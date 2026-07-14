@@ -1,0 +1,222 @@
+use std::{
+    env,
+    ffi::OsString,
+    io::{BufRead, BufReader, Write},
+    os::windows::ffi::OsStrExt,
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, bail};
+use interprocess::local_socket::{GenericNamespaced, Name, Stream, prelude::*};
+use windows_sys::Win32::{
+    Foundation::CloseHandle,
+    System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    },
+};
+
+use crate::protocol::{
+    MAX_FRAME_BYTES, Request, RequestEnvelope, ResponseEnvelope, decode_response, encode_frame,
+};
+
+const START_RETRIES: usize = 50;
+const START_RETRY_DELAY: Duration = Duration::from_millis(100);
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn call(request: Request, auto_start: bool) -> Result<ResponseEnvelope> {
+    let envelope = RequestEnvelope {
+        id: next_request_id(),
+        request,
+    };
+    let stream = match connect() {
+        Ok(stream) => stream,
+        Err(first_error) if auto_start => {
+            start_detached_server().context("failed to launch the Grok runtime server")?;
+            let mut last_error = first_error;
+            for _ in 0..START_RETRIES {
+                thread::sleep(START_RETRY_DELAY);
+                match connect() {
+                    Ok(stream) => return call_over_stream(stream, &envelope),
+                    Err(error) => last_error = error,
+                }
+            }
+            return Err(last_error)
+                .context("runtime server did not become ready within five seconds");
+        }
+        Err(error) => return Err(error),
+    };
+    call_over_stream(stream, &envelope)
+}
+
+fn connect() -> Result<Stream> {
+    let name = runtime_name()?;
+    Stream::connect(name).context("runtime server is not running")
+}
+
+fn call_over_stream(stream: Stream, envelope: &RequestEnvelope) -> Result<ResponseEnvelope> {
+    let mut connection = BufReader::new(stream);
+    connection
+        .get_mut()
+        .write_all(&encode_frame(envelope)?)
+        .context("failed to write runtime request")?;
+    connection
+        .get_mut()
+        .flush()
+        .context("failed to flush runtime request")?;
+    let frame = read_frame(&mut connection).context("failed to read runtime response")?;
+    let response = decode_response(&frame)?;
+    if response.id != envelope.id {
+        bail!(
+            "runtime response id mismatch: expected {}, received {}",
+            envelope.id,
+            response.id
+        );
+    }
+    Ok(response)
+}
+
+pub(crate) fn runtime_name() -> Result<Name<'static>> {
+    let identity = runtime_identity();
+    identity
+        .to_ns_name::<GenericNamespaced>()
+        .context("failed to construct the runtime pipe name")
+}
+
+pub(crate) fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>> {
+    let mut frame = Vec::with_capacity(4096);
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .context("failed to buffer protocol data")?;
+        if buffer.is_empty() {
+            if frame.is_empty() {
+                bail!("protocol peer closed before sending a frame");
+            }
+            return Ok(frame);
+        }
+        let length = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        if frame.len() + length > MAX_FRAME_BYTES {
+            bail!("protocol frame exceeds the 1 MiB limit");
+        }
+        frame.extend_from_slice(&buffer[..length]);
+        reader.consume(length);
+        if frame.last() == Some(&b'\n') {
+            return Ok(frame);
+        }
+    }
+}
+
+pub(crate) fn write_response(stream: &mut impl Write, response: &ResponseEnvelope) -> Result<()> {
+    stream
+        .write_all(&encode_frame(response)?)
+        .context("failed to write runtime response")?;
+    stream.flush().context("failed to flush runtime response")
+}
+
+fn start_detached_server() -> Result<()> {
+    let executable = env::current_exe().context("failed to locate grok-bridge executable")?;
+    let mut application = executable.as_os_str().encode_wide().collect::<Vec<_>>();
+    application.push(0);
+    let mut command_line = OsString::from(format!("\"{}\" __server", executable.display()))
+        .encode_wide()
+        .collect::<Vec<_>>();
+    command_line.push(0);
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut process,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to spawn runtime server");
+    }
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(())
+}
+
+fn runtime_identity() -> OsString {
+    let user = env::var("USERNAME").unwrap_or_else(|_| "default".to_owned());
+    let domain = env::var("USERDOMAIN").unwrap_or_default();
+    let suffix = format!("{domain}-{user}")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    OsString::from(format!("grok-bridge-runtime-v1-{suffix}"))
+}
+
+fn next_request_id() -> String {
+    let sequence = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "req-{:x}-{:x}-{sequence:x}",
+        std::process::id(),
+        now_millis()
+    )
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn reads_exactly_one_frame() {
+        let mut reader = BufReader::new(Cursor::new(b"one\ntwo\n"));
+        assert_eq!(read_frame(&mut reader).unwrap(), b"one\n");
+        assert_eq!(read_frame(&mut reader).unwrap(), b"two\n");
+    }
+
+    #[test]
+    fn rejects_oversized_frames_before_unbounded_growth() {
+        let input = vec![b'x'; MAX_FRAME_BYTES + 1];
+        let mut reader = BufReader::new(Cursor::new(input));
+        assert!(read_frame(&mut reader).is_err());
+    }
+
+    #[test]
+    fn runtime_identity_is_namespaced_and_stable() {
+        let first = runtime_identity();
+        let second = runtime_identity();
+        assert_eq!(first, second);
+        assert!(
+            first
+                .to_string_lossy()
+                .starts_with("grok-bridge-runtime-v1-")
+        );
+    }
+}

@@ -1,10 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-07-15
 
-- Added `remove --session <handle>` for explicit cleanup of non-active local session data.
-- Restricted Unix state directories to mode `0700` and session files to `0600`.
-- Documented `GROK_BRIDGE_STATE_DIR` in the Skill, upgraded GitHub artifact Actions to their Node.js 24-native major versions, and added Ubuntu CI for `main` and pull requests.
+- Replaced v0.2 state-file workers with one per-user Windows x86_64 Runtime Server backed by a local Windows Named Pipe and bounded NDJSON frames.
+- Moved Grok process ownership into the Server, with each session running in a persistent ConPTY and retaining bounded in-memory terminal output.
+- Added Orca-style `create`, `list`, `show`, `read`, `send`, `write`, `resize`, `wait`, and `close` JSON commands with automatic detached Server startup.
+- Added `terminal --session <handle>` to attach an egui terminal to an existing session, plus `terminal [--cwd --prompt --model --always-approve]` to create and open a session.
+- Added a cell-based terminal renderer with ANSI colors and styles, wide characters, cursor rendering, Chinese IME, bracketed paste, terminal key mappings, selection, clipboard copy, bounded scrollback, and live ConPTY resize.
+- Added raw Base64 terminal writes and synchronized ConPTY/vt100 resize. `show` now reports `rows`, `cols`, and `screen_ansi_base64` so the GUI can restore the current screen before consuming cursor-based output.
+- Defined terminal window closure as detach-only. Grok continues running until the user explicitly closes the session or stops the Runtime Server.
+- Added TUI-idle and process-exit waits, blocked interactive prompt detection, follow-up text input, and Ctrl+C interruption.
+- Added cross-platform CJK font discovery and verified face selection for the egui terminal, with `GROK_BRIDGE_CJK_FONT` and `GROK_BRIDGE_CJK_FONT_INDEX` overrides.
+- Prevented the detached Server from inheriting CLI pipeline handles, normalized Windows verbatim working directories, synchronized PTY EOF with process exit, and made Server Stop reliably reap active Grok processes.
+- Retained `GROK_BIN` for trusted native Grok executable selection and `GROK_BRIDGE_ALLOWED_ROOTS` for canonical working-directory restrictions.
+- Limited CI and Release builds to Windows x86_64. The Skill ZIP contains only `SKILL.md`, `agents/openai.yaml`, and `bin/windows-x86_64/grok-bridge.exe`.
 
 ## 0.2.0 - 2026-07-14
 

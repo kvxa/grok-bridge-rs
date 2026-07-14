@@ -1,26 +1,28 @@
 # Repository Guidelines
 
-## 项目定位与结构
+## 项目结构与定位
 
-本仓库是 `grok-build` Agent Skill 的源码。根 `SKILL.md` 定义 Codex 工作流，`agents/openai.yaml` 提供 UI 元数据，`src/main.rs` 实现单一 Rust wrapper，`.github/workflows/release.yml` 构建并发布完整 Skill ZIP。发布包中的 `bin/<platform>/` 由 CI 生成，不在源码仓库维护预编译文件。不要加入 GUI、网络服务、数据库、Git/worktree 管理、内置规划器或多 provider 抽象。
+本仓库构建 Windows x86_64 `grok-build` Agent Skill。`src/main.rs` 提供 CLI；`transport.rs` 负责自动启动和 Windows Named Pipe NDJSON；`server.rs` 分发 RPC；`session.rs` 持有 Grok ConPTY 与有界终端状态；`protocol.rs` 定义 JSON 请求和响应；`terminal_gui.rs` 实现 egui 真实终端；`gui_fonts.rs` 发现并验证 CJK fallback 字体。根 `SKILL.md` 是 Agent 工作流，`.github/workflows/` 负责 CI 和 Release。
 
-## 开发规则
+保持 Orca 风格本地 Runtime，不扩展为网络服务、数据库、Git/worktree 管理器、通用 Agent 平台或多 provider 抽象。
 
-- `start`/`send` 从 STDIN 读取一个 UTF-8 JSON 请求；所有协议命令向 STDOUT 写一个 JSON 结果，诊断写 STDERR。
-- 使用 `tokio::process::Command` 和独立参数启动 Grok，禁止 shell 拼接。
-- wrapper 句柄用于 `status/read/wait/send/stop`；Grok UUID 仅由 worker 保存，续轮通过 `--resume <UUID>` 恢复。
-- 后台 worker 直接消费 `streaming-json`。保留 activity、heartbeat、文本、usage 和结束状态，不持久化 thought 文本或完整 prompt。
-- `read` 必须保持 cursor 增量语义；`wait --for tui-idle` 只有成功进入 `idle` 才算达成。
-- `remove` 只能删除非活动会话，并且删除目标必须是状态根目录的直接子目录。
-- Unix 状态目录必须保持 `0700`，状态、事件、请求、停止标记和 worker 锁文件必须保持 `0600`。
-- Windows PowerShell 5.1 调用示例必须先把 `$OutputEncoding` 和 `[Console]::OutputEncoding` 设置为无 BOM UTF-8，不能使用默认 ASCII/旧代码页处理协议。
-- 保留目录 canonicalize、`GROK_BRIDGE_ALLOWED_ROOTS`、超时、输出截断、prompt 脱敏和参数验证。
-- 协议字段变化必须同步更新测试、README 和 `SKILL.md`。
-- Rust 使用 Rustfmt 默认风格；函数用 `snake_case`，类型用 `PascalCase`，常量用 `SCREAMING_SNAKE_CASE`。
+## 开发与编码规则
 
-## 测试与完成定义
+- 保持每用户单例 Server；CLI 通过本地 Named Pipe 调用 `create/list/show/read/send/write/resize/wait/close`。
+- 所有 Grok 进程和 ConPTY 均由 Server 创建并持有。egui terminal 只附着会话，不直接启动或拥有 Grok。
+- RPC 命令向 STDOUT 只写一行 JSON；诊断写 STDERR。`terminal` 是交互式例外，关窗口只 detach，显式 `close` 才终止会话。
+- `send --text` 保持括号粘贴并追加 Enter 的高层语义；`write --data-base64` 必须逐字节写入，禁止隐式转码、追加回车或修改控制序列。
+- `resize` 必须同时更新 ConPTY 和服务端 vt100 屏幕。`show` 保持 `rows`、`cols`、`screen_ansi_base64`，供 GUI 恢复当前状态。
+- Named Pipe 使用一请求一响应 NDJSON，单帧保持 1 MiB 上限；保留 raw write 大小、终端行列、cursor 和参数验证。
+- 启动外部程序必须使用独立参数，禁止 shell 拼接。`cwd` 必须 canonicalize，并保留 `GROK_BRIDGE_ALLOWED_ROOTS`。
+- GUI reader 和 writer 不得阻塞 egui 线程；后台结果到达后调用 `request_repaint`。窗口销毁只停止本地 reader，不发送 Close。
+- cell renderer 必须保留颜色、样式、宽字符、光标、selection、copy 和 scrollback；输入需覆盖 IME、粘贴、控制键、Alt、导航键和 resize。
+- Windows 英文必须优先使用 Consolas，中文必须由验证过字形覆盖的微软雅黑 fallback 显示；保留 `GROK_BRIDGE_CJK_FONT`、`GROK_BRIDGE_CJK_FONT_INDEX` 的显式中文字体覆盖和跨平台候选发现。
+- Rust 使用 Rustfmt 默认风格：函数 `snake_case`、类型 `PascalCase`、常量 `SCREAMING_SNAKE_CASE`。
 
-默认测试不得调用真实 Grok 或消耗额度。优先覆盖 JSON/UTF-8 解析、UUID、参数生成、状态迁移、cursor、会话删除边界、Unix 权限、路径限制、输出截断和 thought 脱敏。任何代码修改完成前必须通过：
+## 构建与测试
+
+默认测试不得调用真实 Grok、消耗额度或修改外部仓库。优先覆盖 CLI attach/create 互斥、协议帧、raw write、resize、ANSI 快照、cursor、PTY 生命周期、键盘映射、IME/paste、selection/copy、宽字符、scrollback、颜色和 CJK face 验证。
 
 ```text
 cargo fmt --check
@@ -29,10 +31,18 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-同时确认 Release workflow 覆盖 Windows ARM64/x86_64、macOS ARM64、Linux ARM64/x86_64，并将根 `SKILL.md`、`agents/` 与五个二进制组装为 `grok-build/` 顶层目录的 ZIP。
+人工验证需覆盖真实 Grok TUI、中文 IME、控制键、调整窗口尺寸、关闭窗口后重新 attach，以及显式 Close 确实终止进程。
 
-`.github/workflows/ci.yml` 必须在 `main` 与 Pull Request 上运行上述四项检查；`.github/workflows/release.yml` 仅由 `v*` Tag 构建并发布五平台 ZIP。
+## Commit、PR 与发布
 
-## Commit、Tag 与 Release
+提交沿用 `feat:`、`fix:`、`docs:`、`chore:` 等前缀，并说明修改、原因、行为变化和排查线索。PR 应列出范围、风险、验证命令及 Named Pipe/ConPTY/JSON/GUI 兼容性影响。
 
-提交信息应说明改了什么、为何修改、行为变化和排查线索。PR 必须描述范围、风险、验证命令及受影响平台；协议变化需附 JSON 示例。本地 Agent 不自动 commit、push 或创建 Tag。维护者推送 `v*` Tag 后，GitHub Actions 可以按预期自动创建或更新 Release。
+Release 只构建 Windows x86_64。ZIP 顶层必须是 `grok-build/`，且仅包含：
+
+```text
+SKILL.md
+agents/openai.yaml
+bin/windows-x86_64/grok-bridge.exe
+```
+
+不要自动 commit、push、创建 Tag 或发布 Release。

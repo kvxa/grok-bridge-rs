@@ -1,81 +1,79 @@
 ---
 name: grok-build
-description: Delegate concrete coding, repair, and follow-up tasks to Grok Build through the bundled stateful CLI wrapper. Use when Codex should plan and audit while Grok implements, when live Grok status is useful, or when the user explicitly asks for Grok, grok-build, or the wrapper. Do not use for questions Codex can answer without delegation.
+description: Delegate concrete coding, repair, testing, and follow-up tasks to Grok Build through the bundled Windows x86_64 local Runtime CLI. Use when Codex should plan and audit while Grok works in a persistent ConPTY session, when machine-readable create/read/wait/send control is useful, or when the user explicitly asks for Grok, grok-build, or the bundled wrapper. Supports an optional egui terminal for human takeover. Requires Windows and an authenticated Grok CLI.
 ---
 
-# Grok Build
+# Grok Build Local Runtime
 
-Use the platform binary bundled beside this file. Resolve `<skill-dir>` as the directory containing this `SKILL.md`.
-
-## Select the wrapper
-
-- Windows ARM64: `<skill-dir>/bin/windows-arm64/grok-bridge.exe`
-- Windows x86_64/AMD64: `<skill-dir>/bin/windows-x86_64/grok-bridge.exe`
-- macOS Apple Silicon: `<skill-dir>/bin/macos-arm64/grok-bridge`
-- Linux ARM64/aarch64: `<skill-dir>/bin/linux-arm64/grok-bridge`
-- Linux x86_64/AMD64: `<skill-dir>/bin/linux-x86_64/grok-bridge`
-
-Run `<wrapper> doctor` when Grok availability is uncertain. Set `GROK_BRIDGE_STATE_DIR` before the first command when session data must live somewhere other than the platform default. Every protocol command writes one JSON object with `ok` and either `result` or `error`.
-
-## Session workflow
-
-1. Inspect the repository and define acceptance criteria.
-2. Send `start` a UTF-8 JSON object containing `prompt`, absolute `cwd`, optional `timeout_seconds`, `auto_approve`, and optional `model`. Save `result.handle`; this wrapper handle is distinct from Grok's UUID.
-3. Use `read --session <handle> --cursor <n>` for incremental events. Save `result.next_cursor`. Thought text is intentionally hidden; activity, heartbeat, answer text, completion, errors, and usage remain observable.
-4. Use `wait --session <handle> --for tui-idle --timeout-ms <n>` with an explicit timeout. `idle` means the turn completed successfully and can receive a follow-up.
-5. Inspect the diff and run repository checks independently.
-6. Before a follow-up, read remaining events. Send a focused JSON prompt through `send --session <handle>`, then repeat `read`/`wait`. The wrapper owns Grok's resume UUID.
-7. Use `stop --session <handle>` to terminate active work. Stop after five total implementation rounds unless the user requests more.
-8. After final audit and when no follow-up is needed, use `remove --session <handle>` to delete an `idle`, `failed`, `timed_out`, or `stopped` session's local state and events. It rejects `starting` and `running` sessions.
-
-Useful commands:
+Use the executable beside this file:
 
 ```text
-<wrapper> list
-<wrapper> status --session <handle>
-<wrapper> read --session <handle> --cursor 0 --limit 200 --wait-ms 5000
-<wrapper> wait --session <handle> --for tui-idle --timeout-ms 300000
-<wrapper> stop --session <handle>
-<wrapper> remove --session <handle>
+<skill-dir>/bin/windows-x86_64/grok-bridge.exe
 ```
 
-## Windows UTF-8 invocation
+Resolve `<skill-dir>` as the directory containing this `SKILL.md`.
 
-Windows PowerShell 5.1 defaults native pipelines to ASCII and will turn Chinese text into `?`. Set UTF-8 before every `start` or `send`; this is safe in PowerShell 7 too.
+## Workflow
+
+1. Inspect the repository, current changes, constraints, and acceptance criteria.
+2. Run `<bridge> doctor` if Grok availability is uncertain.
+3. Create one focused session. Keep automatic approval disabled unless the repository and prompt are trusted.
 
 ```powershell
-$wrapper = '<wrapper-path>'
-$utf8 = New-Object System.Text.UTF8Encoding($false)
-$OutputEncoding = $utf8
-[Console]::OutputEncoding = $utf8
-$request = @{
-    prompt = '实现修改，保留中文编码，并运行测试。'
-    cwd = (Get-Location).Path
-    timeout_seconds = 1800
-    auto_approve = $true
-    model = $null
-} | ConvertTo-Json -Compress
-$started = $request | & $wrapper start | ConvertFrom-Json
-$handle = $started.result.handle
-& $wrapper wait --session $handle --for tui-idle --timeout-ms 300000
+$bridge = '<skill-dir>\bin\windows-x86_64\grok-bridge.exe'
+$created = & $bridge create `
+    --cwd (Get-Location).Path `
+    --prompt 'Implement the requested change, run relevant checks, and report the result.' |
+    ConvertFrom-Json
+$session = $created.result.value.session
 ```
 
-Follow-up:
+Optional creation arguments are `--model <model>` and `--always-approve`.
+
+4. Wait for the TUI to become idle, then read the terminal state. Save `next_cursor` for incremental reads.
 
 ```powershell
-$utf8 = New-Object System.Text.UTF8Encoding($false)
-$OutputEncoding = $utf8
-[Console]::OutputEncoding = $utf8
-$request = @{ prompt = '只修复验收发现的问题。'; timeout_seconds = 1800 } | ConvertTo-Json -Compress
-$request | & $wrapper send --session $handle
+$wait = & $bridge wait --session $session --for tui-idle --timeout-ms 300000 |
+    ConvertFrom-Json
+$read = & $bridge read --session $session --cursor 0 --limit 4096 --wait-ms 5000 |
+    ConvertFrom-Json
+$nextCursor = $read.result.value.next_cursor
+$screen = $read.result.value.screen
 ```
 
-## macOS and Linux invocation
+If `$wait.result.value.blocked_reason` is present, inspect `show` and send the exact answer required by the visible prompt. Do not treat a blocked prompt as task completion.
 
-```sh
-<wrapper-path> start <<'JSON'
-{"prompt":"Implement the change and run relevant tests.","cwd":"/absolute/project/path","timeout_seconds":1800,"auto_approve":true,"model":null}
-JSON
+5. Independently inspect `git status`, `git diff`, and run the repository's required checks. Runtime success or `tui-idle` is not proof that the task passed.
+6. Send focused follow-up evidence through the same ConPTY session, then repeat `wait`, `read`, and verification.
+
+```powershell
+& $bridge send --session $session --text 'Fix only the verified failures and rerun the checks.'
+& $bridge wait --session $session --for tui-idle --timeout-ms 300000
 ```
 
-Use a returned handle with the same `status`, `read`, `wait`, `send`, `stop`, and `remove` commands shown above. Never put secrets in prompts. Keep `auto_approve` false for untrusted repositories, and never edit the same files concurrently with Grok.
+7. Interrupt a stuck turn with `send --interrupt`. Close the session after the final audit.
+
+```powershell
+& $bridge close --session $session
+```
+
+## Human takeover
+
+Open the egui terminal only when the user requests an interactive view or manual takeover:
+
+```powershell
+& $bridge terminal --session $session
+```
+
+Use `terminal [--cwd <path>] [--prompt <text>] [--model <model>] [--always-approve]` to create a session and open it immediately. Closing the window only detaches; use the explicit close action to terminate Grok. Do not use the GUI as the normal Codex automation path because it waits for human interaction and does not return a JSON result.
+
+## Commands
+
+- `server start|status|stop` manages the per-user singleton Runtime.
+- `create`, `list`, `show`, `read`, `send`, `write`, `resize`, `wait`, and `close` use JSON responses and automatically start the Server when needed.
+- `read` uses byte cursors; `show` includes `rows`, `cols`, and `screen_ansi_base64` for terminal restoration.
+- `send --text` submits bracketed text with Enter; `write --data-base64` writes exact raw bytes and is intended for terminal control or protocol testing.
+- `wait --for tui-idle` reports recognized interactive prompts through `blocked_reason`; `wait --for exit` waits for process termination.
+- `terminal --session <handle>` attaches the egui terminal to an existing session. Without `--session`, it creates a session first.
+
+Prefer JSON `create/read/wait/show/send` for Codex-driven work. Use `write` and `resize` only when exact terminal bytes or dimensions are required. The Server owns every Grok ConPTY and in-memory session; the GUI is only a client. Do not edit the same files concurrently with Grok, expose secrets in prompts or raw input, or assume sessions survive a Server restart. By default the Runtime resolves `grok.exe`; use `GROK_BIN` only for a trusted native executable and `GROK_BRIDGE_ALLOWED_ROOTS` to restrict accepted working directories.

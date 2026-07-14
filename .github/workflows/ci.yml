@@ -10,11 +10,12 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
+  windows-x86_64:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+      - run: rustup target add x86_64-pc-windows-msvc
       - run: cargo fmt --check
-      - run: cargo test
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo build --release --locked
+      - run: cargo test --locked --target x86_64-pc-windows-msvc
+      - run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc

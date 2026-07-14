@@ -1,7 +1,7 @@
 interface:
-  display_name: "Grok Build"
-  short_description: "Delegate and monitor Grok Build coding tasks"
-  default_prompt: "Use $grok-build to start this implementation in Grok, monitor it with read/wait, then inspect and verify the changes."
+  display_name: "Grok Build Runtime"
+  short_description: "Delegate and monitor work through the local Grok runtime"
+  default_prompt: "Use $grok-build to delegate this implementation through the local Grok runtime, monitor it with read and wait, then independently verify the repository changes."
 
 policy:
   allow_implicit_invocation: true

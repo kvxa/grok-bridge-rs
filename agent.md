@@ -1,33 +1,47 @@
-# Codex 使用 grok-build Skill 的编排规则
+# Codex 使用 grok-build Local Runtime 的编排规则
 
-将本文件的规则合并到业务项目 `AGENTS.md`，或在 Codex 会话开始时发送。`grok-build` 负责启动并监控 Grok；Codex 始终负责规划、审计和最终验收。
+将本文件的规则合并到业务项目 `AGENTS.md`，或在 Codex 会话开始时发送。`grok-build` Runtime 负责持有 Grok ConPTY 会话；Codex 负责需求理解、任务拆分、监控、审计和最终验收。
 
 ## 工作流程
 
-1. 理解需求，检查现有工作树，并列出可验证的验收标准。
-2. 把目标、约束、相关文件和验收标准整理成完整 prompt，通过 `$grok-build` 的 `start` 启动任务。只有可信仓库才设置 `auto_approve: true`。
-3. 保存 wrapper `handle`。用 `read --cursor` 增量读取事件，用 `wait --for tui-idle` 等待成功空闲；长任务使用有限超时的滚动等待，不要盲目重复启动。
-4. Grok 执行时，Codex 不得并发修改相同文件。需要中止时调用 `stop`。
-5. 返回 `idle` 后，独立执行 `git status --short`、`git diff --check`、`git diff` 以及项目要求的测试、lint、格式化和构建。
-6. 审计失败时，先读取剩余事件，再用同一 handle 的 `send` 提交只针对证据和根因的返工 prompt。wrapper 自动恢复 Grok UUID。
-7. 最多自动返工五轮；仍未通过则停止并报告根因、改动和未完成项。
-8. 最终审计完成且不再续轮后，调用 `remove --session <handle>` 清理本地会话状态和事件。
-9. 不得删除测试、降低安全检查、吞掉异常，也不得自动 commit、push、merge、创建 PR 或执行不可逆操作。
-
-Windows PowerShell 5.1 调用 `start` 或 `send` 前必须设置：
+1. 检查仓库、现有工作树、约束和可验证验收标准。
+2. 把一个明确实现目标交给 `create`。只有可信仓库和 prompt 才使用 `--always-approve`。
 
 ```powershell
-$utf8 = New-Object System.Text.UTF8Encoding($false)
-$OutputEncoding = $utf8
-[Console]::OutputEncoding = $utf8
+$bridge = '<skill-dir>\bin\windows-x86_64\grok-bridge.exe'
+$created = & $bridge create `
+    --cwd (Get-Location).Path `
+    --prompt '<task>' |
+    ConvertFrom-Json
+$session = $created.result.value.session
 ```
 
-否则中文会在进入 wrapper 前变成问号。
+3. Grok 工作期间不要并发修改相同文件。用有限超时滚动等待，不要重复创建相同任务。若 `wait` 返回 `blocked_reason`，先用 `show` 检查屏幕，再通过 `send` 提交明确答案。
+
+```powershell
+& $bridge wait --session $session --for tui-idle --timeout-ms 300000
+$read = & $bridge read --session $session --cursor 0 --limit 4096 --wait-ms 5000 |
+    ConvertFrom-Json
+$read.result.value.screen
+```
+
+4. 保存 `read.result.value.next_cursor`，后续从该 cursor 增量读取。需要盘点当前会话时使用 `list`，需要查看完整当前终端时使用 `show --session`。
+5. 返回 `tui-idle` 后独立执行 `git status --short`、`git diff --check`、`git diff` 以及项目要求的测试、lint、格式化和构建。
+6. 审计失败时，通过同一会话发送包含证据的聚焦返工请求，再次等待和验收。
+
+```powershell
+& $bridge send --session $session --text '只修复以下验收失败：<evidence>'
+& $bridge wait --session $session --for tui-idle --timeout-ms 300000
+```
+
+7. 卡住时先查看屏幕；确需中断时使用 `send --interrupt`。最终验收后调用 `close --session`。
+8. 不把 Runtime 状态当成正确性证明，不泄露秘密，不删除测试、降低安全检查或吞掉异常。
+9. 不自动 commit、push、merge、创建 PR、Tag 或 Release，也不执行用户未授权的不可逆操作。
 
 ## Prompt 模板
 
 ```text
-你是本任务的具体实现者，请直接检查并修改当前项目。
+你是本任务的具体实现者，请在当前仓库完成以下任务。
 
 目标：
 <用户目标>
@@ -37,9 +51,9 @@ $OutputEncoding = $utf8
 2. <可验证标准>
 
 约束：
-- 只修改与任务直接相关的文件，保留现有文件编码。
-- 保持公开接口兼容，除非目标明确要求改变。
+- 只修改与任务直接相关的文件，保留现有编码。
+- 不重构、不美化、不补无关功能。
 - 增加或更新必要测试，并运行相关检查。
 - 不要 commit、push 或创建 PR。
-- 完成时报告修改文件、测试结果和未解决风险。
+- 完成时在终端报告修改文件、测试结果和剩余风险。
 ```

@@ -9,80 +9,46 @@ permissions:
   contents: write
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
+  build-windows-x86_64:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+      - run: rustup target add x86_64-pc-windows-msvc
       - run: cargo fmt --check
-      - run: cargo test
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo build --release --locked
-
-  build:
-    needs: check
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: target/x86_64-pc-windows-msvc/release/grok-bridge.exe
-          - platform: windows-arm64
-            os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            binary: target/aarch64-pc-windows-msvc/release/grok-bridge.exe
-          - platform: macos-arm64
-            os: macos-14
-            target: aarch64-apple-darwin
-            binary: target/aarch64-apple-darwin/release/grok-bridge
-          - platform: linux-x86_64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            binary: target/x86_64-unknown-linux-gnu/release/grok-bridge
-          - platform: linux-arm64
-            os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            binary: target/aarch64-unknown-linux-gnu/release/grok-bridge
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup target add ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cargo test --locked --target x86_64-pc-windows-msvc
+      - run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.platform }}
-          path: ${{ matrix.binary }}
+          name: windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/grok-bridge.exe
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: build-windows-x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          name: windows-x86_64
+          path: artifacts/windows-x86_64
 
       - name: Assemble Skill archive
         shell: bash
         run: |
           set -euo pipefail
           root="package/grok-build"
-          mkdir -p "$root/agents"
-          mkdir -p "$root/bin/windows-arm64" "$root/bin/windows-x86_64"
-          mkdir -p "$root/bin/macos-arm64" "$root/bin/linux-arm64" "$root/bin/linux-x86_64"
+          mkdir -p "$root/agents" "$root/bin/windows-x86_64"
           cp SKILL.md "$root/SKILL.md"
           cp agents/openai.yaml "$root/agents/openai.yaml"
-          cp artifacts/windows-arm64/grok-bridge.exe "$root/bin/windows-arm64/grok-bridge.exe"
           cp artifacts/windows-x86_64/grok-bridge.exe "$root/bin/windows-x86_64/grok-bridge.exe"
-          cp artifacts/macos-arm64/grok-bridge "$root/bin/macos-arm64/grok-bridge"
-          cp artifacts/linux-arm64/grok-bridge "$root/bin/linux-arm64/grok-bridge"
-          cp artifacts/linux-x86_64/grok-bridge "$root/bin/linux-x86_64/grok-bridge"
-          chmod +x "$root/bin/macos-arm64/grok-bridge"
-          chmod +x "$root/bin/linux-arm64/grok-bridge"
-          chmod +x "$root/bin/linux-x86_64/grok-bridge"
+
+          test "$(find "$root" -type f | wc -l)" -eq 3
+          test -f "$root/SKILL.md"
+          test -f "$root/agents/openai.yaml"
+          test -f "$root/bin/windows-x86_64/grok-bridge.exe"
+
           archive="grok-build-skill-${GITHUB_REF_NAME}.zip"
           (cd package && zip -r "../$archive" grok-build)
           sha256sum "$archive" > "$archive.sha256"
