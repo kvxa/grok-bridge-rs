@@ -81,7 +81,7 @@ $request | & $wrapper start
 
 - 默认状态目录：Windows `%LOCALAPPDATA%\grok-bridge\sessions`；macOS `~/Library/Application Support/grok-bridge/sessions`；Linux `$XDG_STATE_HOME/grok-bridge/sessions` 或 `~/.local/state/grok-bridge/sessions`。
 - 用 `GROK_BRIDGE_STATE_DIR` 覆盖状态目录，用 `GROK_BRIDGE_ALLOWED_ROOTS` 限制允许的 `cwd`，用 `GROK_BIN` 指定 Grok 路径。
-- Unix 状态目录和会话目录使用 `0700`，prompt、状态、事件和锁文件使用 `0600`。完成审计且不再续轮后，用 `remove` 删除非活动会话数据。
+- Unix 状态目录和会话目录使用 `0700`，prompt、状态、事件和锁文件使用 `0600`。完成审计且不再续轮后，用 `remove` 删除 `idle`、`failed`、`timed_out` 或 `stopped` 会话；`starting`/`running` 会被拒绝。
 - prompt 只短暂写入待处理请求文件，worker 读取后立即删除；状态和事件不回显完整 prompt。
 - 默认保持 `auto_approve: false`。每轮后由 Codex 检查 diff 并运行测试；不要让 Codex 与 Grok 并发修改相同文件。
 - Release 下载后校验 SHA-256。macOS 隔离属性仅应在确认来源后由用户自行解除。

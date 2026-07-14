@@ -343,7 +343,7 @@ async fn dispatch() -> Result<()> {
 
 fn print_help() {
     println!(
-        "grok-bridge {}\n\nUSAGE:\n  grok-bridge start\n  grok-bridge status --session <handle>\n  grok-bridge read --session <handle> [--cursor <n>] [--limit <n>] [--wait-ms <n>]\n  grok-bridge wait --session <handle> [--for tui-idle|exit] [--timeout-ms <n>]\n  grok-bridge send --session <handle>\n  grok-bridge stop --session <handle>\n  grok-bridge remove --session <handle>\n  grok-bridge list\n  grok-bridge doctor\n\nSTART reads one UTF-8 JSON object from STDIN. SEND reads one UTF-8 JSON object containing prompt and optional timeout_seconds. REMOVE deletes a non-active session and its local events. All protocol commands write one JSON object to STDOUT.",
+        "grok-bridge {}\n\nUSAGE:\n  grok-bridge start\n  grok-bridge status --session <handle>\n  grok-bridge read --session <handle> [--cursor <n>] [--limit <n>] [--wait-ms <n>]\n  grok-bridge wait --session <handle> [--for tui-idle|exit] [--timeout-ms <n>]\n  grok-bridge send --session <handle>\n  grok-bridge stop --session <handle>\n  grok-bridge remove --session <handle>\n  grok-bridge list\n  grok-bridge doctor\n\nSTART reads one UTF-8 JSON object from STDIN. SEND reads one UTF-8 JSON object containing prompt and optional timeout_seconds. REMOVE deletes an idle, failed, timed_out, or stopped session and its local events; starting and running sessions are rejected. All protocol commands write one JSON object to STDOUT.",
         env!("CARGO_PKG_VERSION")
     );
 }

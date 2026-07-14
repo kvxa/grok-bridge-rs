@@ -26,7 +26,7 @@ Run `<wrapper> doctor` when Grok availability is uncertain. Set `GROK_BRIDGE_STA
 5. Inspect the diff and run repository checks independently.
 6. Before a follow-up, read remaining events. Send a focused JSON prompt through `send --session <handle>`, then repeat `read`/`wait`. The wrapper owns Grok's resume UUID.
 7. Use `stop --session <handle>` to terminate active work. Stop after five total implementation rounds unless the user requests more.
-8. After final audit and when no follow-up is needed, use `remove --session <handle>` to delete the non-active session's local state and events.
+8. After final audit and when no follow-up is needed, use `remove --session <handle>` to delete an `idle`, `failed`, `timed_out`, or `stopped` session's local state and events. It rejects `starting` and `running` sessions.
 
 Useful commands:
 
@@ -78,4 +78,4 @@ $request | & $wrapper send --session $handle
 JSON
 ```
 
-Use a returned handle with the same `status`, `read`, `wait`, `send`, and `stop` commands shown above. Never put secrets in prompts. Keep `auto_approve` false for untrusted repositories, and never edit the same files concurrently with Grok.
+Use a returned handle with the same `status`, `read`, `wait`, `send`, `stop`, and `remove` commands shown above. Never put secrets in prompts. Keep `auto_approve` false for untrusted repositories, and never edit the same files concurrently with Grok.
