@@ -1,36 +1,20 @@
 # grok-build Skill
 
-这是一个通过预编译 CLI wrapper 调用 Grok Build 的 Codex/Agent Skill。Codex 负责规划、审计和验收；`SKILL.md` 选择当前平台二进制，通过 JSON STDIN/STDOUT 同步调用 Grok。无需 MCP、Rust 工具链或安装脚本。
+这是一个通过预编译 CLI wrapper 调用 Grok Build 的 Codex/Agent Skill。Codex 负责规划、监控、审计和验收；wrapper 负责后台运行 Grok、保存会话状态并通过 JSON STDIN/STDOUT 提供实时查询。无需 MCP、HTTP 服务、Rust 工具链或安装脚本。
 
 ## 安装
 
-先安装并登录 Grok Build CLI，确认：
-
-```text
-grok --version
-```
-
-然后从 GitHub Releases 下载 `grok-build-skill-<版本>.zip` 和对应 `.sha256`，校验后直接解压到用户 Skills 目录。
-
-Windows：
+先安装并登录 Grok Build CLI，确认 `grok --version`。然后从 GitHub Releases 下载 `grok-build-skill-<版本>.zip` 及 `.sha256`，校验后解压到用户 Skills 目录：
 
 ```powershell
-Expand-Archive .\grok-build-skill-v0.1.0.zip "$env:USERPROFILE\.agents\skills"
+Expand-Archive .\grok-build-skill-v0.2.0.zip "$env:USERPROFILE\.agents\skills"
 ```
-
-macOS/Linux：
 
 ```sh
-unzip grok-build-skill-v0.1.0.zip -d "$HOME/.agents/skills"
+unzip grok-build-skill-v0.2.0.zip -d "$HOME/.agents/skills"
 ```
 
-完成后应存在：
-
-```text
-$HOME/.agents/skills/grok-build/SKILL.md
-```
-
-重启 Codex，在任意项目中明确调用 `$grok-build`。
+完成后应存在 `$HOME/.agents/skills/grok-build/SKILL.md`。重启 Codex，在项目中调用 `$grok-build`。
 
 ## Release 包结构
 
@@ -46,38 +30,61 @@ grok-build/
     └── linux-x86_64/grok-bridge
 ```
 
-Windows “x86” 按 x86_64 发布，不提供 32 位构建。macOS 仅支持 Apple Silicon。
+Windows “x86” 按 x86_64 发布，不提供 32 位构建；macOS 仅支持 Apple Silicon。
 
-## JSON 调用协议
+## 实时会话协议
 
-wrapper 从 STDIN 读取一个 JSON 对象，等待 Grok 退出，再向 STDOUT 写入一个 JSON 结果。协议模式下日志只能写 STDERR。
+协议借鉴 Orca CLI 的终端工作流，但不引入 PTY、守护服务或编排平台：每次 CLI 调用只完成一个动作，后台 worker 通过本地状态目录衔接。
 
-首轮请求：
-
-```json
-{
-  "prompt": "实现登录限流，增加测试并运行检查。",
-  "cwd": "D:\\Projects\\my-app",
-  "session_id": null,
-  "timeout_seconds": 1800,
-  "auto_approve": false,
-  "model": null
-}
+```text
+start  → status/read(cursor) → wait(tui-idle)
+                                  ↓
+                              send → read/wait
+                                  ↓
+                                 stop
 ```
 
-结果包含 `success`、`exit_code`、`timed_out`、`session_id`、`command`、`cwd`、`stdout`、`stderr`、`output_truncated` 和 `error`。首轮成功后返回 Grok 会话 UUID；返工时原样传回该 UUID，wrapper 使用 `grok --resume <UUID>` 恢复上下文。
+`start` 从 STDIN 读取：
 
-## 安全与配置
+```json
+{"prompt":"实现登录限流并运行测试。","cwd":"D:\\Projects\\my-app","timeout_seconds":1800,"auto_approve":true,"model":null}
+```
 
-- 默认保持 `auto_approve: false`；只在可信仓库中启用自动批准。
-- 用 `GROK_BRIDGE_ALLOWED_ROOTS` 限制允许的 `cwd`。
-- Grok 不在 `PATH` 时，用 `GROK_BIN` 指定完整路径。
-- 不要在 prompt 中放密钥；每轮调用后由 Codex 独立检查 diff 并运行测试。
-- 从 Release 下载后校验随附 SHA-256；macOS 若保留下载隔离属性，需要由用户确认来源后自行解除。
+它立即返回 wrapper `handle`。后续命令：
+
+```text
+grok-bridge status --session <handle>
+grok-bridge read --session <handle> --cursor 0 --limit 200 --wait-ms 5000
+grok-bridge wait --session <handle> --for tui-idle --timeout-ms 300000
+grok-bridge send --session <handle>
+grok-bridge stop --session <handle>
+grok-bridge list
+```
+
+`read` 返回 `oldest_cursor`、`next_cursor`、`latest_cursor` 和 `limited`。事件包括 heartbeat、activity、文本增量、结束原因、token usage 和失败信息；Grok 的 thought 文本不落盘。成功状态为 `idle`，续轮由 wrapper 自动使用 Grok UUID 执行 `--resume`。
+
+## Windows 中文编码
+
+Windows PowerShell 5.1 的原生管道默认使用 ASCII，中文会在进入 wrapper 前变成 `?`。必须显式设置无 BOM UTF-8：
+
+```powershell
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$request | & $wrapper start
+```
+
+`$OutputEncoding` 保护写给 wrapper 的请求，`[Console]::OutputEncoding` 保护 wrapper 返回的中文 JSON。PowerShell 7 也可以使用相同设置。wrapper 接受 UTF-8 BOM，但无法恢复已经被 PowerShell 替换成问号的内容。
+
+## 状态与安全
+
+- 默认状态目录：Windows `%LOCALAPPDATA%\grok-bridge\sessions`；macOS `~/Library/Application Support/grok-bridge/sessions`；Linux `$XDG_STATE_HOME/grok-bridge/sessions` 或 `~/.local/state/grok-bridge/sessions`。
+- 用 `GROK_BRIDGE_STATE_DIR` 覆盖状态目录，用 `GROK_BRIDGE_ALLOWED_ROOTS` 限制允许的 `cwd`，用 `GROK_BIN` 指定 Grok 路径。
+- prompt 只短暂写入待处理请求文件，worker 读取后立即删除；状态和事件不回显完整 prompt。
+- 默认保持 `auto_approve: false`。每轮后由 Codex 检查 diff 并运行测试；不要让 Codex 与 Grok 并发修改相同文件。
+- Release 下载后校验 SHA-256。macOS 隔离属性仅应在确认来源后由用户自行解除。
 
 ## 开发与发布
-
-本地代码检查：
 
 ```text
 cargo fmt --check
@@ -86,12 +93,4 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-推送 `v*` Tag 后，[release.yml](.github/workflows/release.yml) 会：
-
-1. 运行完整 Rust 检查。
-2. 在对应架构的 GitHub-hosted runner 上构建五个平台二进制。
-3. 组装包含 `SKILL.md`、`agents/` 和 `bin/` 的单一 ZIP。
-4. 生成 SHA-256。
-5. 自动创建或更新同名 GitHub Release 并上传两个文件。
-
-本地 Agent 不自动 commit、push 或创建 Tag；Release 仅由维护者推送的版本 Tag 触发。
+推送 `v*` Tag 后，`.github/workflows/release.yml` 会检查代码、原生构建五个平台、组装完整 Skill ZIP、生成 SHA-256 并发布 Release。本地 Agent 不自动 commit、push、建 Tag 或发布。

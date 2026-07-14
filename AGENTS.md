@@ -2,20 +2,23 @@
 
 ## 项目定位与结构
 
-本仓库是 `grok-build` Agent Skill 的源码。根 `SKILL.md` 定义 Codex 工作流，`agents/openai.yaml` 提供 UI 元数据，`src/main.rs` 实现单一 Rust wrapper，`.github/workflows/release.yml` 构建并发布完整 Skill ZIP。发布包中的 `bin/<platform>/` 由 CI 生成，不在源码仓库维护预编译文件。不要加入 GUI、网络服务、数据库、任务队列、Git/worktree 管理、内置规划器或多 provider 抽象。
+本仓库是 `grok-build` Agent Skill 的源码。根 `SKILL.md` 定义 Codex 工作流，`agents/openai.yaml` 提供 UI 元数据，`src/main.rs` 实现单一 Rust wrapper，`.github/workflows/release.yml` 构建并发布完整 Skill ZIP。发布包中的 `bin/<platform>/` 由 CI 生成，不在源码仓库维护预编译文件。不要加入 GUI、网络服务、数据库、Git/worktree 管理、内置规划器或多 provider 抽象。
 
 ## 开发规则
 
-- wrapper 只从 STDIN 读取一个 JSON 请求，只向 STDOUT 写一个 JSON 结果；诊断写 STDERR。
+- `start`/`send` 从 STDIN 读取一个 UTF-8 JSON 请求；所有协议命令向 STDOUT 写一个 JSON 结果，诊断写 STDERR。
 - 使用 `tokio::process::Command` 和独立参数启动 Grok，禁止 shell 拼接。
-- 首轮 `session_id` 为 `null`；从 Grok 输出提取 UUID，续轮通过 `--resume <UUID>` 恢复。
+- wrapper 句柄用于 `status/read/wait/send/stop`；Grok UUID 仅由 worker 保存，续轮通过 `--resume <UUID>` 恢复。
+- 后台 worker 直接消费 `streaming-json`。保留 activity、heartbeat、文本、usage 和结束状态，不持久化 thought 文本或完整 prompt。
+- `read` 必须保持 cursor 增量语义；`wait --for tui-idle` 只有成功进入 `idle` 才算达成。
+- Windows PowerShell 5.1 调用示例必须先把 `$OutputEncoding` 和 `[Console]::OutputEncoding` 设置为无 BOM UTF-8，不能使用默认 ASCII/旧代码页处理协议。
 - 保留目录 canonicalize、`GROK_BRIDGE_ALLOWED_ROOTS`、超时、输出截断、prompt 脱敏和参数验证。
 - 协议字段变化必须同步更新测试、README 和 `SKILL.md`。
 - Rust 使用 Rustfmt 默认风格；函数用 `snake_case`，类型用 `PascalCase`，常量用 `SCREAMING_SNAKE_CASE`。
 
 ## 测试与完成定义
 
-默认测试不得调用真实 Grok或消耗额度。优先覆盖 JSON 解析、UUID、参数生成、路径限制、输出截断和脱敏。任何代码修改完成前必须通过：
+默认测试不得调用真实 Grok 或消耗额度。优先覆盖 JSON/UTF-8 解析、UUID、参数生成、状态迁移、cursor、路径限制、输出截断和 thought 脱敏。任何代码修改完成前必须通过：
 
 ```text
 cargo fmt --check

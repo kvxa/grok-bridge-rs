@@ -1,15 +1,15 @@
 [package]
 name = "grok-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "A minimal STDIO JSON wrapper for invoking Grok Build"
+description = "A stateful STDIO JSON wrapper for invoking Grok Build"
 license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["macros", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1.0", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
 
 [profile.release]
 lto = "thin"

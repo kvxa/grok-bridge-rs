@@ -1,15 +1,13 @@
 ---
 name: grok-build
-description: Delegate concrete coding, repair, and follow-up fix tasks to Grok Build through the bundled headless CLI wrapper. Use when Codex should plan and audit the work while Grok implements changes, or when the user explicitly asks to use Grok, grok-build, or the bundled wrapper. Do not use for questions that Codex can answer without delegating implementation.
+description: Delegate concrete coding, repair, and follow-up tasks to Grok Build through the bundled stateful CLI wrapper. Use when Codex should plan and audit while Grok implements, when live Grok status is useful, or when the user explicitly asks for Grok, grok-build, or the wrapper. Do not use for questions Codex can answer without delegation.
 ---
 
 # Grok Build
 
-Use the platform binary bundled beside this file. Resolve `<skill-dir>` as the directory containing this `SKILL.md`; never assume the user's project is the skill directory.
+Use the platform binary bundled beside this file. Resolve `<skill-dir>` as the directory containing this `SKILL.md`.
 
 ## Select the wrapper
-
-Choose exactly one binary for the current host:
 
 - Windows ARM64: `<skill-dir>/bin/windows-arm64/grok-bridge.exe`
 - Windows x86_64/AMD64: `<skill-dir>/bin/windows-x86_64/grok-bridge.exe`
@@ -17,49 +15,65 @@ Choose exactly one binary for the current host:
 - Linux ARM64/aarch64: `<skill-dir>/bin/linux-arm64/grok-bridge`
 - Linux x86_64/AMD64: `<skill-dir>/bin/linux-x86_64/grok-bridge`
 
-Stop and report an unsupported platform when no mapping exists. Run `<wrapper> doctor` before the first delegation when Grok availability is uncertain.
+Run `<wrapper> doctor` when Grok availability is uncertain. Every protocol command writes one JSON object with `ok` and either `result` or `error`.
 
-## Delegate work
+## Session workflow
 
-1. Inspect the user's repository and define concrete acceptance criteria.
-2. Build one JSON request with these fields:
-   - `prompt`: complete implementation or repair instructions.
-   - `cwd`: the absolute target repository directory.
-   - `session_id`: `null` for the first round; use the UUID returned by the previous round for a follow-up.
-   - `timeout_seconds`: normally `1800`; allowed range is 10 through 7200.
-   - `auto_approve`: use `true` only for a trusted repository when Grok must edit files or run commands.
-   - `model`: `null` unless the user requests a specific Grok model.
-3. Write the compact JSON request to the wrapper's STDIN. Read exactly one JSON result from STDOUT. Treat STDERR as diagnostics only.
-4. Check `success`, `exit_code`, `timed_out`, `session_id`, `stdout`, `stderr`, `output_truncated`, and `error`.
-5. Independently inspect the working tree and run the repository's required format, test, lint, and build commands.
-6. If verification fails, send a focused repair request using the returned `session_id`. Stop after five total rounds unless the user explicitly requests more.
+1. Inspect the repository and define acceptance criteria.
+2. Send `start` a UTF-8 JSON object containing `prompt`, absolute `cwd`, optional `timeout_seconds`, `auto_approve`, and optional `model`. Save `result.handle`; this wrapper handle is distinct from Grok's UUID.
+3. Use `read --session <handle> --cursor <n>` for incremental events. Save `result.next_cursor`. Thought text is intentionally hidden; activity, heartbeat, answer text, completion, errors, and usage remain observable.
+4. Use `wait --session <handle> --for tui-idle --timeout-ms <n>` with an explicit timeout. `idle` means the turn completed successfully and can receive a follow-up.
+5. Inspect the diff and run repository checks independently.
+6. Before a follow-up, read remaining events. Send a focused JSON prompt through `send --session <handle>`, then repeat `read`/`wait`. The wrapper owns Grok's resume UUID.
+7. Use `stop --session <handle>` to terminate active work. Stop after five total implementation rounds unless the user requests more.
 
-The wrapper invokes Grok with argument arrays, not shell command concatenation. Never put secrets in `prompt`.
+Useful commands:
 
-## Windows invocation
+```text
+<wrapper> list
+<wrapper> status --session <handle>
+<wrapper> read --session <handle> --cursor 0 --limit 200 --wait-ms 5000
+<wrapper> wait --session <handle> --for tui-idle --timeout-ms 300000
+<wrapper> stop --session <handle>
+```
 
-Use PowerShell's JSON serializer and native pipeline:
+## Windows UTF-8 invocation
+
+Windows PowerShell 5.1 defaults native pipelines to ASCII and will turn Chinese text into `?`. Set UTF-8 before every `start` or `send`; this is safe in PowerShell 7 too.
 
 ```powershell
+$wrapper = '<wrapper-path>'
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
 $request = @{
-    prompt = "Implement the requested change and run the relevant tests."
+    prompt = '实现修改，保留中文编码，并运行测试。'
     cwd = (Get-Location).Path
-    session_id = $null
     timeout_seconds = 1800
     auto_approve = $true
     model = $null
 } | ConvertTo-Json -Compress
-$request | & <wrapper-path>
+$started = $request | & $wrapper start | ConvertFrom-Json
+$handle = $started.result.handle
+& $wrapper wait --session $handle --for tui-idle --timeout-ms 300000
+```
+
+Follow-up:
+
+```powershell
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$request = @{ prompt = '只修复验收发现的问题。'; timeout_seconds = 1800 } | ConvertTo-Json -Compress
+$request | & $wrapper send --session $handle
 ```
 
 ## macOS and Linux invocation
 
-Pipe a compact, correctly JSON-escaped request with a quoted heredoc:
-
 ```sh
-<wrapper-path> <<'JSON'
-{"prompt":"Implement the requested change and run the relevant tests.","cwd":"/absolute/project/path","session_id":null,"timeout_seconds":1800,"auto_approve":true,"model":null}
+<wrapper-path> start <<'JSON'
+{"prompt":"Implement the change and run relevant tests.","cwd":"/absolute/project/path","timeout_seconds":1800,"auto_approve":true,"model":null}
 JSON
 ```
 
-Do not call Grok directly when this wrapper is available; the wrapper enforces path validation, timeout limits, output clipping, and prompt redaction.
+Use a returned handle with the same `status`, `read`, `wait`, `send`, and `stop` commands shown above. Never put secrets in prompts. Keep `auto_approve` false for untrusted repositories, and never edit the same files concurrently with Grok.
