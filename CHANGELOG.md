@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 - 2026-07-15
+
+- Extended the Runtime, persistent PTY sessions, JSON CLI, and optional egui terminal from Windows x86_64 to Windows ARM64, Linux x86_64/ARM64, and macOS Intel/Apple Silicon.
+- Replaced Windows-only Grok process termination with the portable PTY child-killer interface and resolved `grok.exe` on Windows or `grok` on Unix by default.
+- Added platform-specific detached Server startup and per-user local IPC identities. The generic local socket maps to Windows Named Pipes, Linux abstract sockets, and filesystem Unix sockets on macOS.
+- Removed the fixed 64-session ceiling; live sessions are now limited by host resources and remain explicitly closeable through the CLI or WebUI.
+- Added optional session owner labels to `create`, session state, and new `terminal` sessions, with automatic fallback to `CODEX_THREAD_ID` or `CODEX_SESSION_ID`.
+- Added a Server-owned localhost WebUI and `server ui` command. It groups Grok sessions by a short Codex conversation title, live-refreshes each terminal screen and session state, and explicitly terminates selected sessions. The default listener is `127.0.0.1:47653` and can be changed with `GROK_BRIDGE_WEB_ADDR`.
+- Enabled native Linux GUI builds with the eframe X11 backend while retaining platform-specific CJK font discovery and explicit font overrides.
+- Added fixed native CI runners for all six release targets so tests and Clippy execute on the target architecture instead of relying on compile-only cross builds.
+- Expanded the tag Release workflow to publish one portable Skill ZIP containing `SKILL.md`, `agents/openai.yaml`, and all six native binaries under consistently named `bin/<platform>-<arch>` directories.
+- Restored Linux and macOS executable permissions during packaging and retained the release ZIP SHA-256 sidecar.
+
 ## 0.3.0 - 2026-07-15
 
 - Replaced v0.2 state-file workers with one per-user Windows x86_64 Runtime Server backed by a local Windows Named Pipe and bounded NDJSON frames.

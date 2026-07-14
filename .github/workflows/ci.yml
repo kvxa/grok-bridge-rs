@@ -10,12 +10,45 @@ permissions:
   contents: read
 
 jobs:
-  windows-x86_64:
-    runs-on: windows-latest
+  format:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - run: rustup target add x86_64-pc-windows-msvc
       - run: cargo fmt --check
-      - run: cargo test --locked --target x86_64-pc-windows-msvc
-      - run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
-      - run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+  build:
+    needs: format
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - platform: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - platform: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev pkg-config
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo clippy --locked --target ${{ matrix.target }} --all-targets --all-features -- -D warnings
+      - run: cargo build --release --locked --target ${{ matrix.target }}

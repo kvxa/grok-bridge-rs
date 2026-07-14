@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_WRITE_BYTES: usize = 64 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
+const MAX_OWNER_BYTES: usize = 128;
 const MAX_READ_LIMIT: u32 = 65_536;
 const MIN_TERMINAL_COLS: u16 = 20;
 const MAX_TERMINAL_COLS: u16 = 500;
@@ -34,6 +35,8 @@ pub(crate) enum Request {
         cwd: String,
         prompt: Option<String>,
         model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
         #[serde(default)]
         always_approve: bool,
     },
@@ -145,6 +148,7 @@ pub(crate) struct ServerInfo {
     pub(crate) process_id: u32,
     pub(crate) started_at_ms: u64,
     pub(crate) active_sessions: u32,
+    pub(crate) web_url: Option<String>,
     pub(crate) stopping: bool,
 }
 
@@ -163,6 +167,8 @@ pub(crate) enum SessionPhase {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionState {
     pub(crate) session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owner: Option<String>,
     pub(crate) phase: SessionPhase,
     pub(crate) title: Option<String>,
     pub(crate) cwd: String,
@@ -287,7 +293,9 @@ fn single_frame_payload(frame: &[u8]) -> Result<&[u8]> {
 fn validate_request(request: &Request) -> Result<()> {
     match request {
         Request::ServerStatus | Request::ServerStop | Request::List => Ok(()),
-        Request::Create { cwd, model, .. } => {
+        Request::Create {
+            cwd, model, owner, ..
+        } => {
             if cwd.trim().is_empty() {
                 bail!("cwd must not be empty");
             }
@@ -296,6 +304,9 @@ fn validate_request(request: &Request) -> Result<()> {
                 .is_some_and(|value| value.trim().is_empty())
             {
                 bail!("model must not be empty when provided");
+            }
+            if let Some(owner) = owner.as_deref() {
+                validate_owner(owner)?;
             }
             Ok(())
         }
@@ -390,6 +401,9 @@ fn validate_response_result(result: &ResponseResult) -> Result<()> {
 
 fn validate_session_state(session: &SessionState) -> Result<()> {
     validate_identifier(&session.session, "session handle")?;
+    if let Some(owner) = session.owner.as_deref() {
+        validate_owner(owner)?;
+    }
     if session.cwd.trim().is_empty() {
         bail!("session cwd must not be empty");
     }
@@ -400,6 +414,16 @@ fn validate_session_state(session: &SessionState) -> Result<()> {
     BASE64
         .decode(&session.screen_ansi_base64)
         .context("session screen_ansi_base64 is invalid")?;
+    Ok(())
+}
+
+fn validate_owner(owner: &str) -> Result<()> {
+    if owner.trim().is_empty()
+        || owner.len() > MAX_OWNER_BYTES
+        || owner.chars().any(char::is_control)
+    {
+        bail!("owner must contain between 1 and {MAX_OWNER_BYTES} bytes and no control characters");
+    }
     Ok(())
 }
 
@@ -429,6 +453,7 @@ mod tests {
                 cwd: r"C:\work tree\repo".to_owned(),
                 prompt: Some("fix the terminal".to_owned()),
                 model: Some("grok-code-fast-1".to_owned()),
+                owner: Some("codex-thread-42".to_owned()),
                 always_approve: true,
             },
         };
@@ -519,6 +544,35 @@ mod tests {
         let invalid_handle =
             br#"{"id":"r1","request":{"method":"show","params":{"session":"../bad"}}}"#;
         assert!(decode_request(invalid_handle).is_err());
+    }
+
+    #[test]
+    fn validates_optional_session_owner() {
+        let request = |owner: Option<String>| RequestEnvelope {
+            id: "request-1".to_owned(),
+            request: Request::Create {
+                cwd: ".".to_owned(),
+                prompt: None,
+                model: None,
+                owner,
+                always_approve: false,
+            },
+        };
+
+        for owner in [
+            None,
+            Some("codex-thread-42".to_owned()),
+            Some("人工会话".to_owned()),
+        ] {
+            let envelope = request(owner);
+            assert!(decode_request(&encode_frame(&envelope).unwrap()).is_ok());
+        }
+        for owner in [Some(" ".to_owned()), Some("bad\nowner".to_owned())] {
+            let envelope = request(owner);
+            assert!(decode_request(&encode_frame(&envelope).unwrap()).is_err());
+        }
+        let oversized = request(Some("x".repeat(MAX_OWNER_BYTES + 1)));
+        assert!(decode_request(&encode_frame(&oversized).unwrap()).is_err());
     }
 
     #[test]
@@ -644,6 +698,7 @@ mod tests {
             "r1",
             ResponseResult::Session(SessionState {
                 session: "session-1".to_owned(),
+                owner: Some("codex-thread-42".to_owned()),
                 phase: SessionPhase::Running,
                 title: Some("Grok".to_owned()),
                 cwd: ".".to_owned(),

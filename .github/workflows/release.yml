@@ -9,45 +9,91 @@ permissions:
   contents: write
 
 jobs:
-  build-windows-x86_64:
-    runs-on: windows-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/grok-bridge.exe
+          - platform: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: target/aarch64-pc-windows-msvc/release/grok-bridge.exe
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/grok-bridge
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: target/aarch64-unknown-linux-gnu/release/grok-bridge
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/grok-bridge
+          - platform: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/grok-bridge
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - run: rustup target add x86_64-pc-windows-msvc
-      - run: cargo fmt --check
-      - run: cargo test --locked --target x86_64-pc-windows-msvc
-      - run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
-      - run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev pkg-config
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo clippy --locked --target ${{ matrix.target }} --all-targets --all-features -- -D warnings
+      - run: cargo build --release --locked --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-x86_64
-          path: target/x86_64-pc-windows-msvc/release/grok-bridge.exe
+          name: binary-${{ matrix.platform }}
+          path: ${{ matrix.binary }}
           if-no-files-found: error
 
   release:
-    needs: build-windows-x86_64
-    runs-on: ubuntu-latest
+    needs: build
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          name: windows-x86_64
-          path: artifacts/windows-x86_64
+          pattern: binary-*
+          path: artifacts
 
       - name: Assemble Skill archive
         shell: bash
         run: |
           set -euo pipefail
           root="package/grok-build"
-          mkdir -p "$root/agents" "$root/bin/windows-x86_64"
-          cp SKILL.md "$root/SKILL.md"
-          cp agents/openai.yaml "$root/agents/openai.yaml"
-          cp artifacts/windows-x86_64/grok-bridge.exe "$root/bin/windows-x86_64/grok-bridge.exe"
+          mkdir -p \
+            "$root/agents" \
+            "$root/bin/windows-x86_64" \
+            "$root/bin/windows-arm64" \
+            "$root/bin/linux-x86_64" \
+            "$root/bin/linux-arm64" \
+            "$root/bin/macos-x86_64" \
+            "$root/bin/macos-arm64"
 
-          test "$(find "$root" -type f | wc -l)" -eq 3
-          test -f "$root/SKILL.md"
-          test -f "$root/agents/openai.yaml"
-          test -f "$root/bin/windows-x86_64/grok-bridge.exe"
+          install -m 0644 SKILL.md "$root/SKILL.md"
+          install -m 0644 agents/openai.yaml "$root/agents/openai.yaml"
+          install -m 0755 artifacts/binary-windows-x86_64/grok-bridge.exe "$root/bin/windows-x86_64/grok-bridge.exe"
+          install -m 0755 artifacts/binary-windows-arm64/grok-bridge.exe "$root/bin/windows-arm64/grok-bridge.exe"
+          install -m 0755 artifacts/binary-linux-x86_64/grok-bridge "$root/bin/linux-x86_64/grok-bridge"
+          install -m 0755 artifacts/binary-linux-arm64/grok-bridge "$root/bin/linux-arm64/grok-bridge"
+          install -m 0755 artifacts/binary-macos-x86_64/grok-bridge "$root/bin/macos-x86_64/grok-bridge"
+          install -m 0755 artifacts/binary-macos-arm64/grok-bridge "$root/bin/macos-arm64/grok-bridge"
+
+          test "$(find "$root" -type f | wc -l)" -eq 8
+          test -x "$root/bin/linux-x86_64/grok-bridge"
+          test -x "$root/bin/linux-arm64/grok-bridge"
+          test -x "$root/bin/macos-x86_64/grok-bridge"
+          test -x "$root/bin/macos-arm64/grok-bridge"
 
           archive="grok-build-skill-${GITHUB_REF_NAME}.zip"
           (cd package && zip -r "../$archive" grok-build)

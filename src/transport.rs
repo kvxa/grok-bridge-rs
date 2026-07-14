@@ -2,7 +2,6 @@ use std::{
     env,
     ffi::OsString,
     io::{BufRead, BufReader, Write},
-    os::windows::ffi::OsStrExt,
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -10,6 +9,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use interprocess::local_socket::{GenericNamespaced, Name, Stream, prelude::*};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
+#[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::CloseHandle,
     System::Threading::{
@@ -119,6 +123,7 @@ pub(crate) fn write_response(stream: &mut impl Write, response: &ResponseEnvelop
     stream.flush().context("failed to flush runtime response")
 }
 
+#[cfg(windows)]
 fn start_detached_server() -> Result<()> {
     let executable = env::current_exe().context("failed to locate grok-bridge executable")?;
     let mut application = executable.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -156,6 +161,20 @@ fn start_detached_server() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn start_detached_server() -> Result<()> {
+    let executable = env::current_exe().context("failed to locate grok-bridge executable")?;
+    Command::new(executable)
+        .arg("__server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn runtime server")?;
+    Ok(())
+}
+
+#[cfg(windows)]
 fn runtime_identity() -> OsString {
     let user = env::var("USERNAME").unwrap_or_else(|_| "default".to_owned());
     let domain = env::var("USERDOMAIN").unwrap_or_default();
@@ -170,6 +189,17 @@ fn runtime_identity() -> OsString {
         })
         .collect::<String>();
     OsString::from(format!("grok-bridge-runtime-v1-{suffix}"))
+}
+
+#[cfg(unix)]
+fn runtime_identity() -> OsString {
+    let uid = unsafe { libc::getuid() };
+    OsString::from(format!("grok-bridge-runtime-v1-u{uid}"))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn runtime_identity() -> OsString {
+    OsString::from("grok-bridge-runtime-v1-default")
 }
 
 fn next_request_id() -> String {

@@ -1,18 +1,11 @@
-#[cfg(all(windows, target_arch = "x86_64"))]
 mod gui_fonts;
-#[cfg(all(windows, target_arch = "x86_64"))]
 mod protocol;
-#[cfg(all(windows, target_arch = "x86_64"))]
 mod server;
-#[cfg(all(windows, target_arch = "x86_64"))]
 mod session;
-#[cfg(all(windows, target_arch = "x86_64"))]
 mod terminal_gui;
-#[cfg(all(windows, target_arch = "x86_64"))]
 mod transport;
 
-#[cfg(all(windows, target_arch = "x86_64"))]
-mod windows_app {
+mod app {
     use std::{
         collections::BTreeMap,
         env,
@@ -25,7 +18,7 @@ mod windows_app {
 
     use crate::{
         protocol::{Request, ResponseEnvelope, ResponseResult, WaitCondition},
-        server, terminal_gui, transport,
+        server, session, terminal_gui, transport,
     };
 
     struct TerminalOptions {
@@ -33,12 +26,14 @@ mod windows_app {
         cwd: Option<String>,
         prompt: Option<String>,
         model: Option<String>,
+        owner: Option<String>,
         always_approve: bool,
     }
 
     enum Action {
         Rpc { request: Request, auto_start: bool },
         Terminal(TerminalOptions),
+        ServerUi,
         Doctor,
         Help,
         Version,
@@ -71,6 +66,7 @@ mod windows_app {
                 terminal_gui::run(session)?;
                 Ok(0)
             }
+            Action::ServerUi => server_ui(),
             Action::Doctor => doctor(),
             Action::Help => {
                 print_help();
@@ -144,13 +140,14 @@ mod windows_app {
 
     fn parse_server(arguments: &[OsString]) -> Result<Action> {
         let Some(command) = arguments.first().and_then(|value| value.to_str()) else {
-            bail!("server requires start, status, or stop");
+            bail!("server requires start, status, stop, or ui");
         };
         ensure_no_arguments(&arguments[1..])?;
         match command {
             "start" => rpc(Request::ServerStatus, true),
             "status" => rpc(Request::ServerStatus, false),
             "stop" => rpc(Request::ServerStop, false),
+            "ui" => Ok(Action::ServerUi),
             other => bail!("unknown server command: {other}"),
         }
     }
@@ -158,7 +155,13 @@ mod windows_app {
     fn parse_create(arguments: &[OsString]) -> Result<Action> {
         let options = parse_options(
             arguments,
-            &["--cwd", "--prompt", "--model", "--always-approve"],
+            &[
+                "--cwd",
+                "--prompt",
+                "--model",
+                "--owner",
+                "--always-approve",
+            ],
         )?;
         let cwd = match options.get("--cwd") {
             Some(cwd) => cwd.clone(),
@@ -172,6 +175,7 @@ mod windows_app {
                 cwd,
                 prompt: options.get("--prompt").cloned(),
                 model: options.get("--model").cloned(),
+                owner: options.get("--owner").cloned().or_else(default_owner),
                 always_approve: options.contains_key("--always-approve"),
             },
             true,
@@ -186,14 +190,21 @@ mod windows_app {
                 "--cwd",
                 "--prompt",
                 "--model",
+                "--owner",
                 "--always-approve",
             ],
         )?;
         let session = options.get("--session").cloned();
         if session.is_some()
-            && ["--cwd", "--prompt", "--model", "--always-approve"]
-                .iter()
-                .any(|name| options.contains_key(*name))
+            && [
+                "--cwd",
+                "--prompt",
+                "--model",
+                "--owner",
+                "--always-approve",
+            ]
+            .iter()
+            .any(|name| options.contains_key(*name))
         {
             bail!("--session cannot be combined with session creation options");
         }
@@ -202,6 +213,7 @@ mod windows_app {
             cwd: options.get("--cwd").cloned(),
             prompt: options.get("--prompt").cloned(),
             model: options.get("--model").cloned(),
+            owner: options.get("--owner").cloned().or_else(default_owner),
             always_approve: options.contains_key("--always-approve"),
         }))
     }
@@ -230,6 +242,7 @@ mod windows_app {
                 cwd,
                 prompt: options.prompt,
                 model: options.model,
+                owner: options.owner,
                 always_approve: options.always_approve,
             },
             true,
@@ -239,6 +252,44 @@ mod windows_app {
             Some(ResponseResult::Session(state)) => Ok(state.session),
             _ => bail!("runtime returned an unexpected create response"),
         }
+    }
+
+    fn default_owner() -> Option<String> {
+        ["CODEX_THREAD_ID", "CODEX_SESSION_ID"]
+            .into_iter()
+            .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+    }
+
+    fn server_ui() -> Result<i32> {
+        let response = transport::call(Request::ServerStatus, true)?;
+        ensure_success(&response)?;
+        match response.result {
+            Some(ResponseResult::ServerInfo(info)) => match info.web_url {
+                Some(url) => {
+                    open_browser(&url)?;
+                    eprintln!("grok-bridge WebUI: {url}");
+                    Ok(0)
+                }
+                None => bail!("runtime WebUI is unavailable; check server stderr"),
+            },
+            _ => bail!("runtime returned an unexpected server status response"),
+        }
+    }
+
+    fn open_browser(url: &str) -> Result<()> {
+        #[cfg(windows)]
+        let mut command = Command::new("explorer.exe");
+        #[cfg(target_os = "macos")]
+        let mut command = Command::new("open");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut command = Command::new("xdg-open");
+        #[cfg(not(any(windows, unix)))]
+        bail!("opening a browser is unsupported on this platform; visit {url}");
+        command
+            .arg(url)
+            .spawn()
+            .context("failed to open the Runtime WebUI in the default browser")?;
+        Ok(())
     }
 
     fn ensure_success(response: &ResponseEnvelope) -> Result<()> {
@@ -416,7 +467,7 @@ mod windows_app {
     }
 
     fn doctor() -> Result<i32> {
-        let grok = env::var_os("GROK_BIN").unwrap_or_else(|| OsString::from("grok.exe"));
+        let grok = env::var_os("GROK_BIN").unwrap_or_else(session::default_grok_bin);
         let output = Command::new(&grok)
             .arg("--version")
             .output()
@@ -440,7 +491,7 @@ mod windows_app {
 
     fn print_help() {
         println!(
-            "grok-bridge {}\n\nUSAGE:\n  grok-bridge server start|status|stop\n  grok-bridge create [--cwd <path>] [--prompt <text>] [--model <model>] [--always-approve]\n  grok-bridge list\n  grok-bridge show --session <handle>\n  grok-bridge read --session <handle> [--cursor <n>] [--limit <bytes>] [--wait-ms <n>]\n  grok-bridge send --session <handle> (--text <text> | --interrupt)\n  grok-bridge write --session <handle> --data-base64 <base64>\n  grok-bridge resize --session <handle> --cols <n> --rows <n>\n  grok-bridge wait --session <handle> --for tui-idle|exit [--timeout-ms <n>]\n  grok-bridge close --session <handle>\n  grok-bridge terminal --session <handle>\n  grok-bridge terminal [--cwd <path>] [--prompt <text>] [--model <model>] [--always-approve]\n  grok-bridge doctor\n\n`terminal --session` attaches to an existing persistent ConPTY session. Without `--session`, it creates a session and opens the terminal GUI. Closing the window detaches; only an explicit close-session action terminates Grok. RPC commands print one JSON response; `terminal` is the interactive exception. Every session command auto-starts one per-user runtime Server when needed.",
+            "grok-bridge {}\n\nUSAGE:\n  grok-bridge server start|status|stop|ui\n  grok-bridge create [--cwd <path>] [--prompt <text>] [--model <model>] [--owner <title>] [--always-approve]\n  grok-bridge list\n  grok-bridge show --session <handle>\n  grok-bridge read --session <handle> [--cursor <n>] [--limit <bytes>] [--wait-ms <n>]\n  grok-bridge send --session <handle> (--text <text> | --interrupt)\n  grok-bridge write --session <handle> --data-base64 <base64>\n  grok-bridge resize --session <handle> --cols <n> --rows <n>\n  grok-bridge wait --session <handle> --for tui-idle|exit [--timeout-ms <n>]\n  grok-bridge close --session <handle>\n  grok-bridge terminal --session <handle>\n  grok-bridge terminal [--cwd <path>] [--prompt <text>] [--model <model>] [--owner <title>] [--always-approve]\n  grok-bridge doctor\n\n`server ui` starts the singleton Runtime and opens its localhost WebUI. `terminal --session` attaches to an existing persistent PTY session. Without `--session`, it creates a session and opens the terminal GUI. Closing either UI only detaches; only an explicit close action terminates Grok. RPC commands print one JSON response; interactive UI commands are exceptions. Every session command auto-starts one per-user Runtime Server when needed.",
             env!("CARGO_PKG_VERSION")
         );
     }
@@ -553,13 +604,6 @@ mod windows_app {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
 fn main() {
-    windows_app::main();
-}
-
-#[cfg(not(all(windows, target_arch = "x86_64")))]
-fn main() {
-    eprintln!("grok-bridge 0.3 currently supports Windows x86_64 only");
-    std::process::exit(1);
+    app::main();
 }

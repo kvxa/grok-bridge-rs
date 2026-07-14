@@ -1,142 +1,146 @@
 # grok-build Local Runtime Skill
 
-`grok-build` v0.3.0 是一个可直接解压使用的 Windows x86_64 Agent Skill。Codex 通过随包发布的 `grok-bridge.exe` 调用本机 Grok Runtime；不需要 Python、安装脚本或额外服务。
+`grok-build` v0.4.0 是一个可直接解压使用的跨平台 Agent Skill。Codex 通过随包发布的原生 `grok-bridge` 调用本机 Grok Runtime；不需要 Python、MCP、安装脚本或额外服务。
 
-Runtime 采用 Orca 风格的持久终端会话。CLI 自动启动每用户单例 Server，通过本地 Windows Named Pipe 交换 NDJSON；Server 持有 Grok CLI 的 ConPTY、会话状态和有界终端输出。RPC 命令向 STDOUT 返回一行 JSON，`terminal` 则打开交互式 egui 终端窗口。
+Runtime 维护每用户单例 Server 和持久 PTY 会话。CLI 通过本地 IPC 交换有界 NDJSON：Windows 使用 Named Pipe，Linux 使用抽象 Unix Socket，macOS 使用 `/tmp` 下的 Unix Socket。Server 持有 Grok CLI、会话状态和终端输出；RPC 命令向 STDOUT 返回一行 JSON，`terminal` 打开单会话 egui 终端，内置 localhost WebUI 则集中查看和关闭会话。
 
 ```text
 Codex / JSON CLI       egui terminal
           \               /
-           Windows Named Pipe (NDJSON)
-                       │
-              单例 Runtime Server
-                       │
-                    ConPTY
-                       │
-                    Grok CLI
+             local IPC       localhost WebUI
+                 \             /
+             singleton Runtime Server
+                         │
+                        PTY
+                         │
+                     Grok CLI
 ```
 
-## 系统要求
+## 支持平台
 
-- Windows 10 1809 或更高版本；
-- Windows x86_64；
-- 已安装并登录的 Grok CLI，`grok --version` 可正常执行。
+| 平台 | Release 目录 | Rust target |
+| --- | --- | --- |
+| Windows x86_64 | `bin/windows-x86_64` | `x86_64-pc-windows-msvc` |
+| Windows ARM64 | `bin/windows-arm64` | `aarch64-pc-windows-msvc` |
+| Linux x86_64 | `bin/linux-x86_64` | `x86_64-unknown-linux-gnu` |
+| Linux ARM64 | `bin/linux-arm64` | `aarch64-unknown-linux-gnu` |
+| macOS Intel | `bin/macos-x86_64` | `x86_64-apple-darwin` |
+| macOS Apple Silicon | `bin/macos-arm64` | `aarch64-apple-darwin` |
 
-默认从 `PATH` 查找原生 `grok.exe`，避免把 pnpm 的无扩展名脚本误交给 ConPTY。`GROK_BIN` 可指定可信的原生 Grok 可执行文件；`GROK_BRIDGE_ALLOWED_ROOTS` 可限制允许创建会话的仓库根目录。
+所有平台都要求已安装并登录 Grok CLI，且 `grok --version` 可执行。默认从 `PATH` 查找 Windows 上的 `grok.exe` 或 Unix 上的 `grok`；`GROK_BIN` 可指定可信的原生可执行文件，`GROK_BRIDGE_ALLOWED_ROOTS` 可限制允许创建会话的仓库根目录。
 
-egui terminal 启动时会验证字体字形覆盖。Windows 默认将 Consolas 放在比例字体和等宽字体链的首位显示英文，再由微软雅黑（`msyh.ttc`）显示中文；因此终端和状态栏均保持英文等宽、中文清晰。代码也为后续 macOS/Linux 构建保留系统字体、Fontconfig、Noto CJK、文泉驿和 Source Han 候选。可用 `GROK_BRIDGE_CJK_FONT` 显式覆盖中文 `.ttf`、`.otf` 或 `.ttc` 字体；字体集合可用 `GROK_BRIDGE_CJK_FONT_INDEX` 指定非负 face index。
+Linux GUI 使用 X11 后端。构建机需要 eframe 所需的 XCB/XKB 开发库；运行机需要可用的 X11 会话。无图形桌面时仍可使用 JSON CLI，不要调用 `terminal`。
 
 ## 安装
 
-从 GitHub Releases 下载 `grok-build-skill-v0.3.0.zip` 和对应 `.sha256`，校验后直接解压到用户 Skills 目录：
+从 GitHub Releases 下载 `grok-build-skill-v0.4.0.zip` 和对应 `.sha256`。ZIP 同时包含六个平台的原生二进制，解压一次即可保留统一 Skill 目录。
+
+Windows PowerShell：
 
 ```powershell
-Expand-Archive .\grok-build-skill-v0.3.0.zip "$env:USERPROFILE\.agents\skills" -Force
+Expand-Archive .\grok-build-skill-v0.4.0.zip "$env:USERPROFILE\.agents\skills" -Force
+$bridge = "$env:USERPROFILE\.agents\skills\grok-build\bin\windows-x86_64\grok-bridge.exe"
 ```
 
-安装后应存在：
+Linux/macOS：
+
+```sh
+unzip grok-build-skill-v0.4.0.zip -d "$HOME/.agents/skills"
+bridge="$HOME/.agents/skills/grok-build/bin/linux-x86_64/grok-bridge"
+```
+
+按实际系统和架构替换路径；例如 Apple Silicon 使用 `bin/macos-arm64/grok-bridge`。安装后目录应为：
 
 ```text
-%USERPROFILE%\.agents\skills\grok-build\
+~/.agents/skills/grok-build/
 ├── SKILL.md
-├── agents\openai.yaml
-└── bin\windows-x86_64\grok-bridge.exe
+├── agents/openai.yaml
+└── bin/
+    ├── windows-x86_64/grok-bridge.exe
+    ├── windows-arm64/grok-bridge.exe
+    ├── linux-x86_64/grok-bridge
+    ├── linux-arm64/grok-bridge
+    ├── macos-x86_64/grok-bridge
+    └── macos-arm64/grok-bridge
 ```
 
-重启 Codex 后调用 `$grok-build`。手工安装时也只需复制以上三个文件并保持目录结构。
+Release workflow 会恢复 Linux/macOS 二进制的执行位。若解压工具丢失权限，手工执行 `chmod +x <bridge>`。当前 Release 未做 Windows 代码签名或 macOS notarization；系统出现来源警告时，应先核对 SHA-256 再决定是否放行。
 
 ## Codex 自动化工作流
 
-```powershell
-$bridge = "$env:USERPROFILE\.agents\skills\grok-build\bin\windows-x86_64\grok-bridge.exe"
+先运行 `doctor`，再创建会话并保存 JSON 中的 `result.value.session`：
 
-$created = & $bridge create `
-    --cwd (Get-Location).Path `
-    --prompt '实现当前任务并运行相关测试。' `
-    --always-approve | ConvertFrom-Json
-$session = $created.result.value.session
-
-& $bridge show --session $session
-& $bridge read --session $session --cursor 0 --limit 4096 --wait-ms 5000
-& $bridge wait --session $session --for tui-idle --timeout-ms 300000
+```text
+<bridge> doctor
+<bridge> create --cwd <absolute-repository-path> --owner "<当前 Codex 对话的简短标题>" --prompt "实现当前任务并运行相关测试。"
+<bridge> show --session <session>
+<bridge> read --session <session> --cursor 0 --limit 4096 --wait-ms 5000
+<bridge> wait --session <session> --for tui-idle --timeout-ms 300000
 ```
 
-验收后可提交后续输入，或显式终止会话：
+验收后可在同一 PTY 中继续输入，或显式终止会话：
 
-```powershell
-& $bridge send --session $session --text '只修复验收发现的问题，并重新运行测试。'
-& $bridge wait --session $session --for tui-idle --timeout-ms 300000
-& $bridge close --session $session
+```text
+<bridge> send --session <session> --text "只修复验收发现的问题，并重新运行测试。"
+<bridge> wait --session <session> --for tui-idle --timeout-ms 300000
+<bridge> close --session <session>
 ```
 
-Codex 自动化应继续优先使用 `create/read/wait/show/send` 的 JSON 接口，不应依赖需要人工交互且会持续运行到窗口关闭的 GUI。
+Codex 每次创建 Grok 前都应把当前对话概括成简短、易辨认且不含秘密的标题，并通过 `--owner` 显式传入。同一个 Codex 对话创建后续 Grok 时复用完全相同的标题，WebUI 会据此分组。未显式传入时，CLI 仍依次读取 `CODEX_THREAD_ID`、`CODEX_SESSION_ID` 作为兼容回退。owner 最长 128 bytes，不能包含控制字符。
+
+Codex 自动化应优先使用 `create/read/wait/show/send` 的 JSON 接口。每轮后仍需独立检查 `git status`、`git diff` 并运行仓库要求的测试；`tui-idle` 只表示终端状态，不代表实现通过验收。Runtime 不再设置固定的 64 会话上限，但每个活跃会话都会占用 Grok 进程、PTY 和内存，应及时关闭不再使用的会话。
+
+## localhost 会话面板
+
+执行以下命令会按需启动单例 Runtime Server，并在默认浏览器打开 WebUI：
+
+```text
+<bridge> server ui
+```
+
+页面按 Codex 对话标题归类 Grok 会话，每 2 秒刷新会话 ID、状态、闲置时间、工作目录和终端当前屏幕。确认终端内容后点击“关闭 Grok”，会终止对应进程并从 Runtime 删除该会话；关闭浏览器标签页不会影响任何会话。
+
+默认监听 `127.0.0.1:47653`。可在 Server 第一次启动前通过 `GROK_BRIDGE_WEB_ADDR` 更换地址；WebUI 没有用户认证，因此必须保持在可信回环地址，不要绑定 `0.0.0.0` 或对外网卡。若端口绑定失败，JSON CLI 和 PTY 会话仍可使用，但 `server ui` 会报告 WebUI 不可用。
 
 ## 交互式终端
 
 附着到 Server 已持有的会话：
 
-```powershell
-& $bridge terminal --session $session
+```text
+<bridge> terminal --session <session>
 ```
 
-也可创建会话后立即打开终端：
+也可用 `terminal [--cwd <path>] [--prompt <text>] [--model <model>] [--owner <label>] [--always-approve]` 创建会话后立即打开。关闭窗口只会 detach；只有终端工具栏的“关闭会话”、WebUI 的“关闭”、`close --session` 或 `server stop` 才会终止 Grok。egui 终端只负责单会话交互，不是会话管理面板。
 
-```powershell
-& $bridge terminal `
-    --cwd (Get-Location).Path `
-    --prompt '检查当前实现并等待我的后续输入。'
-```
+终端支持 ANSI 样式、宽字符、光标、中文 IME、括号粘贴、常用控制键、文本选择、剪贴板、scrollback 和 PTY resize。启动时会发现系统字体；可用 `GROK_BRIDGE_CJK_FONT` 指定中文 `.ttf`、`.otf` 或 `.ttc`，字体集合可用 `GROK_BRIDGE_CJK_FONT_INDEX` 指定 face index。
 
-`--model`、`--prompt` 和 `--always-approve` 都是可选参数。不带 `--cwd` 时使用当前目录。关闭窗口只会 detach，Grok 和会话仍由 Server 持有；只有终端工具栏的“关闭会话”、`close --session` 或 `server stop` 才会终止会话。
+## 命令与协议
 
-终端使用逐 cell 渲染，支持 ANSI 颜色、粗体、下划线、反色、暗色、宽字符和光标。输入支持中文 IME、文本输入、括号粘贴、控制键、Alt、方向键、Home/End、Insert/Delete、PageUp/PageDown 和 F1-F12。鼠标拖动可选择文本，Ctrl+C 在存在选择时复制，否则发送中断；滚轮浏览有界 scrollback，窗口尺寸变化会同步调整 ConPTY。
-
-## 命令
-
-- `server start|status|stop`：管理单例 Runtime；
-- `create`：创建由 Server 持有的 Grok ConPTY 会话；
-- `list` / `show`：查询会话列表或当前终端状态；
-- `read`：按字节 cursor 增量读取有界原始输出；
-- `send --text` / `send --interrupt`：提交高层文本或 Ctrl+C；
-- `write --data-base64`：向 ConPTY 写入不经改写的原始字节；
-- `resize --cols --rows`：调整 ConPTY 和服务端终端屏幕；
+- `server start|status|stop|ui`：管理单例 Runtime，并打开 localhost 会话面板；
+- `create`、`list`、`show`、`read`：创建或查询会话与有界输出；
+- `send --text`、`send --interrupt`：提交文本或 Ctrl+C；
+- `write --data-base64`、`resize`：发送原始字节或调整 PTY；
 - `wait --for tui-idle|exit`：等待 TUI 空闲或进程退出；
 - `close`：终止并移除会话；
-- `terminal`：附着现有会话，或创建后打开 egui 终端；
+- `terminal`：附着现有会话，或创建后打开 GUI；
 - `doctor`：检查 Grok CLI 和 Server 状态。
 
-除 `server status`、`server stop` 外，会话命令会在需要时自动启动 Server。Server 退出时会关闭其持有的全部会话；Runtime 状态不跨 Server 重启持久化。
-
-低层原始输入示例：
-
-```powershell
-$data = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("yes`r"))
-& $bridge write --session $session --data-base64 $data
-& $bridge resize --session $session --cols 120 --rows 36
-```
-
-正常提交 prompt 时优先使用 `send --text`；`write` 不追加回车、不做括号粘贴，也不解释字节内容。
-
-## JSON 与终端状态
-
-每个 RPC 命令向 STDOUT 写一个 `ResponseEnvelope` JSON 对象并以换行结束。成功响应包含 `result`，失败响应包含结构化 `error`。`terminal` 是交互式例外，不输出这一 JSON envelope。内部 Named Pipe 使用相同请求 ID 的单请求、单响应 NDJSON 帧，单帧上限 1 MiB。
-
-`read` 返回 `cursor`、`next_cursor`、Base64 原始增量、当前 `screen`、`truncated` 和 `eof`。保存 `next_cursor`，下一次从该位置继续读取。`show` 的会话状态还包含 `rows`、`cols` 和 `screen_ansi_base64`；GUI 先用该 ANSI 快照恢复当前屏幕，再持续消费 `read` 增量。
-
-`wait --for tui-idle` 遇到可识别的交互提示时返回 `satisfied: false` 和 `blocked_reason`，而不是误报空闲。调用方应先用 `show` 检查当前 screen，再通过 `send` 或人工终端提交明确答案。
+每个 RPC 命令向 STDOUT 写一个 `ResponseEnvelope` JSON 对象并以换行结束。成功响应包含 `result`，失败响应包含结构化 `error`；`terminal` 是交互式例外。`read` 返回 byte cursor、Base64 原始增量、当前 screen、`truncated` 和 `eof`。`wait --for tui-idle` 遇到可识别提示时返回 `satisfied: false` 和 `blocked_reason`，调用方应先 `show` 再明确回复。
 
 ## 安全边界
 
-- Grok 及其工具继承当前 Windows 用户权限，Runtime 和 GUI 都不是沙箱。
-- 只在可信仓库和可信 prompt 上使用 `--always-approve`。
-- prompt、`send --text` 和 `write` 的原始字节可能出现在进程参数或本机内存中，不要传递秘密。
-- 不要让 Codex 与人工终端同时修改相同文件；`tui-idle` 只表示终端状态，不代表实现已通过验收。
-- 每轮后独立检查 `git status`、`git diff` 并运行项目要求的测试。
+- Grok 及其工具继承当前用户权限，Runtime 和 GUI 都不是沙箱；
+- 只在可信仓库和可信 prompt 上使用 `--always-approve`；
+- prompt 和原始输入可能出现在进程参数或本机内存中，不要传递秘密；
+- owner 会显示在 JSON 和 WebUI 中，不要把 token、用户名密码或其他秘密用作 owner；
+- WebUI 没有用户认证，只允许绑定可信回环地址；
+- 不要让 Codex 与人工终端同时修改相同文件；
+- Server 退出时会关闭全部会话，状态不跨 Server 重启持久化；
 - 只从可信 Release 下载 ZIP，并验证 SHA-256。
 
 ## 开发与发布
 
-Windows 完成检查：
+本地完成前运行：
 
 ```text
 cargo fmt --check
@@ -145,4 +149,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-CI 在 Windows x86_64 上执行这些检查。`v*` Tag 触发的 Release workflow 只构建 Windows x86_64，并组装可直接解压的 Skill ZIP；本地 Agent 不自动 commit、push、创建 Tag 或发布 Release。
+CI 使用固定的原生 runner 对六个 target 分别执行测试、Clippy 和 release 构建：`windows-2025`、`windows-11-arm`、`ubuntu-24.04`、`ubuntu-24.04-arm`、`macos-15-intel` 和 `macos-15`。这避免交叉编译只能验证链接、不能执行目标架构测试的问题。
+
+`v*` Tag 触发 Release workflow，将六个二进制、`SKILL.md` 和 `agents/openai.yaml` 组装为一个通用 Skill ZIP，并生成 SHA-256 文件。本地 Agent 不自动 commit、push、创建 Tag 或发布 Release。

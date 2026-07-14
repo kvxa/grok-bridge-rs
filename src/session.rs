@@ -15,11 +15,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT},
-    System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject},
-};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::protocol::{
     MAX_WRITE_BYTES, ReadResult, SessionPhase, SessionState, WaitCondition, WaitResult,
@@ -29,12 +25,10 @@ use crate::protocol::{
 const INITIAL_COLS: u16 = 120;
 const INITIAL_ROWS: u16 = 36;
 const SCROLLBACK_ROWS: usize = 5_000;
-const MAX_SESSIONS: usize = 64;
 const MAX_TRANSCRIPT_BYTES: usize = 512 * 1024;
 const MAX_READ_BYTES: usize = 64 * 1024;
 const WRITER_QUEUE_CAPACITY: usize = 64;
 const QUIET_IDLE_MILLISECONDS: u64 = 3_000;
-const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
 const PROCESS_TERMINATE_TIMEOUT_MS: u32 = 5_000;
 
 pub(crate) struct SessionHost {
@@ -63,6 +57,7 @@ impl SessionHost {
         cwd: &str,
         prompt: Option<String>,
         model: Option<String>,
+        owner: Option<String>,
         always_approve: bool,
     ) -> Result<SessionState> {
         let cwd = canonical_directory(Path::new(cwd))?;
@@ -77,17 +72,15 @@ impl SessionHost {
         if !registry.accepting {
             bail!("runtime server is stopping and no longer accepts new sessions");
         }
-        if registry.sessions.len() >= MAX_SESSIONS {
-            bail!("the runtime already contains {MAX_SESSIONS} sessions");
-        }
         let handle = self.next_handle();
         let session = Session::spawn(
             handle.clone(),
             LaunchConfig {
-                grok_bin: env::var_os("GROK_BIN").unwrap_or_else(|| OsString::from("grok.exe")),
+                grok_bin: env::var_os("GROK_BIN").unwrap_or_else(default_grok_bin),
                 cwd,
                 prompt,
                 model,
+                owner,
                 always_approve,
             },
         )?;
@@ -249,6 +242,7 @@ struct LaunchConfig {
     cwd: PathBuf,
     prompt: Option<String>,
     model: Option<String>,
+    owner: Option<String>,
     always_approve: bool,
 }
 
@@ -257,12 +251,14 @@ struct Session {
     changed: Condvar,
     writer_tx: Mutex<Option<SyncSender<Vec<u8>>>>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
     shutdown: AtomicBool,
     terminating: AtomicBool,
 }
 
 struct SessionInner {
     session: String,
+    owner: Option<String>,
     phase: SessionPhase,
     cwd: String,
     model: Option<String>,
@@ -335,21 +331,22 @@ impl Session {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .context("failed to open ConPTY")?;
+            .context("failed to open PTY")?;
         let reader = pair
             .master
             .try_clone_reader()
-            .context("failed to clone the ConPTY reader")?;
+            .context("failed to clone the PTY reader")?;
         let writer = pair
             .master
             .take_writer()
-            .context("failed to take the ConPTY writer")?;
+            .context("failed to take the PTY writer")?;
         let command = build_grok_command(&config);
         let child = pair
             .slave
             .spawn_command(command)
             .context("failed to start interactive Grok Build")?;
         drop(pair.slave);
+        let killer = child.clone_killer();
         let process_id = child
             .process_id()
             .context("Grok did not report a process ID")?;
@@ -358,6 +355,7 @@ impl Session {
         let session = Arc::new(Self {
             inner: Mutex::new(SessionInner {
                 session: handle,
+                owner: config.owner,
                 phase: SessionPhase::Starting,
                 cwd: config.cwd.to_string_lossy().into_owned(),
                 model: config.model,
@@ -384,6 +382,7 @@ impl Session {
             changed: Condvar::new(),
             writer_tx: Mutex::new(Some(writer_tx)),
             master: Mutex::new(Some(pair.master)),
+            killer: Mutex::new(Some(killer)),
             shutdown: AtomicBool::new(false),
             terminating: AtomicBool::new(false),
         });
@@ -539,9 +538,9 @@ impl Session {
         let master_guard = self
             .master
             .lock()
-            .map_err(|_| anyhow::anyhow!("ConPTY master lock was poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("PTY master lock was poisoned"))?;
         let Some(master) = master_guard.as_ref() else {
-            bail!("ConPTY master is closed");
+            bail!("PTY master is closed");
         };
         master
             .resize(PtySize {
@@ -550,7 +549,7 @@ impl Session {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .context("failed to resize ConPTY")?;
+            .context("failed to resize PTY")?;
         inner.parser.screen_mut().set_size(rows, cols);
         inner.updated_at_ms = now_millis();
         drop(master_guard);
@@ -607,7 +606,7 @@ impl Session {
         while !phase_is_terminal(inner.phase) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("Grok stopped but its ConPTY output did not close within five seconds");
+                bail!("Grok stopped but its PTY output did not close within five seconds");
             }
             let waited = self
                 .changed
@@ -615,7 +614,7 @@ impl Session {
                 .map_err(|_| anyhow::anyhow!("session wait lock was poisoned"))?;
             inner = waited.0;
             if waited.1.timed_out() && !phase_is_terminal(inner.phase) {
-                bail!("Grok stopped but its ConPTY output did not close within five seconds");
+                bail!("Grok stopped but its PTY output did not close within five seconds");
             }
         }
         Ok(())
@@ -741,19 +740,14 @@ impl Session {
     }
 
     fn request_termination(&self) -> Result<()> {
-        let process = {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session state lock was poisoned"))?;
-            if inner.process_done {
-                return Ok(());
-            }
-            inner.process_id
-        };
-        let Some(process_id) = process else {
-            bail!("Grok process ID is unavailable");
-        };
+        if self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session state lock was poisoned"))?
+            .process_done
+        {
+            return Ok(());
+        }
         if self
             .terminating
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -761,15 +755,30 @@ impl Session {
         {
             return Ok(());
         }
-        match terminate_process(process_id) {
-            Ok(()) => {
-                self.mark_exit(1);
-                self.release_master();
-                Ok(())
-            }
-            Err(error) => {
-                self.terminating.store(false, Ordering::Release);
-                Err(error)
+        let result = self
+            .killer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Grok process killer lock was poisoned"))?
+            .as_mut()
+            .context("Grok process killer is unavailable")?
+            .kill();
+        #[cfg(windows)]
+        {
+            // portable-pty 0.9 inverts the TerminateProcess result in its
+            // cloned Windows killer: success is returned as a stale OS error,
+            // while failure is returned as Ok. The waiter remains the source
+            // of truth for the actual process exit.
+            let _ = result;
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            match result {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.terminating.store(false, Ordering::Release);
+                    Err(error).context("failed to terminate Grok")
+                }
             }
         }
     }
@@ -808,6 +817,7 @@ impl SessionInner {
         let (rows, cols) = screen.size();
         SessionState {
             session: self.session.clone(),
+            owner: self.owner.clone(),
             phase: self.phase,
             cwd: self.cwd.clone(),
             model: self.model.clone(),
@@ -981,41 +991,6 @@ fn record_error(inner: &mut SessionInner, message: String) {
     inner.updated_at_ms = now_millis();
 }
 
-fn terminate_process(process_id: u32) -> Result<()> {
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, process_id) };
-    if handle.is_null() {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to open Grok process {process_id}"));
-    }
-    let result = (|| {
-        let initial = unsafe { WaitForSingleObject(handle, 0) };
-        if initial == WAIT_OBJECT_0 {
-            return Ok(());
-        }
-        if initial != WAIT_TIMEOUT {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("failed to query Grok process {process_id}"));
-        }
-        if unsafe { TerminateProcess(handle, 1) } == 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("failed to terminate Grok process {process_id}"));
-        }
-        let waited = unsafe { WaitForSingleObject(handle, PROCESS_TERMINATE_TIMEOUT_MS) };
-        if waited == WAIT_OBJECT_0 {
-            Ok(())
-        } else if waited == WAIT_TIMEOUT {
-            bail!("Grok process {process_id} did not exit within five seconds")
-        } else {
-            Err(std::io::Error::last_os_error())
-                .with_context(|| format!("failed while waiting for Grok process {process_id}"))
-        }
-    })();
-    unsafe {
-        CloseHandle(handle);
-    }
-    result
-}
-
 fn wait_satisfied(inner: &mut SessionInner, condition: WaitCondition) -> bool {
     match condition {
         WaitCondition::Exit => phase_is_terminal(inner.phase),
@@ -1086,7 +1061,7 @@ fn phase_is_terminal(phase: SessionPhase) -> bool {
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf> {
-    let canonical = normalize_windows_path(
+    let canonical = normalize_platform_path(
         path.canonicalize()
             .with_context(|| format!("failed to resolve working directory: {}", path.display()))?,
     );
@@ -1105,7 +1080,7 @@ fn ensure_allowed_root(cwd: &Path) -> Result<()> {
     };
     let mut roots = Vec::new();
     for root in env::split_paths(&value) {
-        roots.push(normalize_windows_path(root.canonicalize().with_context(
+        roots.push(normalize_platform_path(root.canonicalize().with_context(
             || format!("failed to resolve allowed root: {}", root.display()),
         )?));
     }
@@ -1119,7 +1094,8 @@ fn ensure_allowed_root(cwd: &Path) -> Result<()> {
     }
 }
 
-fn normalize_windows_path(path: PathBuf) -> PathBuf {
+#[cfg(windows)]
+fn normalize_platform_path(path: PathBuf) -> PathBuf {
     let display = path.to_string_lossy();
     if let Some(rest) = display.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{rest}"))
@@ -1127,6 +1103,19 @@ fn normalize_windows_path(path: PathBuf) -> PathBuf {
         PathBuf::from(rest)
     } else {
         path
+    }
+}
+
+#[cfg(not(windows))]
+fn normalize_platform_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+pub(crate) fn default_grok_bin() -> OsString {
+    if cfg!(windows) {
+        OsString::from("grok.exe")
+    } else {
+        OsString::from("grok")
     }
 }
 
@@ -1195,6 +1184,7 @@ mod tests {
             cwd: PathBuf::from(r"C:\repo"),
             prompt: Some("修复中文".to_owned()),
             model: Some("grok-4".to_owned()),
+            owner: None,
             always_approve: true,
         };
         let command = build_grok_command(&config);
@@ -1263,14 +1253,15 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn normalizes_windows_verbatim_paths_for_child_processes() {
         assert_eq!(
-            normalize_windows_path(PathBuf::from(r"\\?\D:\repo\project")),
+            normalize_platform_path(PathBuf::from(r"\\?\D:\repo\project")),
             PathBuf::from(r"D:\repo\project")
         );
         assert_eq!(
-            normalize_windows_path(PathBuf::from(r"\\?\UNC\server\share\repo")),
+            normalize_platform_path(PathBuf::from(r"\\?\UNC\server\share\repo")),
             PathBuf::from(r"\\server\share\repo")
         );
     }

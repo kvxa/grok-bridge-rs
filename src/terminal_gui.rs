@@ -48,12 +48,7 @@ pub(crate) fn run(session: String) -> Result<()> {
         options,
         Box::new(move |creation_context| {
             let font_status = match install_cjk_font(&creation_context.egui_ctx) {
-                Ok(font) => format!(
-                    "Fonts: Consolas ({}) + Microsoft YaHei ({}, face {})",
-                    font.latin_path.display(),
-                    font.cjk_path.display(),
-                    font.cjk_face_index
-                ),
+                Ok(font) => font_status(&font),
                 Err(error) => format!("Terminal font unavailable: {error:#}"),
             };
             Ok(Box::new(TerminalApp::new(
@@ -64,6 +59,25 @@ pub(crate) fn run(session: String) -> Result<()> {
         }),
     )
     .map_err(|error| anyhow!(error.to_string()))
+}
+
+#[cfg(windows)]
+fn font_status(font: &crate::gui_fonts::InstalledFont) -> String {
+    format!(
+        "Fonts: Consolas ({}) + Microsoft YaHei ({}, face {})",
+        font.latin_path.display(),
+        font.cjk_path.display(),
+        font.cjk_face_index
+    )
+}
+
+#[cfg(not(windows))]
+fn font_status(font: &crate::gui_fonts::InstalledFont) -> String {
+    format!(
+        "CJK font: {} (face {})",
+        font.cjk_path.display(),
+        font.cjk_face_index
+    )
 }
 
 struct Snapshot {
