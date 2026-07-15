@@ -1,6 +1,23 @@
 # grok-build Local Runtime Skill
 
-[Linux DO 社区](https://linux.do/)
+<p>
+  <a href="https://github.com/luodaoyi/grok-bridge-rs/actions/workflows/ci.yml?query=branch%3Amain"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/luodaoyi/grok-bridge-rs/ci.yml?branch=main&label=build&logo=githubactions&logoColor=white" /></a>
+  <a href="https://github.com/luodaoyi/grok-bridge-rs/actions/workflows/release.yml"><img alt="Release Workflow" src="https://img.shields.io/github/actions/workflow/status/luodaoyi/grok-bridge-rs/release.yml?label=release&logo=githubactions&logoColor=white" /></a>
+  <a href="https://github.com/luodaoyi/grok-bridge-rs/releases/latest"><img alt="Latest Release" src="https://img.shields.io/github/v/release/luodaoyi/grok-bridge-rs?display_name=tag&sort=semver" /></a>
+  <a href="https://github.com/luodaoyi/grok-bridge-rs/releases"><img alt="Release Downloads" src="https://img.shields.io/github/downloads/luodaoyi/grok-bridge-rs/total?label=release%20downloads" /></a>
+  <a href="https://github.com/luodaoyi/grok-bridge-rs/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/luodaoyi/grok-bridge-rs?style=flat" /></a>
+  <a href="https://github.com/luodaoyi/grok-bridge-rs/issues"><img alt="Issues" src="https://img.shields.io/github/issues/luodaoyi/grok-bridge-rs" /></a>
+  <a href="https://github.com/luodaoyi/grok-bridge-rs/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/luodaoyi/grok-bridge-rs" /></a>
+</p>
+
+<p>
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024%20edition-000000?logo=rust&logoColor=white" />
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-2ea043" />
+  <img alt="Transport" src="https://img.shields.io/badge/transport-Named%20Pipe%20%7C%20Unix%20Socket-0969da" />
+  <img alt="WebUI" src="https://img.shields.io/badge/WebUI-React%20%2B%20Tailwind-8250df" />
+</p>
+
+这些徽章由 GitHub Actions 和 Shields.io 根据仓库实时状态生成，会自动反映构建、Release、下载量、Star 和 Issue 变化。
 
 `grok-build` v0.6.0 是一个可直接解压使用的跨平台 Agent Skill。Codex 通过随包发布的原生 `grok-bridge` 调用本机 Grok Runtime；不需要 Python、MCP、安装脚本或额外服务。
 
@@ -198,3 +215,9 @@ cargo build --release
 CI 先在 Node.js 24 上执行一次前端测试和构建，再把相同的 `webui-dist` 提供给六个固定原生 runner，分别执行 Rust 测试、Clippy 和 release 构建：`windows-2025`、`windows-11-arm`、`ubuntu-24.04`、`ubuntu-24.04-arm`、`macos-15-intel` 和 `macos-15`。这既确保六个二进制嵌入同一份页面，也避免交叉编译只能验证链接、不能执行目标架构测试的问题。
 
 `v*` Tag 触发 Release workflow，将六个二进制、`README.md`、`SKILL.md`、`agents/openai.yaml` 和两份跨架构 Hook 模板组装为一个通用 Skill ZIP，校验模板均含 14 个协议 v4 事件，并生成 SHA-256 文件。本地 Agent 不自动 commit、push、创建 Tag 或发布 Release。
+
+## 社区与反馈
+
+- [Linux DO 社区](https://linux.do/)
+- [GitHub Issues](https://github.com/luodaoyi/grok-bridge-rs/issues)
+- [GitHub Releases](https://github.com/luodaoyi/grok-bridge-rs/releases)
