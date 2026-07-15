@@ -19,7 +19,7 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_s
 
 use crate::protocol::{
     MAX_WRITE_BYTES, ReadResult, SessionPhase, SessionState, WaitCondition, WaitResult,
-    validate_terminal_size,
+    validate_owner, validate_terminal_size,
 };
 
 const INITIAL_COLS: u16 = 120;
@@ -34,6 +34,12 @@ const PROCESS_TERMINATE_TIMEOUT_MS: u32 = 5_000;
 pub(crate) struct SessionHost {
     registry: Mutex<SessionRegistry>,
     next_id: AtomicU64,
+}
+
+pub(crate) struct CloseOwnerResult {
+    pub(crate) matched: usize,
+    pub(crate) closed: usize,
+    pub(crate) failures: Vec<String>,
 }
 
 struct SessionRegistry {
@@ -168,6 +174,51 @@ impl SessionHost {
             registry.sessions.remove(handle);
         }
         Ok(true)
+    }
+
+    pub(crate) fn close_owner(&self, owner: &str) -> Result<CloseOwnerResult> {
+        validate_owner(owner)?;
+        let sessions = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
+            let mut sessions = Vec::new();
+            for (handle, session) in &registry.sessions {
+                if session.has_owner(owner)? {
+                    sessions.push((handle.clone(), Arc::clone(session)));
+                }
+            }
+            sessions
+        };
+
+        let matched = sessions.len();
+        let mut closed = 0;
+        let mut failures = Vec::new();
+        for (handle, session) in sessions {
+            match session.shutdown() {
+                Ok(()) => {
+                    closed += 1;
+                    let mut registry = self
+                        .registry
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
+                    if registry
+                        .sessions
+                        .get(&handle)
+                        .is_some_and(|current| Arc::ptr_eq(current, &session))
+                    {
+                        registry.sessions.remove(&handle);
+                    }
+                }
+                Err(error) => failures.push(format!("{handle}: {error:#}")),
+            }
+        }
+        Ok(CloseOwnerResult {
+            matched,
+            closed,
+            failures,
+        })
     }
 
     pub(crate) fn shutdown_all(&self) -> Result<()> {
@@ -322,6 +373,16 @@ impl vt100::Callbacks for TitleCallbacks {
 }
 
 impl Session {
+    fn has_owner(&self, owner: &str) -> Result<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session state lock was poisoned"))?
+            .owner
+            .as_deref()
+            == Some(owner))
+    }
+
     fn spawn(handle: String, config: LaunchConfig) -> Result<Arc<Self>> {
         let pty_system = native_pty_system();
         let pair = pty_system

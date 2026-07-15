@@ -417,7 +417,7 @@ fn validate_session_state(session: &SessionState) -> Result<()> {
     Ok(())
 }
 
-fn validate_owner(owner: &str) -> Result<()> {
+pub(crate) fn validate_owner(owner: &str) -> Result<()> {
     if owner.trim().is_empty()
         || owner.len() > MAX_OWNER_BYTES
         || owner.chars().any(char::is_control)

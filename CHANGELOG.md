@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 - 2026-07-15
+
+- Added one-click WebUI cleanup for all Grok sessions grouped under one Codex conversation title, while leaving every other Codex group untouched.
+- Added exact UTF-8 owner routing, confirmation, result counts, and per-session failure reporting for batch close operations.
+
 ## 0.4.0 - 2026-07-15
 
 - Extended the Runtime, persistent PTY sessions, JSON CLI, and optional egui terminal from Windows x86_64 to Windows ARM64, Linux x86_64/ARM64, and macOS Intel/Apple Silicon.

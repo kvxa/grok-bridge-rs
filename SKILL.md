@@ -63,7 +63,7 @@ Use the built-in WebUI only when the user wants a browser overview or manual cle
 <bridge> server ui
 ```
 
-The command starts the singleton Runtime if needed and opens its WebUI in the default browser. The page groups Grok sessions by Codex conversation title, refreshes each terminal's current screen, phase, idle time, and working directory, and explicitly closes a selected Grok process. Closing the browser tab does nothing to sessions.
+The command starts the singleton Runtime if needed and opens its WebUI in the default browser. The page groups Grok sessions by Codex conversation title and refreshes each terminal's current screen, phase, idle time, and working directory. After checking the visible terminals, close either one Grok process or every process in that Codex title group with its batch-close button; other groups remain running. Closing the browser tab does nothing to sessions.
 
 The default address is `127.0.0.1:47653`. Keep `GROK_BRIDGE_WEB_ADDR` on a loopback address because the WebUI has no user authentication. If the port cannot be bound, JSON CLI and PTY sessions continue to work but `server ui` reports that the WebUI is unavailable.
 
