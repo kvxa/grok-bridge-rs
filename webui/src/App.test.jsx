@@ -7,6 +7,8 @@ const sessions = [
   {
     session: "gbt-a",
     owner: "Codex A/中文",
+    client_session_id: "codex-a",
+    client_state: "connected",
     phase: "running",
     title: "实现 TodoList",
     cwd: "C:\\work\\todo-a",
@@ -22,6 +24,8 @@ const sessions = [
   {
     session: "gbt-unowned",
     owner: null,
+    client_session_id: null,
+    client_state: "unmanaged",
     phase: "idle",
     title: null,
     cwd: "C:\\work\\other",
@@ -147,7 +151,7 @@ describe("App", () => {
     await renderApp();
 
     const ownedGroup = [...container.querySelectorAll("details.group")].find(
-      (group) => group.dataset.ownerKey === "owner:Codex A/中文",
+      (group) => group.dataset.ownerKey === "client:codex-a",
     );
     const sessionClose = [...ownedGroup.querySelectorAll("button")].find(
       (button) => button.textContent.trim() === "关闭 Grok",
@@ -168,7 +172,7 @@ describe("App", () => {
     await act(async () => ownerClose.click());
     await settle();
     expect(fetch).toHaveBeenCalledWith(
-      "/api/owners/Codex%20A%2F%E4%B8%AD%E6%96%87/close",
+      "/api/clients/codex-a/close",
       expect.objectContaining({
         method: "POST",
         headers: { "X-Grok-Bridge-WebUI": "1" },

@@ -18,8 +18,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::protocol::{
-    HookActivity, HookEvent, HookEventKind, MAX_WRITE_BYTES, ReadResult, SessionPhase,
-    SessionState, WaitCondition, WaitResult, validate_owner, validate_terminal_size,
+    ClientLeaseState, CloseGroupResult, HookActivity, HookEvent, HookEventKind, MAX_WRITE_BYTES,
+    ReadResult, SessionPhase, SessionState, WaitCondition, WaitResult, validate_client_session_id,
+    validate_owner, validate_terminal_size,
 };
 
 const INITIAL_COLS: u16 = 120;
@@ -31,22 +32,51 @@ const WRITER_QUEUE_CAPACITY: usize = 64;
 const QUIET_IDLE_MILLISECONDS: u64 = 3_000;
 const PROCESS_TERMINATE_TIMEOUT_MS: u32 = 5_000;
 const PROVIDER_SESSION_UUID_BYTES: usize = 16;
+const DEFAULT_CODEX_LEASE_SECONDS: u64 = 120;
+const DEFAULT_ORPHAN_GRACE_SECONDS: u64 = 600;
+const MIN_CODEX_LEASE_SECONDS: u64 = 30;
+const MAX_CODEX_LEASE_SECONDS: u64 = 24 * 60 * 60;
+const MIN_ORPHAN_GRACE_SECONDS: u64 = 60;
+const MAX_ORPHAN_GRACE_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+#[derive(Clone, Copy)]
+pub(crate) struct OrphanPolicy {
+    pub(crate) lease_ms: u64,
+    pub(crate) grace_ms: u64,
+}
+
+impl OrphanPolicy {
+    pub(crate) fn from_env() -> Result<Self> {
+        Ok(Self {
+            lease_ms: parse_duration_env(
+                "GROK_BRIDGE_CODEX_LEASE_SECONDS",
+                DEFAULT_CODEX_LEASE_SECONDS,
+                MIN_CODEX_LEASE_SECONDS,
+                MAX_CODEX_LEASE_SECONDS,
+            )?
+            .saturating_mul(1_000),
+            grace_ms: parse_duration_env(
+                "GROK_BRIDGE_ORPHAN_GRACE_SECONDS",
+                DEFAULT_ORPHAN_GRACE_SECONDS,
+                MIN_ORPHAN_GRACE_SECONDS,
+                MAX_ORPHAN_GRACE_SECONDS,
+            )?
+            .saturating_mul(1_000),
+        })
+    }
+}
 
 pub(crate) struct SessionHost {
     registry: Mutex<SessionRegistry>,
     next_id: AtomicU64,
-}
-
-pub(crate) struct CloseOwnerResult {
-    pub(crate) matched: usize,
-    pub(crate) closed: usize,
-    pub(crate) failures: Vec<String>,
+    orphan_policy: OrphanPolicy,
 }
 
 struct SessionRegistry {
     accepting: bool,
     sessions: HashMap<String, Arc<Session>>,
     provider_sessions: HashMap<String, String>,
+    clients: HashMap<String, Arc<AtomicU64>>,
 }
 
 impl SessionRegistry {
@@ -58,23 +88,48 @@ impl SessionRegistry {
         {
             return false;
         }
+        let client_session_id = session.client_session_id().ok().flatten();
         self.sessions.remove(handle);
         self.provider_sessions
             .retain(|_, mapped_handle| mapped_handle != handle);
+        if let Some(client_session_id) = client_session_id
+            && !self
+                .sessions
+                .values()
+                .any(|remaining| remaining.has_client(&client_session_id).unwrap_or(false))
+        {
+            self.clients.remove(&client_session_id);
+        }
         true
     }
 }
 
 impl SessionHost {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(orphan_policy: OrphanPolicy) -> Self {
         Self {
             registry: Mutex::new(SessionRegistry {
                 accepting: true,
                 sessions: HashMap::new(),
                 provider_sessions: HashMap::new(),
+                clients: HashMap::new(),
             }),
             next_id: AtomicU64::new(1),
+            orphan_policy,
         }
+    }
+
+    pub(crate) fn touch_client(&self, client_session_id: &str) -> Result<()> {
+        validate_client_session_id(client_session_id)?;
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
+        registry
+            .clients
+            .entry(client_session_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .store(now_millis(), Ordering::Release);
+        Ok(())
     }
 
     pub(crate) fn create(
@@ -84,6 +139,7 @@ impl SessionHost {
         model: Option<String>,
         owner: Option<String>,
         always_approve: bool,
+        client_session_id: Option<String>,
     ) -> Result<SessionState> {
         let cwd = canonical_directory(Path::new(cwd))?;
         ensure_allowed_root(&cwd)?;
@@ -97,6 +153,18 @@ impl SessionHost {
         if !registry.accepting {
             bail!("runtime server is stopping and no longer accepts new sessions");
         }
+        let client_lease = if let Some(client_session_id) = client_session_id.as_deref() {
+            validate_client_session_id(client_session_id)?;
+            let lease = registry
+                .clients
+                .entry(client_session_id.to_owned())
+                .or_insert_with(|| Arc::new(AtomicU64::new(now_millis())))
+                .clone();
+            lease.store(now_millis(), Ordering::Release);
+            Some(lease)
+        } else {
+            None
+        };
         let handle = self.next_handle();
         let provider_session_id = generate_provider_session_id()?;
         if registry
@@ -115,6 +183,9 @@ impl SessionHost {
                 model,
                 owner,
                 always_approve,
+                client_session_id,
+                client_lease,
+                orphan_policy: self.orphan_policy,
             },
         )?;
         let state = session.state()?;
@@ -226,7 +297,7 @@ impl SessionHost {
         Ok(true)
     }
 
-    pub(crate) fn close_owner(&self, owner: &str) -> Result<CloseOwnerResult> {
+    pub(crate) fn close_owner(&self, owner: &str) -> Result<CloseGroupResult> {
         validate_owner(owner)?;
         let sessions = {
             let registry = self
@@ -258,7 +329,78 @@ impl SessionHost {
                 Err(error) => failures.push(format!("{handle}: {error:#}")),
             }
         }
-        Ok(CloseOwnerResult {
+        Ok(CloseGroupResult {
+            matched,
+            closed,
+            failures,
+        })
+    }
+
+    pub(crate) fn close_client(&self, client_session_id: &str) -> Result<CloseGroupResult> {
+        validate_client_session_id(client_session_id)?;
+        let sessions = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
+            let mut sessions = Vec::new();
+            for (handle, session) in &registry.sessions {
+                if session.has_client(client_session_id)? {
+                    sessions.push((handle.clone(), Arc::clone(session)));
+                }
+            }
+            sessions
+        };
+        let result = self.close_sessions(sessions)?;
+        if result.failures.is_empty() {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
+            registry.clients.remove(client_session_id);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn reap_orphans(&self) -> Result<CloseGroupResult> {
+        let now = now_millis();
+        let sessions = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
+            let mut sessions = Vec::new();
+            for (handle, session) in &registry.sessions {
+                if session.claim_orphan_cleanup(now)? {
+                    sessions.push((handle.clone(), Arc::clone(session)));
+                }
+            }
+            sessions
+        };
+        self.close_sessions(sessions)
+    }
+
+    fn close_sessions(&self, sessions: Vec<(String, Arc<Session>)>) -> Result<CloseGroupResult> {
+        let matched = sessions.len();
+        let mut closed = 0;
+        let mut failures = Vec::new();
+        for (handle, session) in sessions {
+            match session.shutdown() {
+                Ok(()) => {
+                    closed += 1;
+                    let mut registry = self
+                        .registry
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
+                    registry.remove_session(&handle, &session);
+                }
+                Err(error) => {
+                    session.cleanup_claimed.store(false, Ordering::Release);
+                    failures.push(format!("{handle}: {error:#}"));
+                }
+            }
+        }
+        Ok(CloseGroupResult {
             matched,
             closed,
             failures,
@@ -333,6 +475,9 @@ struct LaunchConfig {
     model: Option<String>,
     owner: Option<String>,
     always_approve: bool,
+    client_session_id: Option<String>,
+    client_lease: Option<Arc<AtomicU64>>,
+    orphan_policy: OrphanPolicy,
 }
 
 struct Session {
@@ -343,12 +488,17 @@ struct Session {
     killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
     shutdown: AtomicBool,
     terminating: AtomicBool,
+    cleanup_claimed: AtomicBool,
 }
 
 struct SessionInner {
     session: String,
     owner: Option<String>,
+    client_session_id: Option<String>,
+    client_lease: Option<Arc<AtomicU64>>,
+    orphan_policy: OrphanPolicy,
     phase: SessionPhase,
+    phase_changed_at_ms: u64,
     cwd: String,
     model: Option<String>,
     always_approve: bool,
@@ -380,6 +530,7 @@ struct HookState {
     last_event_at_ms: Option<u64>,
     tool_name: Option<String>,
     waiting_reason: Option<String>,
+    turn_done: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -445,6 +596,25 @@ impl Session {
             == Some(owner))
     }
 
+    fn has_client(&self, client_session_id: &str) -> Result<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session state lock was poisoned"))?
+            .client_session_id
+            .as_deref()
+            == Some(client_session_id))
+    }
+
+    fn client_session_id(&self) -> Result<Option<String>> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session state lock was poisoned"))?
+            .client_session_id
+            .clone())
+    }
+
     fn spawn(handle: String, provider_session_id: &str, config: LaunchConfig) -> Result<Arc<Self>> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -479,7 +649,11 @@ impl Session {
             inner: Mutex::new(SessionInner {
                 session: handle,
                 owner: config.owner,
+                client_session_id: config.client_session_id,
+                client_lease: config.client_lease,
+                orphan_policy: config.orphan_policy,
                 phase: SessionPhase::Starting,
+                phase_changed_at_ms: now,
                 cwd: config.cwd.to_string_lossy().into_owned(),
                 model: config.model,
                 always_approve: config.always_approve,
@@ -509,6 +683,7 @@ impl Session {
             killer: Mutex::new(Some(killer)),
             shutdown: AtomicBool::new(false),
             terminating: AtomicBool::new(false),
+            cleanup_claimed: AtomicBool::new(false),
         });
 
         spawn_reader(Arc::clone(&session), reader);
@@ -522,7 +697,25 @@ impl Session {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("session state lock was poisoned"))?;
-        Ok(inner.to_state())
+        Ok(inner.to_state(now_millis(), self.cleanup_claimed.load(Ordering::Acquire)))
+    }
+
+    fn claim_orphan_cleanup(&self, now: u64) -> Result<bool> {
+        if self.cleanup_claimed.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session state lock was poisoned"))?;
+        if !inner.orphan_cleanup_due(now) {
+            return Ok(false);
+        }
+        drop(inner);
+        Ok(self
+            .cleanup_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok())
     }
 
     fn apply_hook_event(&self, event: HookEvent) -> Result<()> {
@@ -542,34 +735,52 @@ impl Session {
             }
         }
 
-        match hook_effect(&event) {
+        let now = now_millis();
+        let effect = if inner.hook.turn_done
+            && !matches!(
+                event.kind,
+                HookEventKind::SessionStart
+                    | HookEventKind::UserPromptSubmit
+                    | HookEventKind::Stop
+                    | HookEventKind::StopFailure
+                    | HookEventKind::SessionEnd
+            ) {
+            HookEffect::RecordOnly
+        } else {
+            hook_effect(&event)
+        };
+        match effect {
             HookEffect::Reset => {
                 inner.hook.activity = HookActivity::Unknown;
                 inner.hook.tool_name = None;
                 inner.hook.waiting_reason = None;
+                inner.hook.turn_done = false;
             }
             HookEffect::Working { tool_name } => {
                 inner.hook.activity = HookActivity::Working;
                 inner.hook.tool_name = tool_name;
                 inner.hook.waiting_reason = None;
-                inner.phase = SessionPhase::Running;
+                if event.kind == HookEventKind::UserPromptSubmit {
+                    inner.hook.turn_done = false;
+                }
+                set_phase(&mut inner, SessionPhase::Running, now);
             }
             HookEffect::Waiting { tool_name, reason } => {
                 inner.hook.activity = HookActivity::Waiting;
                 inner.hook.tool_name = tool_name;
                 inner.hook.waiting_reason = Some(reason);
-                inner.phase = SessionPhase::Running;
+                set_phase(&mut inner, SessionPhase::Running, now);
             }
             HookEffect::Done => {
                 inner.hook.activity = HookActivity::Done;
                 inner.hook.tool_name = None;
                 inner.hook.waiting_reason = None;
-                inner.phase = SessionPhase::Idle;
+                inner.hook.turn_done = true;
+                set_phase(&mut inner, SessionPhase::Idle, now);
             }
             HookEffect::RecordOnly => {}
         }
 
-        let now = now_millis();
         inner.hook.last_event = Some(event.kind);
         inner.hook.last_event_at_ms = Some(now);
         inner.updated_at_ms = now;
@@ -686,13 +897,15 @@ impl Session {
         };
         match writer.try_send(data) {
             Ok(()) => {
+                let now = now_millis();
                 if starts_turn {
-                    inner.phase = SessionPhase::Running;
+                    set_phase(&mut inner, SessionPhase::Running, now);
                     inner.hook.activity = HookActivity::Working;
                     inner.hook.tool_name = None;
                     inner.hook.waiting_reason = None;
+                    inner.hook.turn_done = false;
                 }
-                inner.updated_at_ms = now_millis();
+                inner.updated_at_ms = now;
                 drop(writer_guard);
                 drop(inner);
                 self.changed.notify_all();
@@ -821,7 +1034,7 @@ impl Session {
         let callbacks = inner.parser.callbacks_mut();
         let title_updated = std::mem::take(&mut callbacks.title_updated);
         let responses = std::mem::take(&mut callbacks.responses);
-        inner.phase = phase_after_output(
+        let phase = phase_after_output(
             inner.phase,
             inner.title.as_deref(),
             title_updated,
@@ -830,6 +1043,7 @@ impl Session {
             inner.error.is_some(),
             self.shutdown.load(Ordering::Acquire),
         );
+        set_phase(&mut inner, phase, now);
         inner.last_output_at_ms = Some(now);
         inner.updated_at_ms = now;
         inner.chunks.push_back(OutputChunk { start, data });
@@ -1001,12 +1215,19 @@ impl Session {
 }
 
 impl SessionInner {
-    fn to_state(&self) -> SessionState {
+    fn to_state(&self, now: u64, cleanup_claimed: bool) -> SessionState {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
+        let (client_state, client_last_seen_at_ms, orphaned_at_ms, auto_close_at_ms) =
+            self.client_lifecycle(now, cleanup_claimed);
         SessionState {
             session: self.session.clone(),
             owner: self.owner.clone(),
+            client_session_id: self.client_session_id.clone(),
+            client_state,
+            client_last_seen_at_ms,
+            orphaned_at_ms,
+            auto_close_at_ms,
             phase: self.phase,
             cwd: self.cwd.clone(),
             model: self.model.clone(),
@@ -1031,6 +1252,40 @@ impl SessionInner {
         }
     }
 
+    fn client_lifecycle(
+        &self,
+        now: u64,
+        cleanup_claimed: bool,
+    ) -> (ClientLeaseState, Option<u64>, Option<u64>, Option<u64>) {
+        let Some(lease) = self.client_lease.as_ref() else {
+            return (ClientLeaseState::Unmanaged, None, None, None);
+        };
+        let last_seen = lease.load(Ordering::Acquire);
+        let lease_expires_at = last_seen.saturating_add(self.orphan_policy.lease_ms);
+        if cleanup_claimed {
+            return (ClientLeaseState::Closing, Some(last_seen), None, None);
+        }
+        if now <= lease_expires_at {
+            return (ClientLeaseState::Connected, Some(last_seen), None, None);
+        }
+        if !phase_is_safe_for_orphan_cleanup(self.phase) {
+            return (ClientLeaseState::Disconnected, Some(last_seen), None, None);
+        }
+        let orphaned_at = lease_expires_at.max(self.phase_changed_at_ms);
+        let auto_close_at = orphaned_at.saturating_add(self.orphan_policy.grace_ms);
+        (
+            ClientLeaseState::Orphaned,
+            Some(last_seen),
+            Some(orphaned_at),
+            Some(auto_close_at),
+        )
+    }
+
+    fn orphan_cleanup_due(&self, now: u64) -> bool {
+        let (_, _, _, auto_close_at) = self.client_lifecycle(now, false);
+        auto_close_at.is_some_and(|deadline| now >= deadline)
+    }
+
     fn wait_result(
         &self,
         condition: WaitCondition,
@@ -1048,6 +1303,33 @@ impl SessionInner {
             blocked_reason: blocked_reason.map(str::to_owned),
         }
     }
+}
+
+fn set_phase(inner: &mut SessionInner, phase: SessionPhase, now: u64) {
+    if inner.phase != phase {
+        inner.phase = phase;
+        inner.phase_changed_at_ms = now;
+    }
+}
+
+fn phase_is_safe_for_orphan_cleanup(phase: SessionPhase) -> bool {
+    phase == SessionPhase::Idle || phase_is_terminal(phase)
+}
+
+fn parse_duration_env(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .to_str()
+        .with_context(|| format!("{name} must be valid Unicode"))?;
+    let seconds = value
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be an integer number of seconds"))?;
+    if !(min..=max).contains(&seconds) {
+        bail!("{name} must be between {min} and {max} seconds");
+    }
+    Ok(seconds)
 }
 
 fn generate_provider_session_id() -> Result<String> {
@@ -1071,11 +1353,14 @@ fn generate_provider_session_id() -> Result<String> {
 fn hook_effect(event: &HookEvent) -> HookEffect {
     match event.kind {
         HookEventKind::SessionStart => HookEffect::Reset,
-        HookEventKind::UserPromptSubmit
-        | HookEventKind::PostToolUse
-        | HookEventKind::PostToolUseFailure => HookEffect::Working {
+        HookEventKind::UserPromptSubmit => HookEffect::Working {
             tool_name: event.tool_name.clone(),
         },
+        HookEventKind::PostToolUse
+        | HookEventKind::PostToolUseFailure
+        | HookEventKind::PermissionDenied
+        | HookEventKind::PreCompact
+        | HookEventKind::PostCompact => HookEffect::Working { tool_name: None },
         HookEventKind::PreToolUse if is_ask_user_question(event.tool_name.as_deref()) => {
             HookEffect::Waiting {
                 tool_name: event.tool_name.clone(),
@@ -1092,6 +1377,7 @@ fn hook_effect(event: &HookEvent) -> HookEffect {
             HookEffect::Done
         }
         HookEventKind::Notification => notification_effect(event),
+        HookEventKind::SubagentStart | HookEventKind::SubagentStop => HookEffect::RecordOnly,
     }
 }
 
@@ -1248,9 +1534,10 @@ fn finalize_session(inner: &mut SessionInner, shutdown: bool) -> bool {
     ) else {
         return false;
     };
-    inner.phase = phase;
+    let now = now_millis();
+    set_phase(inner, phase, now);
     inner.process_id = None;
-    inner.updated_at_ms = now_millis();
+    inner.updated_at_ms = now;
     true
 }
 
@@ -1331,8 +1618,9 @@ fn wait_satisfied(inner: &mut SessionInner, condition: WaitCondition) -> bool {
                 )
                 && quiet
             {
-                inner.phase = SessionPhase::Idle;
-                inner.updated_at_ms = now_millis();
+                let now = now_millis();
+                set_phase(inner, SessionPhase::Idle, now);
+                inner.updated_at_ms = now;
                 return true;
             }
             false
@@ -1507,7 +1795,14 @@ mod tests {
             inner: Mutex::new(SessionInner {
                 session: "gbt-test".to_owned(),
                 owner: Some("test-owner".to_owned()),
+                client_session_id: None,
+                client_lease: None,
+                orphan_policy: OrphanPolicy {
+                    lease_ms: 120_000,
+                    grace_ms: 600_000,
+                },
                 phase,
+                phase_changed_at_ms: 1,
                 cwd: cwd.to_string_lossy().into_owned(),
                 model: Some("grok-test".to_owned()),
                 always_approve: false,
@@ -1537,6 +1832,7 @@ mod tests {
             killer: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             terminating: AtomicBool::new(false),
+            cleanup_claimed: AtomicBool::new(false),
         }
     }
 
@@ -1548,8 +1844,13 @@ mod tests {
                 accepting: true,
                 sessions: HashMap::from([(handle.clone(), session)]),
                 provider_sessions: HashMap::from([(provider_session_id.to_owned(), handle)]),
+                clients: HashMap::new(),
             }),
             next_id: AtomicU64::new(1),
+            orphan_policy: OrphanPolicy {
+                lease_ms: 120_000,
+                grace_ms: 600_000,
+            },
         }
     }
 
@@ -1576,6 +1877,12 @@ mod tests {
             model: Some("grok-4".to_owned()),
             owner: None,
             always_approve: true,
+            client_session_id: None,
+            client_lease: None,
+            orphan_policy: OrphanPolicy {
+                lease_ms: 120_000,
+                grace_ms: 600_000,
+            },
         };
         let command = build_grok_command(&config, TEST_PROVIDER_SESSION_ID);
         assert_eq!(command.get_env("GROK_BRIDGE_SESSION"), None);
@@ -1661,6 +1968,9 @@ mod tests {
             HookEventKind::UserPromptSubmit,
             HookEventKind::PostToolUse,
             HookEventKind::PostToolUseFailure,
+            HookEventKind::PermissionDenied,
+            HookEventKind::PreCompact,
+            HookEventKind::PostCompact,
         ] {
             assert!(matches!(
                 hook_effect(&hook_event(kind)),
@@ -1677,6 +1987,120 @@ mod tests {
         assert_eq!(
             hook_effect(&hook_event(HookEventKind::SessionStart)),
             HookEffect::Reset
+        );
+        for kind in [HookEventKind::SubagentStart, HookEventKind::SubagentStop] {
+            assert_eq!(hook_effect(&hook_event(kind)), HookEffect::RecordOnly);
+        }
+    }
+
+    #[test]
+    fn completed_turn_ignores_late_tool_events_until_the_next_prompt() {
+        let session = test_session(SessionPhase::Running);
+        session
+            .apply_hook_event(hook_event(HookEventKind::Stop))
+            .unwrap();
+        let stopped = session.state().unwrap();
+        assert_eq!(stopped.phase, SessionPhase::Idle);
+        assert_eq!(stopped.activity, HookActivity::Done);
+
+        let mut late = hook_event(HookEventKind::PostToolUse);
+        late.tool_name = Some("edit_file".to_owned());
+        session.apply_hook_event(late).unwrap();
+        let guarded = session.state().unwrap();
+        assert_eq!(guarded.phase, SessionPhase::Idle);
+        assert_eq!(guarded.activity, HookActivity::Done);
+        assert_eq!(guarded.tool_name, None);
+
+        session
+            .apply_hook_event(hook_event(HookEventKind::UserPromptSubmit))
+            .unwrap();
+        let resumed = session.state().unwrap();
+        assert_eq!(resumed.phase, SessionPhase::Running);
+        assert_eq!(resumed.activity, HookActivity::Working);
+    }
+
+    #[test]
+    fn lease_cleanup_only_targets_idle_or_terminal_sessions_after_grace() {
+        let session = test_session(SessionPhase::Idle);
+        let lease = Arc::new(AtomicU64::new(1_000));
+        {
+            let mut inner = session.inner.lock().unwrap();
+            inner.client_session_id = Some("codex-thread".to_owned());
+            inner.client_lease = Some(lease);
+            inner.orphan_policy = OrphanPolicy {
+                lease_ms: 100,
+                grace_ms: 200,
+            };
+            inner.phase_changed_at_ms = 900;
+            assert_eq!(
+                inner.client_lifecycle(1_050, false).0,
+                ClientLeaseState::Connected
+            );
+            let lifecycle = inner.client_lifecycle(1_101, false);
+            assert_eq!(lifecycle.0, ClientLeaseState::Orphaned);
+            assert_eq!(lifecycle.2, Some(1_100));
+            assert_eq!(lifecycle.3, Some(1_300));
+            assert!(!inner.orphan_cleanup_due(1_299));
+            assert!(inner.orphan_cleanup_due(1_300));
+
+            set_phase(&mut inner, SessionPhase::Running, 1_200);
+            let running = inner.client_lifecycle(2_000, false);
+            assert_eq!(running.0, ClientLeaseState::Disconnected);
+            assert_eq!(running.3, None);
+            assert!(!inner.orphan_cleanup_due(10_000));
+        }
+    }
+
+    #[test]
+    fn orphan_reaper_removes_expired_terminal_sessions_but_keeps_running_ones() {
+        let expired = Arc::new(AtomicU64::new(1));
+        let host = test_host(TEST_PROVIDER_SESSION_ID, SessionPhase::Exited);
+        {
+            let session = host.get("gbt-test").unwrap();
+            let mut inner = session.inner.lock().unwrap();
+            inner.client_session_id = Some("codex-expired".to_owned());
+            inner.client_lease = Some(Arc::clone(&expired));
+            inner.orphan_policy = OrphanPolicy {
+                lease_ms: 1,
+                grace_ms: 1,
+            };
+            inner.phase_changed_at_ms = 1;
+        }
+        host.registry
+            .lock()
+            .unwrap()
+            .clients
+            .insert("codex-expired".to_owned(), expired);
+        let result = host.reap_orphans().unwrap();
+        assert_eq!(result.matched, 1);
+        assert_eq!(result.closed, 1);
+        assert!(result.failures.is_empty());
+        assert!(host.list().unwrap().is_empty());
+
+        let running = Arc::new(AtomicU64::new(1));
+        let host = test_host(TEST_PROVIDER_SESSION_ID, SessionPhase::Running);
+        {
+            let session = host.get("gbt-test").unwrap();
+            let mut inner = session.inner.lock().unwrap();
+            inner.client_session_id = Some("codex-running".to_owned());
+            inner.client_lease = Some(Arc::clone(&running));
+            inner.orphan_policy = OrphanPolicy {
+                lease_ms: 1,
+                grace_ms: 1,
+            };
+            inner.phase_changed_at_ms = 1;
+        }
+        host.registry
+            .lock()
+            .unwrap()
+            .clients
+            .insert("codex-running".to_owned(), running);
+        let result = host.reap_orphans().unwrap();
+        assert_eq!(result.matched, 0);
+        assert_eq!(host.list().unwrap().len(), 1);
+        assert_eq!(
+            host.show("gbt-test").unwrap().client_state,
+            ClientLeaseState::Disconnected
         );
     }
 

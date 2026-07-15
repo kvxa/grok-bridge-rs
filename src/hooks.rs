@@ -21,7 +21,7 @@ const HOOK_FILE_NAME: &str = "grok-bridge.json";
 const MANAGED_ENV_NAME: &str = "GROK_BRIDGE_MANAGED";
 const MANAGED_ENV_VALUE: &str = "1";
 const PROTOCOL_ENV_NAME: &str = "GROK_BRIDGE_HOOK_PROTOCOL";
-const PROTOCOL_ENV_VALUE: &str = "3";
+const PROTOCOL_ENV_VALUE: &str = "4";
 const PROVIDER_SESSION_ENV_NAME: &str = "GROK_SESSION_ID";
 const MAX_STDIN_BYTES: usize = 256 * 1024;
 const MAX_PROVIDER_SESSION_ID_BYTES: usize = 256;
@@ -30,7 +30,7 @@ const MAX_SHORT_TEXT_BYTES: usize = 128;
 const MAX_MESSAGE_BYTES: usize = 1024;
 const HOOK_TIMEOUT_SECONDS: u64 = 2;
 
-const HOOK_EVENTS: [HookSpec; 9] = [
+const HOOK_EVENTS: [HookSpec; 14] = [
     HookSpec::lifecycle("SessionStart"),
     HookSpec::lifecycle("UserPromptSubmit"),
     HookSpec::lifecycle("Stop"),
@@ -39,7 +39,12 @@ const HOOK_EVENTS: [HookSpec; 9] = [
     HookSpec::tool("PreToolUse"),
     HookSpec::tool("PostToolUse"),
     HookSpec::tool("PostToolUseFailure"),
+    HookSpec::tool("PermissionDenied"),
     HookSpec::lifecycle("Notification"),
+    HookSpec::lifecycle("SubagentStart"),
+    HookSpec::lifecycle("SubagentStop"),
+    HookSpec::lifecycle("PreCompact"),
+    HookSpec::lifecycle("PostCompact"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -88,7 +93,7 @@ pub(crate) fn run_ingress_fail_open() {
         return;
     };
 
-    let _ = transport::call(
+    let _ = transport::call_anonymous(
         Request::HookEvent {
             provider_session_id,
             event,
@@ -198,7 +203,12 @@ fn parse_event_kind(value: &str) -> Option<HookEventKind> {
         "PreToolUse" | "pre_tool_use" => Some(HookEventKind::PreToolUse),
         "PostToolUse" | "post_tool_use" => Some(HookEventKind::PostToolUse),
         "PostToolUseFailure" | "post_tool_use_failure" => Some(HookEventKind::PostToolUseFailure),
+        "PermissionDenied" | "permission_denied" => Some(HookEventKind::PermissionDenied),
         "Notification" | "notification" => Some(HookEventKind::Notification),
+        "SubagentStart" | "subagent_start" => Some(HookEventKind::SubagentStart),
+        "SubagentStop" | "subagent_stop" => Some(HookEventKind::SubagentStop),
+        "PreCompact" | "pre_compact" => Some(HookEventKind::PreCompact),
+        "PostCompact" | "post_compact" => Some(HookEventKind::PostCompact),
         _ => None,
     }
 }
@@ -641,7 +651,12 @@ mod tests {
             ("PreToolUse", HookEventKind::PreToolUse),
             ("PostToolUse", HookEventKind::PostToolUse),
             ("PostToolUseFailure", HookEventKind::PostToolUseFailure),
+            ("PermissionDenied", HookEventKind::PermissionDenied),
             ("Notification", HookEventKind::Notification),
+            ("SubagentStart", HookEventKind::SubagentStart),
+            ("SubagentStop", HookEventKind::SubagentStop),
+            ("PreCompact", HookEventKind::PreCompact),
+            ("PostCompact", HookEventKind::PostCompact),
         ];
         for (name, expected) in cases {
             let payload = serde_json::to_vec(&json!({
@@ -651,8 +666,31 @@ mod tests {
             .unwrap();
             assert_eq!(parse_event(&payload, None).unwrap().1.kind, expected);
         }
-        assert!(parse_event(br#"{"hookEventName":"SubagentStart"}"#, None).is_none());
+        assert!(parse_event(br#"{"hookEventName":"UnknownEvent"}"#, None).is_none());
         assert!(parse_event(br#"{"hookEventName":"Stop"}"#, None).is_none());
+    }
+
+    #[test]
+    fn bundled_hook_templates_cover_the_current_protocol() {
+        for source in [
+            include_str!("../hooks/windows/grok-bridge.json"),
+            include_str!("../hooks/unix/grok-bridge.json"),
+        ] {
+            let document: Value = serde_json::from_str(source).unwrap();
+            let hooks = document["hooks"].as_object().unwrap();
+            assert_eq!(hooks.len(), HOOK_EVENTS.len());
+            for spec in HOOK_EVENTS {
+                let groups = hooks[spec.name].as_array().unwrap();
+                assert_eq!(groups.len(), 1);
+                if spec.tool_event {
+                    assert_eq!(groups[0]["matcher"], ".*");
+                }
+                let handler = &groups[0]["hooks"][0];
+                assert_eq!(handler["timeout"], HOOK_TIMEOUT_SECONDS);
+                assert_eq!(handler["env"][MANAGED_ENV_NAME], MANAGED_ENV_VALUE);
+                assert_eq!(handler["env"][PROTOCOL_ENV_NAME], PROTOCOL_ENV_VALUE);
+            }
+        }
     }
 
     #[test]

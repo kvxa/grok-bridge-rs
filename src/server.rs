@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -16,10 +16,10 @@ use interprocess::local_socket::{ListenerOptions, Stream, prelude::*};
 use crate::{
     protocol::{
         Request, ResponseEnvelope, ResponseResult, ServerInfo, decode_request, decode_write_data,
-        validate_owner,
+        validate_client_session_id, validate_owner,
     },
-    session::SessionHost,
-    transport::{call, read_frame, runtime_name, write_response},
+    session::{OrphanPolicy, SessionHost},
+    transport::{call_anonymous, read_frame, runtime_name, write_response},
 };
 
 pub(crate) fn run() -> Result<()> {
@@ -32,7 +32,7 @@ pub(crate) fn run() -> Result<()> {
                 ErrorKind::AddrInUse | ErrorKind::PermissionDenied
             ) =>
         {
-            if call(Request::ServerStatus, false).is_ok_and(|response| {
+            if call_anonymous(Request::ServerStatus, false).is_ok_and(|response| {
                 response.ok && matches!(response.result, Some(ResponseResult::ServerInfo(_)))
             }) {
                 return Ok(());
@@ -48,7 +48,7 @@ pub(crate) fn run() -> Result<()> {
         .and_then(|listener| listener.local_addr().ok())
         .map(|address| format!("http://{address}/"));
     let state = Arc::new(RuntimeState {
-        host: SessionHost::new(),
+        host: SessionHost::new(OrphanPolicy::from_env()?),
         started_at_ms: now_millis(),
         stopping: AtomicBool::new(false),
         web_url,
@@ -56,6 +56,10 @@ pub(crate) fn run() -> Result<()> {
     if let Some(listener) = web_listener {
         let web_state = Arc::clone(&state);
         thread::spawn(move || run_web_ui(listener, web_state));
+    }
+    {
+        let reaper_state = Arc::clone(&state);
+        thread::spawn(move || run_orphan_reaper(reaper_state));
     }
 
     for connection in listener.incoming() {
@@ -112,20 +116,42 @@ fn handle_connection(stream: Stream, state: Arc<RuntimeState>) {
     };
 
     let request_id = envelope.id;
-    let (response, stop_after_response) = match dispatch(&state, envelope.request) {
-        Ok((result, stop)) => (ResponseEnvelope::success(request_id, result), stop),
-        Err(error) => (
-            ResponseEnvelope::failure(request_id, "request_failed", format!("{error:#}")),
-            false,
-        ),
-    };
-    let _ = write_response(connection.get_mut(), &response);
+    let client_session_id = envelope.client_session_id;
+    let refresh_after_response = !matches!(envelope.request, Request::CloseCodex);
+    if let Some(client_session_id) = client_session_id.as_deref()
+        && let Err(error) = state.host.touch_client(client_session_id)
+    {
+        let response =
+            ResponseEnvelope::failure(request_id, "invalid_client_session", format!("{error:#}"));
+        let _ = write_response(connection.get_mut(), &response);
+        return;
+    }
+    let (response, stop_after_response) =
+        match dispatch(&state, envelope.request, client_session_id.as_deref()) {
+            Ok((result, stop)) => (ResponseEnvelope::success(request_id, result), stop),
+            Err(error) => (
+                ResponseEnvelope::failure(request_id, "request_failed", format!("{error:#}")),
+                false,
+            ),
+        };
+    let wrote_response = write_response(connection.get_mut(), &response).is_ok();
+    if wrote_response
+        && response.ok
+        && refresh_after_response
+        && let Some(client_session_id) = client_session_id.as_deref()
+    {
+        let _ = state.host.touch_client(client_session_id);
+    }
     if stop_after_response {
         wake_listener();
     }
 }
 
-fn dispatch(state: &RuntimeState, request: Request) -> Result<(ResponseResult, bool)> {
+fn dispatch(
+    state: &RuntimeState,
+    request: Request,
+    client_session_id: Option<&str>,
+) -> Result<(ResponseResult, bool)> {
     let result = match request {
         Request::ServerStatus => ResponseResult::ServerInfo(state.server_info()),
         Request::ServerStop => {
@@ -133,23 +159,37 @@ fn dispatch(state: &RuntimeState, request: Request) -> Result<(ResponseResult, b
             state.host.shutdown_all()?;
             return Ok((ResponseResult::Accepted { accepted: true }, true));
         }
+        Request::Heartbeat => {
+            let client_session_id = client_session_id.context(
+                "heartbeat requires CODEX_THREAD_ID or CODEX_SESSION_ID in the client environment",
+            )?;
+            state.host.touch_client(client_session_id)?;
+            ResponseResult::Accepted { accepted: true }
+        }
+        Request::CloseCodex => {
+            let client_session_id = client_session_id.context(
+                "close_codex requires CODEX_THREAD_ID or CODEX_SESSION_ID in the client environment",
+            )?;
+            ResponseResult::CloseGroup(state.host.close_client(client_session_id)?)
+        }
         Request::Create {
             cwd,
             prompt,
             model,
             owner,
             always_approve,
-        } => ResponseResult::Session(state.host.create(
+        } => ResponseResult::Session(Box::new(state.host.create(
             &cwd,
             prompt,
             model,
             owner,
             always_approve,
-        )?),
+            client_session_id.map(str::to_owned),
+        )?)),
         Request::List => ResponseResult::Sessions {
             sessions: state.host.list()?,
         },
-        Request::Show { session } => ResponseResult::Session(state.host.show(&session)?),
+        Request::Show { session } => ResponseResult::Session(Box::new(state.host.show(&session)?)),
         Request::Read {
             session,
             cursor,
@@ -162,7 +202,7 @@ fn dispatch(state: &RuntimeState, request: Request) -> Result<(ResponseResult, b
             wait_ms.unwrap_or(0),
         )?),
         Request::Send { session, input } => {
-            ResponseResult::Session(state.host.send(&session, input)?)
+            ResponseResult::Session(Box::new(state.host.send(&session, input)?))
         }
         Request::Write {
             session,
@@ -201,6 +241,18 @@ fn dispatch(state: &RuntimeState, request: Request) -> Result<(ResponseResult, b
         },
     };
     Ok((result, false))
+}
+
+fn run_orphan_reaper(state: Arc<RuntimeState>) {
+    while !state.stopping.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_secs(5));
+        if state.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(error) = state.host.reap_orphans() {
+            eprintln!("grok-bridge server: orphan cleanup failed: {error:#}");
+        }
+    }
 }
 
 impl RuntimeState {
@@ -279,6 +331,62 @@ fn handle_web_connection(mut stream: TcpStream, state: Arc<RuntimeState>) {
                 );
             }
         },
+        ("POST", path) if path.starts_with("/api/clients/") => {
+            let Some(encoded_client) = close_path_segment(path, "/api/clients/") else {
+                let _ = write_http(
+                    &mut stream,
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    "not found",
+                );
+                return;
+            };
+            if !bridge_header {
+                let _ = write_http(
+                    &mut stream,
+                    "403 Forbidden",
+                    "text/plain; charset=utf-8",
+                    "missing WebUI request header",
+                );
+                return;
+            }
+            let client_session_id = match percent_decode_path_segment(encoded_client) {
+                Ok(client_session_id) => client_session_id,
+                Err(error) => {
+                    let _ = write_http(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain; charset=utf-8",
+                        &error,
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = validate_client_session_id(&client_session_id) {
+                let _ = write_http(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    &format!("{error:#}"),
+                );
+                return;
+            }
+            match state.host.close_client(&client_session_id) {
+                Ok(result) => {
+                    let body = serde_json::to_string(&result)
+                        .unwrap_or_else(|_| r#"{"matched":0,"closed":0,"failures":[]}"#.to_owned());
+                    let _ = write_http(&mut stream, "200 OK", "application/json", &body);
+                }
+                Err(error) => {
+                    let _ = write_http(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "text/plain; charset=utf-8",
+                        &format!("{error:#}"),
+                    );
+                }
+            }
+        }
         ("POST", path) if path.starts_with("/api/owners/") => {
             let Some(encoded_owner) = close_path_segment(path, "/api/owners/") else {
                 let _ = write_http(
@@ -634,6 +742,19 @@ mod tests {
         assert!(response.ends_with(b"missing WebUI request header"));
     }
 
+    #[test]
+    fn client_close_api_reports_an_exact_empty_group() {
+        let response = serve_web_request(
+            b"POST /api/clients/codex-thread-42/close HTTP/1.1\r\nHost: localhost\r\nX-Grok-Bridge-WebUI: 1\r\n\r\n",
+        );
+        let (headers, body) = split_http_response(&response);
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({ "matched": 0, "closed": 0, "failures": [] })
+        );
+    }
+
     fn serve_web_request(request: &[u8]) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -644,7 +765,10 @@ mod tests {
         handle_web_connection(
             server,
             Arc::new(RuntimeState {
-                host: SessionHost::new(),
+                host: SessionHost::new(OrphanPolicy {
+                    lease_ms: 120_000,
+                    grace_ms: 600_000,
+                }),
                 started_at_ms: 0,
                 stopping: AtomicBool::new(false),
                 web_url: None,

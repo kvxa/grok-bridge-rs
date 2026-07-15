@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 - 2026-07-15
+
+- Expanded managed Grok Build Hooks to all 14 currently documented events, including permission denial, subagent lifecycle, and compaction, and added completion guards so late tool events cannot revive a finished turn.
+- Added stable Codex identity propagation from `CODEX_THREAD_ID`/`CODEX_SESSION_ID`, shared lease refresh through normal RPCs and `heartbeat`, and targeted `close-codex` cleanup.
+- Added conservative orphan handling: disconnected running/waiting sessions remain available for inspection, while idle and terminal sessions are automatically removed only after the configurable lease and grace periods.
+- Updated the WebUI to group by stable Codex identity, retain readable owner titles, show connection/cleanup state, and close exact Codex groups without collisions between duplicate titles.
+- Added Windows and Unix Hook templates plus README to the universal Release ZIP, with CI validation for all protocol v4 events and manual `~/.grok/hooks` installation guidance.
+
 ## 0.5.1 - 2026-07-15
 
 - Rebuilt the embedded session WebUI with React and Tailwind CSS; CI now produces one deterministic static bundle before every native Rust target embeds it into the CLI binary.

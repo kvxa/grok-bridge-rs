@@ -27,3 +27,12 @@ export async function closeOwnerRequest(owner) {
   if (!response.ok) throw new Error(await responseError(response));
   return response.json();
 }
+
+export async function closeClientRequest(clientSessionId) {
+  const response = await fetch(
+    `/api/clients/${encodeURIComponent(clientSessionId)}/close`,
+    { method: "POST", headers: WEB_UI_HEADER },
+  );
+  if (!response.ok) throw new Error(await responseError(response));
+  return response.json();
+}

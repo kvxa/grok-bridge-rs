@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_WRITE_BYTES: usize = 64 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
+const MAX_CLIENT_SESSION_ID_BYTES: usize = 128;
 const MAX_OWNER_BYTES: usize = 128;
 const PROVIDER_SESSION_ID_BYTES: usize = 36;
 const MAX_HOOK_CWD_BYTES: usize = 4096;
@@ -22,6 +23,8 @@ const MAX_TERMINAL_ROWS: u16 = 200;
 #[serde(deny_unknown_fields)]
 pub(crate) struct RequestEnvelope {
     pub(crate) id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) client_session_id: Option<String>,
     pub(crate) request: Request,
 }
 
@@ -35,6 +38,8 @@ pub(crate) struct RequestEnvelope {
 pub(crate) enum Request {
     ServerStatus,
     ServerStop,
+    Heartbeat,
+    CloseCodex,
     Create {
         cwd: String,
         prompt: Option<String>,
@@ -92,7 +97,12 @@ pub(crate) enum HookEventKind {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    PermissionDenied,
     Notification,
+    SubagentStart,
+    SubagentStop,
+    PreCompact,
+    PostCompact,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -170,11 +180,20 @@ impl ResponseEnvelope {
 )]
 pub(crate) enum ResponseResult {
     ServerInfo(ServerInfo),
-    Session(SessionState),
+    Session(Box<SessionState>),
     Sessions { sessions: Vec<SessionState> },
     Read(ReadResult),
     Wait(WaitResult),
+    CloseGroup(CloseGroupResult),
     Accepted { accepted: bool },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CloseGroupResult {
+    pub(crate) matched: usize,
+    pub(crate) closed: usize,
+    pub(crate) failures: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -206,12 +225,33 @@ pub(crate) enum SessionPhase {
     Stopped,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ClientLeaseState {
+    #[default]
+    Unmanaged,
+    Connected,
+    Disconnected,
+    Orphaned,
+    Closing,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionState {
     pub(crate) session: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) client_session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) client_state: ClientLeaseState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) client_last_seen_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) orphaned_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_close_at_ms: Option<u64>,
     pub(crate) phase: SessionPhase,
     pub(crate) title: Option<String>,
     pub(crate) cwd: String,
@@ -278,6 +318,9 @@ pub(crate) fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 pub(crate) fn decode_request(frame: &[u8]) -> Result<RequestEnvelope> {
     let envelope: RequestEnvelope = decode_frame(frame)?;
     validate_identifier(&envelope.id, "request id")?;
+    if let Some(client_session_id) = envelope.client_session_id.as_deref() {
+        validate_client_session_id(client_session_id)?;
+    }
     validate_request(&envelope.request)?;
     Ok(envelope)
 }
@@ -341,7 +384,11 @@ fn single_frame_payload(frame: &[u8]) -> Result<&[u8]> {
 
 fn validate_request(request: &Request) -> Result<()> {
     match request {
-        Request::ServerStatus | Request::ServerStop | Request::List => Ok(()),
+        Request::ServerStatus
+        | Request::ServerStop
+        | Request::Heartbeat
+        | Request::CloseCodex
+        | Request::List => Ok(()),
         Request::Create {
             cwd, model, owner, ..
         } => {
@@ -414,7 +461,9 @@ fn validate_response(envelope: &ResponseEnvelope) -> Result<()> {
 
 fn validate_response_result(result: &ResponseResult) -> Result<()> {
     match result {
-        ResponseResult::ServerInfo(_) | ResponseResult::Accepted { .. } => Ok(()),
+        ResponseResult::ServerInfo(_)
+        | ResponseResult::CloseGroup(_)
+        | ResponseResult::Accepted { .. } => Ok(()),
         ResponseResult::Session(session) => validate_session_state(session),
         ResponseResult::Sessions { sessions } => {
             for session in sessions {
@@ -460,6 +509,9 @@ fn validate_session_state(session: &SessionState) -> Result<()> {
     if let Some(owner) = session.owner.as_deref() {
         validate_owner(owner)?;
     }
+    if let Some(client_session_id) = session.client_session_id.as_deref() {
+        validate_client_session_id(client_session_id)?;
+    }
     if session.cwd.trim().is_empty() {
         bail!("session cwd must not be empty");
     }
@@ -489,6 +541,18 @@ pub(crate) fn validate_owner(owner: &str) -> Result<()> {
         || owner.chars().any(char::is_control)
     {
         bail!("owner must contain between 1 and {MAX_OWNER_BYTES} bytes and no control characters");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_client_session_id(client_session_id: &str) -> Result<()> {
+    if client_session_id.trim().is_empty()
+        || client_session_id.len() > MAX_CLIENT_SESSION_ID_BYTES
+        || client_session_id.chars().any(char::is_control)
+    {
+        bail!(
+            "client_session_id must contain between 1 and {MAX_CLIENT_SESSION_ID_BYTES} bytes and no control characters"
+        );
     }
     Ok(())
 }
@@ -577,6 +641,7 @@ mod tests {
     fn hook_request(provider_session_id: &str, event: HookEvent) -> RequestEnvelope {
         RequestEnvelope {
             id: "request-hook".to_owned(),
+            client_session_id: None,
             request: Request::HookEvent {
                 provider_session_id: provider_session_id.to_owned(),
                 event,
@@ -592,6 +657,7 @@ mod tests {
     fn request_round_trip_preserves_create_fields() {
         let request = RequestEnvelope {
             id: "request-1".to_owned(),
+            client_session_id: Some("codex-client-42".to_owned()),
             request: Request::Create {
                 cwd: r"C:\work tree\repo".to_owned(),
                 prompt: Some("fix the terminal".to_owned()),
@@ -629,6 +695,8 @@ mod tests {
         let requests = [
             Request::ServerStatus,
             Request::ServerStop,
+            Request::Heartbeat,
+            Request::CloseCodex,
             Request::List,
             Request::Show {
                 session: "session-1".to_owned(),
@@ -669,6 +737,7 @@ mod tests {
         for (index, request) in requests.into_iter().enumerate() {
             let envelope = RequestEnvelope {
                 id: format!("request-{index}"),
+                client_session_id: None,
                 request,
             };
             assert_eq!(
@@ -715,6 +784,7 @@ mod tests {
     fn validates_optional_session_owner() {
         let request = |owner: Option<String>| RequestEnvelope {
             id: "request-1".to_owned(),
+            client_session_id: None,
             request: Request::Create {
                 cwd: ".".to_owned(),
                 prompt: None,
@@ -839,6 +909,7 @@ mod tests {
     fn validates_raw_terminal_writes() {
         let request = |data_base64: String| RequestEnvelope {
             id: "request-1".to_owned(),
+            client_session_id: None,
             request: Request::Write {
                 session: "session-1".to_owned(),
                 data_base64,
@@ -862,6 +933,7 @@ mod tests {
     fn validates_terminal_resize_bounds() {
         let request = |cols, rows| RequestEnvelope {
             id: "request-1".to_owned(),
+            client_session_id: None,
             request: Request::Resize {
                 session: "session-1".to_owned(),
                 cols,
@@ -966,7 +1038,12 @@ mod tests {
                 HookEventKind::PostToolUseFailure,
                 "\"post_tool_use_failure\"",
             ),
+            (HookEventKind::PermissionDenied, "\"permission_denied\""),
             (HookEventKind::Notification, "\"notification\""),
+            (HookEventKind::SubagentStart, "\"subagent_start\""),
+            (HookEventKind::SubagentStop, "\"subagent_stop\""),
+            (HookEventKind::PreCompact, "\"pre_compact\""),
+            (HookEventKind::PostCompact, "\"post_compact\""),
         ];
         for (kind, expected) in kinds {
             assert_eq!(serde_json::to_string(&kind).unwrap(), expected);
@@ -987,9 +1064,14 @@ mod tests {
     fn validates_session_timestamps_and_wait_state() {
         let invalid_session = ResponseEnvelope::success(
             "r1",
-            ResponseResult::Session(SessionState {
+            ResponseResult::Session(Box::new(SessionState {
                 session: "session-1".to_owned(),
                 owner: Some("codex-thread-42".to_owned()),
+                client_session_id: Some("codex-client-42".to_owned()),
+                client_state: ClientLeaseState::Connected,
+                client_last_seen_at_ms: Some(20),
+                orphaned_at_ms: None,
+                auto_close_at_ms: None,
                 phase: SessionPhase::Running,
                 title: Some("Grok".to_owned()),
                 cwd: ".".to_owned(),
@@ -1011,7 +1093,7 @@ mod tests {
                 hook_at_ms: Some(10),
                 tool_name: Some("ask_user_question".to_owned()),
                 waiting_reason: Some("Waiting for an answer".to_owned()),
-            }),
+            })),
         );
         assert!(decode_response(&encode_frame(&invalid_session).unwrap()).is_err());
 

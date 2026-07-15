@@ -99,6 +99,8 @@ jobs:
           root="package/grok-build"
           mkdir -p \
             "$root/agents" \
+            "$root/hooks/windows" \
+            "$root/hooks/unix" \
             "$root/bin/windows-x86_64" \
             "$root/bin/windows-arm64" \
             "$root/bin/linux-x86_64" \
@@ -106,8 +108,11 @@ jobs:
             "$root/bin/macos-x86_64" \
             "$root/bin/macos-arm64"
 
+          install -m 0644 README.md "$root/README.md"
           install -m 0644 SKILL.md "$root/SKILL.md"
           install -m 0644 agents/openai.yaml "$root/agents/openai.yaml"
+          install -m 0644 hooks/windows/grok-bridge.json "$root/hooks/windows/grok-bridge.json"
+          install -m 0644 hooks/unix/grok-bridge.json "$root/hooks/unix/grok-bridge.json"
           install -m 0755 artifacts/binary-windows-x86_64/grok-bridge.exe "$root/bin/windows-x86_64/grok-bridge.exe"
           install -m 0755 artifacts/binary-windows-arm64/grok-bridge.exe "$root/bin/windows-arm64/grok-bridge.exe"
           install -m 0755 artifacts/binary-linux-x86_64/grok-bridge "$root/bin/linux-x86_64/grok-bridge"
@@ -115,7 +120,11 @@ jobs:
           install -m 0755 artifacts/binary-macos-x86_64/grok-bridge "$root/bin/macos-x86_64/grok-bridge"
           install -m 0755 artifacts/binary-macos-arm64/grok-bridge "$root/bin/macos-arm64/grok-bridge"
 
-          test "$(find "$root" -type f | wc -l)" -eq 8
+          test "$(find "$root" -type f | wc -l)" -eq 11
+          for hook in "$root/hooks/windows/grok-bridge.json" "$root/hooks/unix/grok-bridge.json"; do
+            jq -e '.hooks | length == 14' "$hook" >/dev/null
+            jq -e '[.hooks[][].hooks[] | select(.env.GROK_BRIDGE_HOOK_PROTOCOL == "4")] | length == 14' "$hook" >/dev/null
+          done
           test -x "$root/bin/linux-x86_64/grok-bridge"
           test -x "$root/bin/linux-arm64/grok-bridge"
           test -x "$root/bin/macos-x86_64/grok-bridge"

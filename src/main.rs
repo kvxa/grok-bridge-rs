@@ -127,6 +127,14 @@ mod app {
                 ensure_no_arguments(&arguments[1..])?;
                 rpc(Request::List, true)
             }
+            "heartbeat" => {
+                ensure_no_arguments(&arguments[1..])?;
+                rpc(Request::Heartbeat, true)
+            }
+            "close-codex" => {
+                ensure_no_arguments(&arguments[1..])?;
+                rpc(Request::CloseCodex, true)
+            }
             "show" => {
                 let options = parse_options(&arguments[1..], &["--session"])?;
                 rpc(
@@ -534,7 +542,7 @@ mod app {
 
     fn print_help() {
         println!(
-            "grok-bridge {}\n\nUSAGE:\n  grok-bridge hooks install|status|uninstall\n  grok-bridge server start|status|stop|ui\n  grok-bridge create [--cwd <path>] [--prompt <text>] [--model <model>] [--owner <title>] [--always-approve]\n  grok-bridge list\n  grok-bridge show --session <handle>\n  grok-bridge read --session <handle> [--cursor <n>] [--limit <bytes>] [--wait-ms <n>]\n  grok-bridge send --session <handle> (--text <text> | --interrupt)\n  grok-bridge write --session <handle> --data-base64 <base64>\n  grok-bridge resize --session <handle> --cols <n> --rows <n>\n  grok-bridge wait --session <handle> --for tui-idle|exit [--timeout-ms <n>]\n  grok-bridge close --session <handle>\n  grok-bridge terminal --session <handle>\n  grok-bridge terminal [--cwd <path>] [--prompt <text>] [--model <model>] [--owner <title>] [--always-approve]\n  grok-bridge doctor\n\n`hooks install` adds the managed Grok lifecycle hooks used for accurate working, waiting, and idle status. `server ui` starts the singleton Runtime and opens its localhost WebUI. `terminal --session` attaches to an existing persistent PTY session. Without `--session`, it creates a session and opens the terminal GUI. Closing either UI only detaches; only an explicit close action terminates Grok. RPC commands print one JSON response; interactive UI commands are exceptions. Every session command auto-starts one per-user Runtime Server when needed.",
+            "grok-bridge {}\n\nUSAGE:\n  grok-bridge hooks install|status|uninstall\n  grok-bridge server start|status|stop|ui\n  grok-bridge create [--cwd <path>] [--prompt <text>] [--model <model>] [--owner <title>] [--always-approve]\n  grok-bridge list\n  grok-bridge heartbeat\n  grok-bridge close-codex\n  grok-bridge show --session <handle>\n  grok-bridge read --session <handle> [--cursor <n>] [--limit <bytes>] [--wait-ms <n>]\n  grok-bridge send --session <handle> (--text <text> | --interrupt)\n  grok-bridge write --session <handle> --data-base64 <base64>\n  grok-bridge resize --session <handle> --cols <n> --rows <n>\n  grok-bridge wait --session <handle> --for tui-idle|exit [--timeout-ms <n>]\n  grok-bridge close --session <handle>\n  grok-bridge terminal --session <handle>\n  grok-bridge terminal [--cwd <path>] [--prompt <text>] [--model <model>] [--owner <title>] [--always-approve]\n  grok-bridge doctor\n\n`hooks install` adds the managed Grok lifecycle hooks used for accurate working, waiting, and idle status. `server ui` starts the singleton Runtime and opens its localhost WebUI. Session RPCs refresh the current CODEX_THREAD_ID/CODEX_SESSION_ID lease; `heartbeat` refreshes it explicitly and `close-codex` closes only that Codex session's Grok processes. `terminal --session` attaches to an existing persistent PTY session. Without `--session`, it creates a session and opens the terminal GUI. Closing either UI only detaches; only an explicit close action or expired safe-session lease terminates Grok. RPC commands print one JSON response; interactive UI commands are exceptions. Every session command auto-starts one per-user Runtime Server when needed.",
             env!("CARGO_PKG_VERSION")
         );
     }
@@ -545,6 +553,20 @@ mod app {
 
         #[test]
         fn parses_wait_and_interrupt_commands() {
+            assert!(matches!(
+                parse_args(vec!["heartbeat".into()]).unwrap(),
+                Action::Rpc {
+                    request: Request::Heartbeat,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                parse_args(vec!["close-codex".into()]).unwrap(),
+                Action::Rpc {
+                    request: Request::CloseCodex,
+                    ..
+                }
+            ));
             let action = parse_args(vec![
                 "wait".into(),
                 "--session".into(),

@@ -4,6 +4,7 @@ import {
   groupSessions,
   groupSummary,
   ownerKey,
+  sessionGroupKey,
   sessionStats,
 } from "./sessions.js";
 
@@ -26,17 +27,40 @@ describe("activityOf", () => {
 
 describe("session grouping", () => {
   const sessions = [
-    { session: "b", owner: "Codex B", phase: "idle", activity: "done" },
+    {
+      session: "b",
+      owner: "Codex B",
+      client_session_id: "thread-b",
+      phase: "idle",
+      activity: "done",
+    },
     { session: "missing", owner: null, phase: "running", activity: "working" },
-    { session: "a", owner: "Codex A", phase: "running", activity: "waiting" },
-    { session: "a2", owner: "Codex A", phase: "exited", activity: "done" },
+    {
+      session: "a",
+      owner: "Codex A",
+      client_session_id: "thread-a",
+      phase: "running",
+      activity: "waiting",
+    },
+    {
+      session: "a2",
+      owner: "Codex A",
+      client_session_id: "thread-a",
+      phase: "exited",
+      activity: "done",
+    },
   ];
 
   it("sorts owner groups and keeps a distinct missing-owner key", () => {
     const groups = groupSessions(sessions);
-    expect(groups.map(([owner]) => owner)).toEqual([null, "Codex A", "Codex B"]);
+    expect(groups.map(([key]) => key)).toEqual([
+      "missing-owner",
+      "client:thread-a",
+      "client:thread-b",
+    ]);
     expect(groups[1][1]).toHaveLength(2);
     expect(ownerKey(null)).not.toBe(ownerKey("missing-owner"));
+    expect(sessionGroupKey(sessions[2])).toBe("client:thread-a");
   });
 
   it("computes headline and per-group status counts", () => {

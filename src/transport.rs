@@ -24,6 +24,7 @@ use windows_sys::Win32::{
 
 use crate::protocol::{
     MAX_FRAME_BYTES, Request, RequestEnvelope, ResponseEnvelope, decode_response, encode_frame,
+    validate_client_session_id,
 };
 
 const START_RETRIES: usize = 50;
@@ -31,8 +32,21 @@ const START_RETRY_DELAY: Duration = Duration::from_millis(100);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn call(request: Request, auto_start: bool) -> Result<ResponseEnvelope> {
+    call_with_client_session(request, auto_start, current_client_session_id()?)
+}
+
+pub(crate) fn call_anonymous(request: Request, auto_start: bool) -> Result<ResponseEnvelope> {
+    call_with_client_session(request, auto_start, None)
+}
+
+fn call_with_client_session(
+    request: Request,
+    auto_start: bool,
+    client_session_id: Option<String>,
+) -> Result<ResponseEnvelope> {
     let envelope = RequestEnvelope {
         id: next_request_id(),
+        client_session_id,
         request,
     };
     let stream = match connect() {
@@ -53,6 +67,26 @@ pub(crate) fn call(request: Request, auto_start: bool) -> Result<ResponseEnvelop
         Err(error) => return Err(error),
     };
     call_over_stream(stream, &envelope)
+}
+
+fn current_client_session_id() -> Result<Option<String>> {
+    client_session_id_from(
+        env::var("CODEX_THREAD_ID").ok(),
+        env::var("CODEX_SESSION_ID").ok(),
+    )
+}
+
+fn client_session_id_from(
+    thread_id: Option<String>,
+    session_id: Option<String>,
+) -> Result<Option<String>> {
+    let value = thread_id
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| session_id.filter(|value| !value.trim().is_empty()));
+    if let Some(value) = value.as_deref() {
+        validate_client_session_id(value)?;
+    }
+    Ok(value)
 }
 
 fn connect() -> Result<Stream> {
@@ -248,5 +282,23 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("grok-bridge-runtime-v1-")
         );
+    }
+
+    #[test]
+    fn codex_thread_identity_precedes_the_legacy_session_identity() {
+        assert_eq!(
+            client_session_id_from(Some("thread-42".to_owned()), Some("session-7".to_owned()))
+                .unwrap()
+                .as_deref(),
+            Some("thread-42")
+        );
+        assert_eq!(
+            client_session_id_from(None, Some("session-7".to_owned()))
+                .unwrap()
+                .as_deref(),
+            Some("session-7")
+        );
+        assert_eq!(client_session_id_from(None, None).unwrap(), None);
+        assert!(client_session_id_from(Some("bad\nidentity".to_owned()), None).is_err());
     }
 }

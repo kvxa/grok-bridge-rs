@@ -21,14 +21,14 @@ Refer to the selected executable as `<bridge>` below. Do not download another wr
 ## Workflow
 
 1. Inspect the repository, current changes, constraints, and acceptance criteria.
-2. Run `<bridge> hooks install` before the first session and after replacing the bundled executable. The command is idempotent and updates only the managed entries in `$GROK_HOME/hooks/grok-bridge.json`, or the default `~/.grok/hooks/grok-bridge.json` when `GROK_HOME` is unset. Run `<bridge> doctor` if Grok availability is uncertain. `hooks status` always returns JSON, so inspect its `installed` field instead of relying only on the exit code.
+2. Run `<bridge> hooks install` before the first session and after replacing the bundled executable. The command is idempotent and updates only the managed entries in `$GROK_HOME/hooks/grok-bridge.json`, or the default `~/.grok/hooks/grok-bridge.json` when `GROK_HOME` is unset. Release archives also include fresh-install templates under `hooks/windows` and `hooks/unix`, but `hooks install` is required for custom Skill paths and safely preserves unrelated entries. Run `<bridge> doctor` if Grok availability is uncertain. `hooks status` always returns JSON, so inspect its `installed` field instead of relying only on the exit code.
 3. Create one focused session. Keep automatic approval disabled unless the repository and prompt are trusted.
 
 ```text
 <bridge> create --cwd <absolute-repository-path> --owner "<short-current-Codex-conversation-title>" --prompt "Implement the requested change, run relevant checks, and report the result."
 ```
 
-Before every `create`, summarize the current Codex conversation into a short, recognizable, non-secret title and pass it through `--owner`. Reuse exactly the same title for later Grok sessions created by that Codex conversation so the WebUI groups them together. Environment fallback through `CODEX_THREAD_ID` or `CODEX_SESSION_ID` exists for compatibility, but Skill-driven calls must provide the human-readable title explicitly. Optional creation arguments are `--model <model>` and `--always-approve`. Parse the JSON response and save `result.value.session`.
+Before every `create`, summarize the current Codex conversation into a short, recognizable, non-secret title and pass it through `--owner`. Reuse exactly the same title for later Grok sessions created by that Codex conversation. The CLI automatically attaches `CODEX_THREAD_ID`, falling back to `CODEX_SESSION_ID`, as the stable machine identity; the WebUI groups by that identity and displays owner as the readable title. Skill-driven calls must still provide the title explicitly. Optional creation arguments are `--model <model>` and `--always-approve`. Parse the JSON response and save `result.value.session`.
 
 4. Wait for the TUI to become idle, then read the terminal state. Save `next_cursor` for incremental reads.
 
@@ -39,6 +39,8 @@ Before every `create`, summarize the current Codex conversation into a short, re
 
 Inspect the Session JSON fields `activity`, `hook_event`, `tool_name`, and `waiting_reason` after `create`, `list`, or `show`. If `blocked_reason` is present, inspect `show` and send the exact answer required by the visible prompt. Grok lifecycle Hooks report `ask_user_question` and other recognized interactive waits before terminal-title polling would; routine permission notifications remain record-only, so terminal prompt detection is still authoritative. Do not treat a blocked prompt as completion.
 
+Every identified RPC refreshes the current Codex lease. If independent inspection or testing will run longer than the configured lease without another Bridge command, issue `<bridge> heartbeat` before and after that work. Do not invent or override `CODEX_THREAD_ID`/`CODEX_SESSION_ID`; use the environment supplied by Codex.
+
 5. Independently inspect `git status` and `git diff`, then run the repository's required checks. Runtime success or `tui-idle` is not proof that the task passed.
 6. Send focused follow-up evidence through the same PTY session, then repeat `wait`, `read`, and verification.
 
@@ -47,10 +49,11 @@ Inspect the Session JSON fields `activity`, `hook_event`, `tool_name`, and `wait
 <bridge> wait --session <session> --for tui-idle --timeout-ms 300000
 ```
 
-7. Interrupt a stuck turn with `send --interrupt`. Close the session after the final audit.
+7. Interrupt a stuck turn with `send --interrupt`. Close the current session when it is no longer useful. At the end of the whole Codex task, run `close-codex` so every Grok created by this Codex identity is cleaned up without affecting other Codex sessions.
 
 ```text
 <bridge> close --session <session>
+<bridge> close-codex
 ```
 
 There is no fixed session-count limit. Create only the sessions needed for the task and close unused sessions because every live Grok process consumes local resources.
@@ -63,7 +66,9 @@ Use the built-in WebUI only when the user wants a browser overview or manual cle
 <bridge> server ui
 ```
 
-The command starts the singleton Runtime if needed and opens its WebUI in the default browser. The page summarizes working, waiting, and completed activity, groups Grok sessions by Codex conversation title, and keeps each group collapsible across automatic refreshes; use the expand-all and collapse-all controls when many Codex conversations are active. The top-right theme control defaults to the operating-system color scheme and can persist an explicit light or dark choice. Each session card shows its terminal screen, most recent Hook, active tool, waiting reason, process ID, last-update age, and working directory. After checking the visible terminals, close either one Grok process or every process in that Codex title group with its batch-close button; other groups remain running. Closing the browser tab does nothing to sessions.
+The command starts the singleton Runtime if needed and opens its WebUI in the default browser. The page summarizes working, waiting, and completed activity, groups Grok sessions by stable Codex identity while displaying the owner title, and keeps each group collapsible across automatic refreshes. The top-right theme control defaults to the operating-system color scheme and can persist an explicit light or dark choice. Each session card shows its Codex lease state and cleanup countdown, terminal screen, most recent Hook, active tool, waiting reason, process ID, last-update age, and working directory. After checking the visible terminals, close either one Grok process or every process in that Codex identity group; other groups remain running. Closing the browser tab does nothing to sessions.
+
+The default lease is 120 seconds with a 600-second orphan grace period. Only idle or terminal sessions are auto-removed after both periods; working or waiting sessions are never automatically killed merely because Codex disconnected. Use the WebUI for those disconnected live sessions. `GROK_BRIDGE_CODEX_LEASE_SECONDS` and `GROK_BRIDGE_ORPHAN_GRACE_SECONDS` can adjust the policy before the singleton Server starts.
 
 The default address is `127.0.0.1:47653`. Keep `GROK_BRIDGE_WEB_ADDR` on a loopback address because the WebUI has no user authentication. If the port cannot be bound, JSON CLI and PTY sessions continue to work but `server ui` reports that the WebUI is unavailable.
 
@@ -82,6 +87,7 @@ Use `terminal [--cwd <path>] [--prompt <text>] [--model <model>] [--owner <label
 - `hooks install|status|uninstall` manages the global Grok lifecycle Hook entries used to distinguish working, waiting, and completed turns. Install is idempotent; uninstall preserves unrelated hooks.
 - `server start|status|stop|ui` manages the per-user singleton Runtime and opens its localhost WebUI.
 - `create`, `list`, `show`, `read`, `send`, `write`, `resize`, `wait`, and `close` return JSON and start the Server when needed.
+- `heartbeat` refreshes the current Codex lease; `close-codex` closes all sessions attached to the current Codex identity.
 - `read` uses byte cursors; `show` includes `rows`, `cols`, and `screen_ansi_base64` for terminal restoration.
 - `send --text` submits bracketed text with Enter; `write --data-base64` writes exact raw bytes.
 - `wait --for tui-idle` reports recognized prompts through `blocked_reason`; `wait --for exit` waits for process termination.

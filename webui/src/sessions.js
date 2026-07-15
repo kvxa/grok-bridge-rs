@@ -26,27 +26,48 @@ export function ownerKey(owner) {
   return owner == null ? "missing-owner" : `owner:${owner}`;
 }
 
+export function sessionGroupKey(session) {
+  return session.client_session_id
+    ? `client:${session.client_session_id}`
+    : ownerKey(session.owner ?? null);
+}
+
 export function groupSessions(sessions) {
   const grouped = new Map();
   for (const session of sessions) {
-    const owner = session.owner ?? null;
-    if (!grouped.has(owner)) grouped.set(owner, []);
-    grouped.get(owner).push(session);
+    const key = sessionGroupKey(session);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(session);
   }
-  return [...grouped.entries()].sort(([left], [right]) =>
-    String(left ?? "").localeCompare(String(right ?? ""), "zh-CN"),
+  return [...grouped.entries()].sort(([, left], [, right]) =>
+    String(left[0]?.owner ?? "").localeCompare(
+      String(right[0]?.owner ?? ""),
+      "zh-CN",
+    ),
   );
 }
 
 export function sessionStats(sessions) {
   const activities = sessions.map(activityOf);
   return {
-    owners: new Set(sessions.map((session) => session.owner ?? null)).size,
+    owners: new Set(sessions.map(sessionGroupKey)).size,
     sessions: sessions.length,
     working: activities.filter((activity) => activity === "working").length,
     waiting: activities.filter((activity) => activity === "waiting").length,
     done: activities.filter((activity) => activity === "done").length,
   };
+}
+
+export function clientStateLabel(state) {
+  return (
+    {
+      unmanaged: "未跟踪",
+      connected: "Codex 在线",
+      disconnected: "Codex 已断开",
+      orphaned: "等待自动清理",
+      closing: "正在清理",
+    }[state] ?? "未知"
+  );
 }
 
 export function groupSummary(sessions) {
@@ -71,11 +92,23 @@ export function ageLabel(updatedAt, now = Date.now()) {
   return `${Math.floor(seconds / 3600)} 小时前`;
 }
 
+export function remainingLabel(deadline, now = Date.now()) {
+  const seconds = Math.max(0, Math.ceil((deadline - now) / 1000));
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)} 分钟`;
+  return `${Math.ceil(seconds / 3600)} 小时`;
+}
+
 export function sessionsSignature(sessions) {
   return JSON.stringify(
     sessions.map((session) => [
       session.session,
       session.owner,
+      session.client_session_id,
+      session.client_state,
+      session.client_last_seen_at_ms,
+      session.orphaned_at_ms,
+      session.auto_close_at_ms,
       session.phase,
       session.title,
       session.cwd,

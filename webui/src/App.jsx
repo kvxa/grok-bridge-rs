@@ -19,6 +19,7 @@ import {
   useState,
 } from "react";
 import {
+  closeClientRequest,
   closeOwnerRequest,
   closeSessionRequest,
   getSessions,
@@ -27,9 +28,10 @@ import {
   activityLabel,
   activityOf,
   ageLabel,
+  clientStateLabel,
   groupSessions,
   groupSummary,
-  ownerKey,
+  remainingLabel,
   sessionsSignature,
   sessionStats,
 } from "./sessions.js";
@@ -225,6 +227,14 @@ function SessionRow({ session, onClose, busy }) {
         <SessionMeta label="最近更新">
           <Age updatedAt={session.updated_at_ms} />
         </SessionMeta>
+        <SessionMeta label="Codex 连接">
+          {clientStateLabel(session.client_state)}
+        </SessionMeta>
+        {session.auto_close_at_ms ? (
+          <SessionMeta label="自动清理倒计时">
+            {remainingLabel(session.auto_close_at_ms)}
+          </SessionMeta>
+        ) : null}
         {session.hook_event ? (
           <SessionMeta label="最近 Hook">{session.hook_event}</SessionMeta>
         ) : null}
@@ -252,11 +262,13 @@ function Age({ updatedAt }) {
 }
 
 function OwnerGroup({
+  groupKey,
   owner,
+  clientSessionId,
   sessions,
   collapsed,
   onToggle,
-  onCloseOwner,
+  onCloseGroup,
   onCloseSession,
   busy,
 }) {
@@ -264,7 +276,7 @@ function OwnerGroup({
   return (
     <details
       className="group overflow-hidden border-y border-[var(--border)] bg-[var(--group-bg)] open:border-[var(--open-border)]"
-      data-owner-key={ownerKey(owner)}
+      data-owner-key={groupKey}
       open={!collapsed}
       onToggle={(event) => onToggle(event.currentTarget.open)}
     >
@@ -291,13 +303,15 @@ function OwnerGroup({
       </summary>
       {collapsed ? null : (
         <div className="border-t border-[var(--group-body-border)] bg-[var(--group-body-bg)]">
-          {owner == null ? null : (
+          {owner == null && clientSessionId == null ? null : (
             <div className="flex justify-end border-b border-[var(--group-body-border)] px-3 py-2 sm:px-4">
               <button
                 className={`${dangerButton} max-sm:w-full`}
                 type="button"
                 disabled={busy}
-                onClick={() => onCloseOwner(owner, sessions.length)}
+                onClick={() =>
+                  onCloseGroup(owner, clientSessionId, sessions.length)
+                }
               >
                 <Trash2 aria-hidden="true" size={14} />
                 关闭该 Codex 全部 Grok
@@ -378,12 +392,13 @@ export default function App() {
     [load],
   );
 
-  const closeOwner = useCallback(
-    async (owner, count) => {
+  const closeGroup = useCallback(
+    async (owner, clientSessionId, count) => {
       if (loadingRef.current) return;
+      const displayOwner = owner ?? clientSessionId;
       if (
         !window.confirm(
-          `确认关闭 Codex“${owner}”下的全部 ${count} 个 Grok 会话？`,
+          `确认关闭 Codex“${displayOwner}”下的全部 ${count} 个 Grok 会话？`,
         )
       ) {
         return;
@@ -391,7 +406,9 @@ export default function App() {
       loadingRef.current = true;
       setLoading(true);
       try {
-        const result = await closeOwnerRequest(owner);
+        const result = clientSessionId
+          ? await closeClientRequest(clientSessionId)
+          : await closeOwnerRequest(owner);
         if (result.matched === 0) {
           setNotice({ tone: "info", text: "该 Codex 分组已没有活跃 Grok 会话。" });
         } else if (
@@ -405,7 +422,7 @@ export default function App() {
         } else {
           setNotice({
             tone: "info",
-            text: `已关闭 Codex“${owner}”下的全部 ${result.closed} 个 Grok 会话。`,
+            text: `已关闭 Codex“${displayOwner}”下的全部 ${result.closed} 个 Grok 会话。`,
           });
         }
       } catch (error) {
@@ -430,7 +447,7 @@ export default function App() {
   const setAllGroups = useCallback(
     (open) => {
       setCollapsedOwners(
-        open ? new Set() : new Set(groups.map(([owner]) => ownerKey(owner))),
+        open ? new Set() : new Set(groups.map(([groupKey]) => groupKey)),
       );
     },
     [groups],
@@ -534,16 +551,20 @@ export default function App() {
 
       <main className="grid gap-2">
         {groups.length ? (
-          groups.map(([owner, ownerSessions]) => {
-            const key = ownerKey(owner);
+          groups.map(([key, ownerSessions]) => {
+            const owner = ownerSessions[0]?.owner ?? null;
+            const clientSessionId =
+              ownerSessions[0]?.client_session_id ?? null;
             return (
               <OwnerGroup
                 key={key}
+                groupKey={key}
                 owner={owner}
+                clientSessionId={clientSessionId}
                 sessions={ownerSessions}
                 collapsed={collapsedOwners.has(key)}
                 onToggle={(open) => toggleOwner(key, open)}
-                onCloseOwner={closeOwner}
+                onCloseGroup={closeGroup}
                 onCloseSession={closeSession}
                 busy={loading}
               />
