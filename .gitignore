@@ -1,5 +1,7 @@
 /target/
 /dist/
+/webui/node_modules/
+/webui/dist/
 /.serena/
 *.zip
 .DS_Store

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="auto" data-resolved-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Grok Bridge 会话管理</title>
+    <script>
+      (() => {
+        const key = "grok-bridge-theme";
+        const root = document.documentElement;
+        let preference = "auto";
+        try {
+          const stored = localStorage.getItem(key);
+          if (["auto", "light", "dark"].includes(stored)) preference = stored;
+        } catch {}
+        const resolved =
+          preference === "auto"
+            ? window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light"
+            : preference;
+        root.dataset.theme = preference;
+        root.dataset.resolvedTheme = resolved;
+        root.style.colorScheme = resolved;
+        document.querySelector('meta[name="color-scheme"]').content = resolved;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

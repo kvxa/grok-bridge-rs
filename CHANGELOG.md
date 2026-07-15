@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 - 2026-07-15
+
+- Rebuilt the embedded session WebUI with React and Tailwind CSS; CI now produces one deterministic static bundle before every native Rust target embeds it into the CLI binary.
+- Added persistent automatic, light, and dark themes with a top-right switcher; automatic mode follows live operating-system color-scheme changes before the first page paint.
+- Applied complete light and dark color tokens across session groups, terminals, status badges, notices, and destructive controls while improving small-text contrast in both themes.
+
 ## 0.5.0 - 2026-07-15
 
 - Redesigned the localhost WebUI as a denser session-management view with Codex owner summaries, persistent collapsible groups, live counts, stable terminal scroll positions, and responsive controls.

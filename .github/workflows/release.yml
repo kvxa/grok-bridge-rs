@@ -9,7 +9,29 @@ permissions:
   contents: write
 
 jobs:
+  webui:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - run: npm ci
+        working-directory: webui
+      - run: npm test
+        working-directory: webui
+      - run: npm run build
+        working-directory: webui
+      - uses: actions/upload-artifact@v7
+        with:
+          name: webui-dist
+          path: webui/dist
+          if-no-files-found: error
+
   build:
+    needs: webui
     strategy:
       fail-fast: false
       matrix:
@@ -41,6 +63,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: webui-dist
+          path: webui/dist
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |

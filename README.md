@@ -1,8 +1,8 @@
 # grok-build Local Runtime Skill
 
-`grok-build` v0.5.0 是一个可直接解压使用的跨平台 Agent Skill。Codex 通过随包发布的原生 `grok-bridge` 调用本机 Grok Runtime；不需要 Python、MCP、安装脚本或额外服务。
+`grok-build` v0.5.1 是一个可直接解压使用的跨平台 Agent Skill。Codex 通过随包发布的原生 `grok-bridge` 调用本机 Grok Runtime；不需要 Python、MCP、安装脚本或额外服务。
 
-Runtime 维护每用户单例 Server 和持久 PTY 会话。CLI 通过本地 IPC 交换有界 NDJSON：Windows 使用 Named Pipe，Linux 使用抽象 Unix Socket，macOS 使用 `/tmp` 下的 Unix Socket。Server 持有 Grok CLI、会话状态和终端输出；RPC 命令向 STDOUT 返回一行 JSON，`terminal` 打开单会话 egui 终端，内置 localhost WebUI 则集中查看和关闭会话。
+Runtime 维护每用户单例 Server 和持久 PTY 会话。CLI 通过本地 IPC 交换有界 NDJSON：Windows 使用 Named Pipe，Linux 使用抽象 Unix Socket，macOS 使用 `/tmp` 下的 Unix Socket。Server 持有 Grok CLI、会话状态和终端输出；RPC 命令向 STDOUT 返回一行 JSON，`terminal` 打开单会话 egui 终端，编译进二进制的 React + Tailwind localhost WebUI 则集中查看和关闭会话。
 
 ```text
 Codex / JSON CLI       egui terminal
@@ -33,19 +33,19 @@ Linux GUI 使用 X11 后端。构建机需要 eframe 所需的 XCB/XKB 开发库
 
 ## 安装
 
-从 GitHub Releases 下载 `grok-build-skill-v0.5.0.zip` 和对应 `.sha256`。ZIP 同时包含六个平台的原生二进制，解压一次即可保留统一 Skill 目录。
+从 GitHub Releases 下载 `grok-build-skill-v0.5.1.zip` 和对应 `.sha256`。ZIP 同时包含六个平台的原生二进制，解压一次即可保留统一 Skill 目录。
 
 Windows PowerShell：
 
 ```powershell
-Expand-Archive .\grok-build-skill-v0.5.0.zip "$env:USERPROFILE\.agents\skills" -Force
+Expand-Archive .\grok-build-skill-v0.5.1.zip "$env:USERPROFILE\.agents\skills" -Force
 $bridge = "$env:USERPROFILE\.agents\skills\grok-build\bin\windows-x86_64\grok-bridge.exe"
 ```
 
 Linux/macOS：
 
 ```sh
-unzip grok-build-skill-v0.5.0.zip -d "$HOME/.agents/skills"
+unzip grok-build-skill-v0.5.1.zip -d "$HOME/.agents/skills"
 bridge="$HOME/.agents/skills/grok-build/bin/linux-x86_64/grok-bridge"
 ```
 
@@ -112,7 +112,7 @@ Bridge 为每个 Grok 子进程生成随机 UUID，并通过官方 `--session-id
 <bridge> server ui
 ```
 
-页面顶部汇总 Codex 分组、Grok 总数以及工作中、等待输入、完成/空闲数量；下方按 Codex 对话标题显示可折叠分组，并在每个会话卡片中展示最近 Hook、当前工具、等待原因、PID、工作目录和终端当前屏幕。页面每 2 秒刷新数据，但会保留手工折叠状态，也可一键全部展开或折叠。确认终端内容后，可以关闭单个 Grok，也可以点击“关闭该 Codex 全部 Grok”终止该标题下的全部会话；其他 Codex 分组不受影响。批量操作会报告匹配数、成功数和失败项，失败会话保留在 Runtime 中供重试。关闭浏览器标签页不会影响任何会话。
+页面顶部汇总 Codex 分组、Grok 总数以及工作中、等待输入、完成/空闲数量；右上角可选择自动、浅色或深色主题，默认自动跟随系统色调，手工选择会保存在浏览器中。下方按 Codex 对话标题显示可折叠分组，并在每个会话卡片中展示最近 Hook、当前工具、等待原因、PID、工作目录和终端当前屏幕。页面每 2 秒刷新数据，但会保留手工折叠状态，也可一键全部展开或折叠。确认终端内容后，可以关闭单个 Grok，也可以点击“关闭该 Codex 全部 Grok”终止该标题下的全部会话；其他 Codex 分组不受影响。批量操作会报告匹配数、成功数和失败项，失败会话保留在 Runtime 中供重试。关闭浏览器标签页不会影响任何会话。
 
 默认监听 `127.0.0.1:47653`。可在 Server 第一次启动前通过 `GROK_BRIDGE_WEB_ADDR` 更换地址；WebUI 没有用户认证，因此必须保持在可信回环地址，不要绑定 `0.0.0.0` 或对外网卡。若端口绑定失败，JSON CLI 和 PTY 会话仍可使用，但 `server ui` 会报告 WebUI 不可用。
 
@@ -159,12 +159,19 @@ Bridge 为每个 Grok 子进程生成随机 UUID，并通过官方 `--session-id
 本地完成前运行：
 
 ```text
+cd webui
+npm ci
+npm test
+npm run build
+cd ..
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-CI 使用固定的原生 runner 对六个 target 分别执行测试、Clippy 和 release 构建：`windows-2025`、`windows-11-arm`、`ubuntu-24.04`、`ubuntu-24.04-arm`、`macos-15-intel` 和 `macos-15`。这避免交叉编译只能验证链接、不能执行目标架构测试的问题。
+`webui/` 保存 React、Tailwind 和 Vitest 源码。Rust 编译通过 `include_bytes!` 嵌入 `webui/dist/`，因此源码构建必须先生成前端产物；Release ZIP 中不包含 Node.js、依赖目录或独立网页文件。
+
+CI 先在 Node.js 24 上执行一次前端测试和构建，再把相同的 `webui-dist` 提供给六个固定原生 runner，分别执行 Rust 测试、Clippy 和 release 构建：`windows-2025`、`windows-11-arm`、`ubuntu-24.04`、`ubuntu-24.04-arm`、`macos-15-intel` 和 `macos-15`。这既确保六个二进制嵌入同一份页面，也避免交叉编译只能验证链接、不能执行目标架构测试的问题。
 
 `v*` Tag 触发 Release workflow，将六个二进制、`SKILL.md` 和 `agents/openai.yaml` 组装为一个通用 Skill ZIP，并生成 SHA-256 文件。本地 Agent 不自动 commit、push、创建 Tag 或发布 Release。
