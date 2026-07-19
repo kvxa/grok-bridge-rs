@@ -14,15 +14,17 @@
 
 grok-build gives Codex a reliable local way to use Grok for real software work without creating a new unmanaged process for every request. Its shared runtime keeps sessions visible, interactive, grouped by Codex conversation, and easy to close from a browser.
 
+The WebUI includes a language switcher with 13 locales: English, Simplified Chinese, Traditional Chinese, Japanese, Korean, Russian, Spanish, French, German, Indonesian, Thai, Vietnamese, and Arabic. It follows the browser language on first visit, remembers the selected language locally, and uses a right-to-left layout for Arabic.
+
 ## WebUI Preview
 
-### Light theme
+### Light theme (English)
 
-![grok-build WebUI light theme](images/light.jpg)
+![grok-build WebUI light theme in English](images/light-en.jpg)
 
-### Dark theme
+### Dark theme (English)
 
-![grok-build WebUI dark theme](images/dark.jpg)
+![grok-build WebUI dark theme in English](images/dark-en.jpg)
 
 ## Why Use It?
 
@@ -75,6 +77,42 @@ bridge="$HOME/.agents/skills/grok-build/bin/linux-x86_64/grok-bridge"
 Replace the binary directory with `windows-arm64`, `linux-arm64`, `macos-x86_64`, or `macos-arm64` when needed. `server ui` starts the local runtime on demand and opens the browser panel. The default address is `http://127.0.0.1:47653`.
 
 After the Skill is installed, Codex can use it directly. The panel is there when you want to see what every Grok session is doing or take manual control.
+
+## Install or Update with Your Agent
+
+Claude Code, Codex, and OpenCode can install or update this Skill for you. The prompts below are deliberately host-aware: the agent must inspect its own Skill discovery rules instead of assuming that another tool's directory is correct. Replace `[HOST AGENT]` with `Claude Code`, `Codex`, or `OpenCode`.
+
+### One-time installation prompt
+
+```text
+You are [HOST AGENT]. Install the grok-build Agent Skill from the official latest GitHub Release: https://github.com/luodaoyi/grok-bridge-rs/releases/latest
+
+First inspect this host's Skill discovery rules and choose the correct user-level Skill directory. Do not guess from another Agent's conventions. Install the extracted folder as grok-build/ and keep the bundled SKILL.md, agents/openai.yaml, hooks/, and platform-specific bin/ files. Detect the current operating system and CPU architecture, but keep all native binaries in the release archive.
+
+Download the release ZIP and its matching .sha256 file, verify the SHA-256 before extracting, and stop if verification fails. Do not install Grok CLI, use sudo or administrator privileges, run remote scripts, modify the current project, or change unrelated Skills. If a previous grok-build installation exists, preserve any files outside that Skill and report the path and any custom files inside it before replacing it.
+
+After installation, run the bundled grok-bridge doctor command and grok-bridge hooks install command using the binary for this host. Do not start the WebUI unless I ask. Report the exact Skill path, release tag, selected platform binary, checksum result, and command results. Do not commit, push, or publish anything.
+```
+
+Host-specific first lines:
+
+- Claude Code: `You are Claude Code. Install the grok-build Agent Skill...`
+- Codex: `You are Codex. Install the grok-build Agent Skill...`
+- OpenCode: `You are OpenCode. Install the grok-build Agent Skill...`
+
+### Update or upgrade prompt
+
+```text
+You are [HOST AGENT]. Update the installed grok-build Agent Skill to the newest official release from https://github.com/luodaoyi/grok-bridge-rs/releases/latest.
+
+Find the currently active grok-build installation using this host's Skill discovery rules and report its path and current release if available. Check the latest release tag first; if it is already installed, do not reinstall it. Otherwise download the release ZIP and matching .sha256 file, verify the SHA-256 before extraction, and select the native binary for the current operating system and CPU architecture.
+
+Stage the verified replacement before switching to it. Replace only the grok-build Skill, preserve unrelated Skills and files outside that directory, and stop before overwriting any custom files inside the existing Skill; report them first. After the switch, run the new grok-bridge doctor command and grok-bridge hooks install command. Do not install Grok CLI, use sudo or administrator privileges, run remote scripts, modify the current project, start the WebUI, commit, push, or publish anything unless I explicitly ask.
+
+Report the old and new release tags, Skill path, platform binary, checksum result, preserved custom files, and command results. If the download, verification, or replacement cannot be completed safely, leave the current installation unchanged and explain why.
+```
+
+These prompts keep the installation compatible with the host Agent while the Skill itself remains local-only. After installation, invoke it using the host's normal Skill syntax; in Codex this is `$grok-build`.
 
 ## Everyday Use
 
