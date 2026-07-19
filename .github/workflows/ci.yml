@@ -36,6 +36,7 @@ jobs:
           name: webui-dist
           path: webui/dist
           if-no-files-found: error
+          retention-days: 1
 
   build:
     needs:
@@ -96,3 +97,26 @@ jobs:
       - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo clippy --locked --target ${{ matrix.target }} --all-targets --all-features -- -D warnings
       - run: cargo build --release --locked --target ${{ matrix.target }}
+
+  cleanup:
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs: build
+    permissions:
+      actions: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Delete temporary workflow artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_ids="$(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+              --jq '.artifacts[].id'
+          )"
+          for artifact_id in $artifact_ids; do
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+          done

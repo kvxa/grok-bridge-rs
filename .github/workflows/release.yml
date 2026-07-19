@@ -29,6 +29,7 @@ jobs:
           name: webui-dist
           path: webui/dist
           if-no-files-found: error
+          retention-days: 1
 
   build:
     needs: webui
@@ -98,6 +99,7 @@ jobs:
           name: binary-${{ matrix.platform }}
           path: ${{ matrix.binary }}
           if-no-files-found: error
+          retention-days: 1
 
   release:
     needs: build
@@ -167,3 +169,26 @@ jobs:
               --generate-notes \
               --title "grok-build ${GITHUB_REF_NAME}"
           fi
+
+  cleanup:
+    if: ${{ always() }}
+    needs: release
+    permissions:
+      actions: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Delete temporary workflow artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_ids="$(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+              --jq '.artifacts[].id'
+          )"
+          for artifact_id in $artifact_ids; do
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+          done
