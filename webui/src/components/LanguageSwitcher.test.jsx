@@ -208,10 +208,10 @@ describe("LanguageSwitcher", () => {
         new KeyboardEvent("keydown", { key: "End", bubbles: true }),
       );
     });
-    // Last supported locale is Portuguese (Portugal).
+    // Last supported locale remains Arabic (canonical list ends with ar).
     expect(
       container
-        .querySelector('[data-language-option="pt-PT"]')
+        .querySelector('[data-language-option="ar"]')
         ?.getAttribute("data-active"),
     ).toBe("true");
 

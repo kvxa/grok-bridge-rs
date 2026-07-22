@@ -6,8 +6,6 @@ import fr from "./fr.js";
 import id from "./id.js";
 import ja from "./ja.js";
 import ko from "./ko.js";
-import ptBR from "./pt-BR.js";
-import ptPT from "./pt-PT.js";
 import ru from "./ru.js";
 import th from "./th.js";
 import vi from "./vi.js";
@@ -25,8 +23,6 @@ export const catalogs = {
   ja,
   ko,
   es,
-  "pt-BR": ptBR,
-  "pt-PT": ptPT,
   id,
   th,
   vi,

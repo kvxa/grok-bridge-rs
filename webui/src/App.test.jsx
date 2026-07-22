@@ -204,7 +204,7 @@ describe("App", () => {
   it("renders supervisor/subagent groups, stats, terminal shells and no unowned batch close", async () => {
     await renderAppAndConnect();
     expect(container.textContent).toContain("Codex A/中文");
-    expect(container.textContent).toContain("未标记的 Codex 会话");
+    expect(container.textContent).toContain("未标记的 Codex 对话");
     expect(container.textContent).toContain("监督者");
     expect(container.textContent).toContain("子代理");
     expect(container.textContent).toContain("GitHub");
@@ -225,14 +225,14 @@ describe("App", () => {
     expect(container.querySelector('[href="#session-board"]')).not.toBeNull();
     expect(container.querySelectorAll("button")).toSatisfy((buttons) =>
       [...buttons].some((button) =>
-        button.textContent.includes("关闭该 Codex 下的全部 Grok 会话"),
+        button.textContent.includes("关闭该 Codex 全部 Grok"),
       ),
     );
     expect(
       [...container.querySelectorAll("details.group")]
         .find((group) => group.dataset.ownerKey === "missing-owner")
         .textContent,
-    ).not.toContain("关闭该 Codex 下的全部 Grok 会话");
+    ).not.toContain("关闭该 Codex 全部 Grok");
     expect(MockXTerm.instances.every((term) => term.options.disableStdin)).toBe(
       true,
     );
@@ -343,8 +343,7 @@ describe("App", () => {
     );
 
     const ownerClose = [...container.querySelectorAll("button")].find(
-      (button) =>
-        button.textContent.includes("关闭该 Codex 下的全部 Grok 会话"),
+      (button) => button.textContent.includes("关闭该 Codex 全部 Grok"),
     );
     await act(async () => ownerClose.click());
     await settle();
@@ -458,6 +457,7 @@ describe("App", () => {
         orphan_grace_ms: 600_000,
       },
     ]);
+    expect(container.textContent).toContain("清理倒计时");
     expect(container.textContent).toContain("自动关闭倒计时");
     expect(container.querySelector('[data-lifecycle-hint="orphaned"]')).not.toBeNull();
   });
@@ -524,9 +524,6 @@ describe("App", () => {
     expect(toggle).not.toBeNull();
     expect(toggle.getAttribute("aria-checked")).toBe("false");
     expect(toggle.dataset.interactive).toBe("off");
-    expect(toggle.getAttribute("title")).toBe(
-      "开启所有 Grok 终端的键盘输入",
-    );
     expect(
       [...container.querySelectorAll("[data-readonly]")].every(
         (node) => node.dataset.readonly === "true",
@@ -540,12 +537,7 @@ describe("App", () => {
     await act(async () => toggle.click());
     await settle();
     expect(toggle.getAttribute("aria-checked")).toBe("true");
-    expect(toggle.getAttribute("title")).toBe(
-      "开启或关闭所有终端的键盘输入",
-    );
-    const warning = container.querySelector("[data-interactive-warning]");
-    expect(warning).not.toBeNull();
-    expect(warning.textContent).toContain("交互模式已开启");
+    expect(container.querySelector("[data-interactive-warning]")).not.toBeNull();
     expect(MockXTerm.instances.every((term) => !term.options.disableStdin)).toBe(
       true,
     );

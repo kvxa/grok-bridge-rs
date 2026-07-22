@@ -20,7 +20,7 @@ export function InteractiveToggle({
       aria-label={t("interactive.aria")}
       title={
         interactive
-          ? t("interactive.aria")
+          ? t("interactive.warning")
           : connected
             ? t("interactive.offHint")
             : t("interactive.disconnected")
