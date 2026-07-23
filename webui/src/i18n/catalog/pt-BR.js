@@ -136,7 +136,7 @@ export default {
   "session.lifecycle.orphanedAt":
     "Prazo local de elegibilidade para limpeza {at}; o Runtime limpa pouco depois",
   "session.lifecycle.orphanedNoDeadline":
-    "Órfão; o Runtime não informou prazo de elegibilidade para limpeza.",
+    "Órfã; o Runtime não informou prazo de elegibilidade para limpeza.",
   "session.lifecycle.closingTitle": "Fechando sessão",
   "session.lifecycle.closingBody":
     "Esta sessão gerenciada está sendo fechada agora.",
@@ -145,7 +145,7 @@ export default {
   "session.lifecycle.collapsedOrphanedDue":
     "Aguardando limpeza do Runtime",
   "session.lifecycle.collapsedOrphanedUnknown":
-    "Órfão — fechamento automático pendente",
+    "Órfã — fechamento automático pendente",
   "session.lifecycle.collapsedClosing": "Fechando agora",
 
   "terminal.header": "Terminal · somente leitura em tempo real",

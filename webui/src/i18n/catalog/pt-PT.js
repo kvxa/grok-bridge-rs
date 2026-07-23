@@ -62,7 +62,7 @@ export default {
 
   "update.title": "Atualização disponível: v{version}",
   "update.body":
-    "O Runtime atual é v{current}. Transfera e substitua o binário local manualmente e reinicie para aplicar.",
+    "O Runtime atual é v{current}. Transfira e substitua o binário local manualmente e reinicie para aplicar.",
   "update.openRelease": "Abrir Release mais recente",
   "update.dismiss": "Lembrar mais tarde",
 
