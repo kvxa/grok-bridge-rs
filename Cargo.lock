@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "grok-bridge"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "anyhow",
  "base64",

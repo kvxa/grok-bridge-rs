@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.8.4 - 2026-07-27
+
+- Fixed exaggerated WebUI terminal character spacing on Windows by replacing the unresolved CSS-variable font with a concrete Consolas-first monospace stack for xterm.js canvas measurement and rendering.
+
 ## 0.8.3 - 2026-07-23
 
 - Added Brazilian Portuguese and European Portuguese WebUI catalogs, locale detection, and localized page metadata.
