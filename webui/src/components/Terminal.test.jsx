@@ -220,8 +220,14 @@ describe("Terminal (xterm read-only)", () => {
     const term = MockXTerm.instances[0];
     expect(term.options.disableStdin).toBe(true);
     expect(term.options.cursorBlink).toBe(false);
+    expect(term.options.lineHeight).toBe(1);
     expect(term.options.fontFamily).toBe(TERMINAL_FONT_FAMILY);
-    expect(term.options.fontFamily).toMatch(/^Consolas,/);
+    expect(term.options.fontFamily).toMatch(
+      /^"SauceCodePro Nerd Font Mono", "Source Code Pro",/,
+    );
+    expect(term.options.fontFamily).toContain(
+      'Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+    );
     expect(term.options.fontFamily).not.toContain("var(");
     expect(
       container.querySelector("[data-terminal-host]").style.fontFamily,

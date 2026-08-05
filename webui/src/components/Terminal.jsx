@@ -238,7 +238,7 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
       scrollback: 5000,
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: 13,
-      lineHeight: 1.25,
+      lineHeight: 1,
       theme: readTerminalTheme(),
       rows: safeRows(rows),
       cols: safeCols(cols),
