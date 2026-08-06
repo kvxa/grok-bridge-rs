@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.8.5 - 2026-08-06
+
+- Refined WebUI terminal typography with a compact line height for continuous box-drawing glyphs while preserving the concrete Consolas-first xterm font stack on Windows.
+- Aligned DOM monospace content with the Source Code Pro-derived fallback stack and added regression coverage for the terminal font and line-height settings.
+
 ## 0.8.4 - 2026-07-27
 
 - Fixed exaggerated WebUI terminal character spacing on Windows by replacing the unresolved CSS-variable font with a concrete Consolas-first monospace stack for xterm.js canvas measurement and rendering.
