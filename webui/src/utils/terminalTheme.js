@@ -43,5 +43,7 @@ export function readTerminalTheme() {
 
 // xterm.js uses this value for canvas text measurement. A CSS custom-property
 // reference is not resolved by the canvas font parser and can produce mismatched
-// cell widths on Windows, so keep the stack concrete and prefer Consolas.
-export const TERMINAL_FONT_FAMILY = 'Consolas, "Courier New", monospace';
+// cell widths on Windows, so keep the stack concrete and preserve Consolas as
+// the first choice. The remaining fonts match the WebUI monospace stack.
+export const TERMINAL_FONT_FAMILY =
+  'Consolas, "SauceCodePro Nerd Font Mono", "Source Code Pro", Monaco, "Liberation Mono", "Courier New", monospace';

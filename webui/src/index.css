@@ -1,5 +1,8 @@
 :root {
   color-scheme: dark;
+  --tblr-font-monospace:
+    "SauceCodePro Nerd Font Mono", "Source Code Pro", monaco, consolas,
+    "Liberation Mono", "Courier New", monospace;
   --gb-page-bg: #0b0d0c;
   --gb-page-glow: radial-gradient(
       1000px 420px at 8% -8%,
