@@ -883,27 +883,36 @@ mod tests {
             .unwrap();
         let _client = Stream::connect(name).unwrap();
         let mut server = listener.accept().unwrap();
-        // The peer never reads. Fill the pipe until writes would block, then
-        // attempt a fresh frame under a short deadline.
+        // The peer never reads. Fill the pipe until a non-blocking write
+        // signals WouldBlock/TimedOut, then attempt a fresh frame under a
+        // short deadline. Unix pipes accept bytes until the buffer is
+        // genuinely full, while Windows named pipes can report the full pipe
+        // on the very first non-blocking write — so the blocking signal is
+        // the reliable "full" marker and `filled` may legitimately stay 0.
         server.set_nonblocking(true).unwrap();
         let filler = vec![0x55u8; 64 * 1024];
         let mut filled = 0usize;
-        loop {
+        let pipe_full = loop {
             match server.write(&filler) {
-                Ok(0) => break,
+                // Ok(0) means the peer half-closed the connection, not that
+                // the buffer is full; treat it as an unexpected shutdown.
+                Ok(0) => panic!("IPC peer closed while filling the send buffer"),
                 Ok(written) => filled += written,
                 Err(error)
                     if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
                 {
-                    break;
+                    break true;
                 }
                 Err(error) => panic!("unexpected fill error: {error}"),
             }
             if filled > 16 * 1024 * 1024 {
-                panic!("send buffer never filled; cannot exercise the write deadline");
+                panic!("send buffer never blocked; cannot exercise the write deadline");
             }
-        }
-        assert!(filled > 0, "send buffer accepted no bytes");
+        };
+        assert!(
+            pipe_full,
+            "fill loop ended without a WouldBlock/TimedOut signal after {filled} bytes"
+        );
 
         // A full-size frame can never fit in the small filled pipe, so the
         // stalled peer must surface as a bounded timeout instead of a
