@@ -1,24 +1,30 @@
 use std::{
     collections::HashMap,
-    env,
-    io::{BufRead, BufReader, ErrorKind, Write},
-    net::{TcpListener, TcpStream},
+    env, fmt,
+    io::{self, BufRead, BufReader, ErrorKind, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
-use interprocess::local_socket::{ListenerOptions, Stream, prelude::*};
+#[cfg(not(unix))]
+use interprocess::local_socket::ListenerOptions;
+#[cfg(unix)]
+use interprocess::local_socket::Name;
+use interprocess::local_socket::{Listener, Stream, prelude::*};
 use tungstenite::{
     Message, WebSocket,
     handshake::derive_accept_key,
     protocol::{Role, WebSocketConfig},
 };
 
+#[cfg(not(unix))]
+use crate::transport::call_anonymous;
 use crate::{
     protocol::{
         Request, ResponseEnvelope, ResponseResult, ServerInfo, decode_request, decode_write_data,
@@ -26,7 +32,7 @@ use crate::{
         validate_terminal_size,
     },
     session::{OrphanPolicy, SessionHost},
-    transport::{call_anonymous, read_frame, runtime_name, write_response},
+    transport::{IPC_FRAME_READ_DEADLINE, read_frame, runtime_name, write_response},
     version_check::{CHECK_INTERVAL, VersionChecker},
 };
 
@@ -41,9 +47,40 @@ const WEB_EVENTS_LEASE_REFRESH: Duration = Duration::from_secs(10);
 /// Cap inbound request-id length for WebUI command frames.
 const WEB_EVENTS_MAX_REQUEST_ID_BYTES: usize = 128;
 
+/// Active connection caps: the Runtime never spawns an unbounded number of
+/// handler threads for either local listener. Reaching a cap rejects new
+/// connections with a bounded error instead of creating another thread.
+const WEB_MAX_ACTIVE_CONNECTIONS: usize = 64;
+const IPC_MAX_ACTIVE_CONNECTIONS: usize = 64;
+
+/// HTTP parser and I/O bounds for the loopback WebUI.
+/// Request line and per-header line byte caps.
+const WEB_HTTP_MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const WEB_HTTP_MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+/// Maximum number of header lines per request.
+const WEB_HTTP_MAX_HEADER_COUNT: usize = 64;
+/// Maximum total header bytes (names, values, CRLFs) per request.
+const WEB_HTTP_MAX_HEADER_BYTES: usize = 32 * 1024;
+/// Maximum response body the WebUI will serialize onto the wire. Bodies above
+/// this are replaced with a bounded 500 error instead of being sent verbatim.
+const WEB_HTTP_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Per-read socket timeout: a stalled peer fails one read quickly.
+const WEB_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total wall-clock budget for reading one HTTP request; a trickling client
+/// cannot hold a handler thread forever one byte at a time.
+const WEB_HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+/// Socket write timeout for WebUI HTTP and WebSocket writes.
+const WEB_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle poll interval while waiting for HTTP request bytes.
+const WEB_HTTP_POLL: Duration = Duration::from_millis(5);
+
 pub(crate) fn run() -> Result<()> {
-    let name = runtime_name()?;
-    let listener = match ListenerOptions::new().name(name).create_sync() {
+    // On Unix one owner-only lock serializes bind, liveness probe, stale
+    // cleanup, and rebind. It is released immediately after listener ownership
+    // is established, and by the OS if a starter crashes.
+    #[cfg(unix)]
+    let startup_lock = crate::transport::acquire_runtime_startup_lock()?;
+    let listener = match bind_runtime_listener() {
         Ok(listener) => listener,
         Err(error)
             if matches!(
@@ -51,17 +88,28 @@ pub(crate) fn run() -> Result<()> {
                 ErrorKind::AddrInUse | ErrorKind::PermissionDenied
             ) =>
         {
-            if call_anonymous(Request::ServerStatus, false).is_ok_and(|response| {
-                response.ok && matches!(response.result, Some(ResponseResult::ServerInfo(_)))
-            }) {
+            if runtime_server_is_alive() {
+                // Another Runtime already owns the IPC name; the singleton is
+                // running, so this duplicate server exits quietly.
                 return Ok(());
             }
-            return Err(error).context("runtime pipe name is occupied by another process");
+            rebind_after_stale_socket(
+                error,
+                #[cfg(unix)]
+                &startup_lock,
+            )?
         }
-        Err(error) => return Err(error).context("failed to bind the runtime named pipe"),
+        Err(error) => {
+            #[cfg(not(unix))]
+            return Err(error).context("failed to bind the runtime named pipe");
+            #[cfg(unix)]
+            return Err(error).context("failed to bind the runtime IPC listener");
+        }
     };
+    #[cfg(unix)]
+    drop(startup_lock);
 
-    let web_listener = bind_web_ui();
+    let web_listener = bind_web_ui()?;
     let web_url = web_listener
         .as_ref()
         .and_then(|listener| listener.local_addr().ok())
@@ -72,6 +120,8 @@ pub(crate) fn run() -> Result<()> {
         stopping: AtomicBool::new(false),
         web_url,
         version_checker: Arc::new(VersionChecker::new()),
+        web_connections: AtomicUsize::new(0),
+        ipc_connections: AtomicUsize::new(0),
     });
     if let Some(listener) = web_listener {
         let web_state = Arc::clone(&state);
@@ -100,12 +150,104 @@ pub(crate) fn run() -> Result<()> {
         if state.stopping.load(Ordering::Acquire) {
             break;
         }
+        if !admit_connection(&state.ipc_connections, IPC_MAX_ACTIVE_CONNECTIONS) {
+            // At the IPC connection cap: answer with a bounded error frame and
+            // close without spawning another handler thread.
+            let _ = connection.set_nonblocking(true);
+            let busy = ResponseEnvelope::failure(
+                "invalid-request",
+                "server_busy",
+                "the runtime is at its IPC connection limit; retry shortly",
+            );
+            let mut connection = connection;
+            let _ = write_response(&mut connection, &busy);
+            continue;
+        }
         let state = Arc::clone(&state);
-        thread::spawn(move || handle_connection(connection, state));
+        thread::spawn(move || {
+            // Keep a dedicated Arc for the slot so the counter stays alive for
+            // the whole handler while `state` moves into the handler.
+            let slot_state = Arc::clone(&state);
+            let _slot = ConnectionSlot {
+                slots: &slot_state.ipc_connections,
+            };
+            handle_connection(connection, state);
+        });
     }
 
     state.host.shutdown_all()?;
     Ok(())
+}
+
+/// Bind the Runtime IPC listener. On Unix this secures a filesystem socket to
+/// owner-only (0600) inside the private owner-only runtime directory; on other
+/// platforms it keeps the historical named-pipe bind. Returns the raw I/O
+/// error so `run` can distinguish an occupied name from other bind failures.
+fn bind_runtime_listener() -> io::Result<Listener> {
+    #[cfg(unix)]
+    {
+        let path = crate::transport::runtime_socket_path().map_err(io::Error::other)?;
+        crate::transport::bind_listener_at(&path)
+    }
+    #[cfg(not(unix))]
+    {
+        let name = runtime_name().map_err(io::Error::other)?;
+        ListenerOptions::new().name(name).create_sync()
+    }
+}
+
+/// Whether another Runtime owns the IPC name. On Unix this probes the socket
+/// directly: a live listener accepts connections even while at its connection
+/// cap, whereas a stale socket file refuses them. Other platforms keep the
+/// historical `ServerStatus` round-trip.
+fn runtime_server_is_alive() -> bool {
+    #[cfg(unix)]
+    {
+        runtime_name()
+            .map(|name| runtime_server_is_alive_for(&name))
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        call_anonymous(Request::ServerStatus, false).is_ok_and(|response| {
+            response.ok && matches!(response.result, Some(ResponseResult::ServerInfo(_)))
+        })
+    }
+}
+
+/// Unix liveness probe for a single name: a live listener accepts connections,
+/// while a stale socket file refuses them. Never removes anything.
+#[cfg(unix)]
+fn runtime_server_is_alive_for(name: &Name<'_>) -> bool {
+    Stream::connect(name.clone()).is_ok()
+}
+
+/// The IPC name is held by a process that did not answer the liveness probe.
+/// On Unix this is typically a stale socket file left by a crashed Runtime:
+/// remove it only when it is provably our own socket file, then retry the bind
+/// once. Unsafe paths — symlinks, wrong file types, foreign owners — are
+/// refused with a diagnosable error instead of being deleted. Other platforms
+/// keep the historical "occupied" error.
+fn rebind_after_stale_socket(
+    error: io::Error,
+    #[cfg(unix)] startup_lock: &crate::transport::RuntimeStartupLock,
+) -> Result<Listener> {
+    #[cfg(unix)]
+    {
+        if crate::transport::remove_stale_runtime_socket(startup_lock)? {
+            match bind_runtime_listener() {
+                Ok(listener) => Ok(listener),
+                Err(retry_error) => Err(retry_error)
+                    .context("runtime socket was re-occupied after removing the stale socket"),
+            }
+        } else {
+            Err(error).context("runtime socket path is occupied by another process")
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Err(error).context("runtime pipe name is occupied by another process")
+    }
 }
 
 struct RuntimeState {
@@ -114,16 +256,52 @@ struct RuntimeState {
     stopping: AtomicBool,
     web_url: Option<String>,
     version_checker: Arc<VersionChecker>,
+    /// Active WebUI HTTP/WebSocket handler threads.
+    web_connections: AtomicUsize,
+    /// Active IPC request handler threads.
+    ipc_connections: AtomicUsize,
+}
+
+/// Atomically reserve one of `limit` handler slots; `false` means the cap is
+/// reached and the caller must reject the connection without spawning a thread.
+fn admit_connection(slots: &AtomicUsize, limit: usize) -> bool {
+    slots
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < limit).then_some(current + 1)
+        })
+        .is_ok()
+}
+
+/// Releases a reserved connection slot when the handler thread finishes.
+struct ConnectionSlot<'a> {
+    slots: &'a AtomicUsize,
+}
+
+impl Drop for ConnectionSlot<'_> {
+    fn drop(&mut self) {
+        self.slots.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn handle_connection(stream: Stream, state: Arc<RuntimeState>) {
+    // Non-blocking I/O lets the request read and the response write be bounded
+    // by wall-clock deadlines on every platform (Windows named pipes have no
+    // native socket timeouts).
+    if stream.set_nonblocking(true).is_err() {
+        return;
+    }
     let mut connection = BufReader::new(stream);
-    let frame = match read_frame(&mut connection) {
+    let frame = match read_frame(
+        &mut connection,
+        Some(Instant::now() + IPC_FRAME_READ_DEADLINE),
+    ) {
         Ok(frame) => frame,
         Err(error) => {
-            let response =
-                ResponseEnvelope::failure("invalid-request", "invalid_frame", format!("{error:#}"));
-            let _ = write_response(connection.get_mut(), &response);
+            // The peer did not deliver a complete request (silent, closed, or
+            // oversized). Record the bounded error and close; there is no
+            // request to answer and writing would only wait another write
+            // deadline on a peer that is not reading.
+            eprintln!("grok-bridge server: IPC request read failed: {error:#}");
             return;
         }
     };
@@ -312,15 +490,77 @@ impl RuntimeState {
     }
 }
 
-fn bind_web_ui() -> Option<TcpListener> {
-    let address = env::var("GROK_BRIDGE_WEB_ADDR").unwrap_or_else(|_| "127.0.0.1:47653".to_owned());
-    match TcpListener::bind(&address) {
-        Ok(listener) => Some(listener),
-        Err(error) => {
-            eprintln!("grok-bridge server: WebUI unavailable at {address}: {error}");
-            None
+/// Default WebUI listener. Kept loopback-only because the WebUI has no user
+/// authentication; `GROK_BRIDGE_WEB_ADDR` may only select a loopback address.
+const DEFAULT_WEB_ADDR: &str = "127.0.0.1:47653";
+
+/// Why a `GROK_BRIDGE_WEB_ADDR` value cannot be used as the WebUI listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebAddrError {
+    /// Not parseable as a literal `IpAddr:port`. Hostnames are never resolved.
+    InvalidAddress(String),
+    /// Parsed, but the IP is not a loopback address.
+    NotLoopback(SocketAddr),
+}
+
+impl fmt::Display for WebAddrError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WebAddrError::InvalidAddress(value) => write!(
+                formatter,
+                "GROK_BRIDGE_WEB_ADDR {value:?} is not a literal IP address with a port; \
+                 the local-only WebUI never resolves hostnames, use a loopback address \
+                 such as 127.0.0.1:47653 or [::1]:47653"
+            ),
+            WebAddrError::NotLoopback(address) => write!(
+                formatter,
+                "GROK_BRIDGE_WEB_ADDR {address} is not a loopback address; the local-only \
+                 WebUI may only bind to IPv4 127.0.0.0/8 or IPv6 ::1"
+            ),
         }
     }
+}
+
+impl std::error::Error for WebAddrError {}
+
+/// Parse a `GROK_BRIDGE_WEB_ADDR` value into a bindable `SocketAddr` and
+/// require it to be loopback (IPv4 127.0.0.0/8 or IPv6 ::1). Pure: never
+/// resolves hostnames, never binds, never reads the environment.
+fn parse_web_addr(value: &str) -> Result<SocketAddr, WebAddrError> {
+    match value.parse::<SocketAddr>() {
+        Ok(address) if address.ip().is_loopback() => Ok(address),
+        Ok(address) => Err(WebAddrError::NotLoopback(address)),
+        Err(_) => Err(WebAddrError::InvalidAddress(value.to_owned())),
+    }
+}
+
+/// Shared by `bind_web_ui` and tests; `value` is the raw `GROK_BRIDGE_WEB_ADDR`.
+fn bind_web_ui_from(value: &str) -> Result<Option<TcpListener>> {
+    // Parse and validate before binding so a wildcard, LAN, public, hostname,
+    // or unresolvable value is a startup error and never reaches `bind`.
+    let socket_addr = parse_web_addr(value)?;
+    classify_web_ui_bind(value, TcpListener::bind(socket_addr))
+}
+
+fn classify_web_ui_bind(
+    value: &str,
+    result: io::Result<TcpListener>,
+) -> Result<Option<TcpListener>> {
+    match result {
+        Ok(listener) => Ok(Some(listener)),
+        // A legal loopback address whose port is taken only disables the
+        // WebUI; JSON CLI and PTY sessions keep running.
+        Err(error) if error.kind() == ErrorKind::AddrInUse => {
+            eprintln!("grok-bridge server: WebUI unavailable at {value}: {error}");
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to bind WebUI at {value}")),
+    }
+}
+
+fn bind_web_ui() -> Result<Option<TcpListener>> {
+    let address = env::var("GROK_BRIDGE_WEB_ADDR").unwrap_or_else(|_| DEFAULT_WEB_ADDR.to_owned());
+    bind_web_ui_from(&address)
 }
 
 fn run_web_ui(listener: TcpListener, state: Arc<RuntimeState>) {
@@ -329,9 +569,29 @@ fn run_web_ui(listener: TcpListener, state: Arc<RuntimeState>) {
             break;
         }
         match connection {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                if !admit_connection(&state.web_connections, WEB_MAX_ACTIVE_CONNECTIONS) {
+                    // At the Web connection cap: answer with a bounded 503 and
+                    // close without spawning another handler thread.
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                    let _ = write_http(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        "text/plain; charset=utf-8",
+                        "too many active WebUI connections; retry shortly",
+                    );
+                    continue;
+                }
                 let state = Arc::clone(&state);
-                thread::spawn(move || handle_web_connection(stream, state));
+                thread::spawn(move || {
+                    // Keep a dedicated Arc for the slot so the counter stays alive for
+                    // the whole handler while `state` moves into the handler.
+                    let slot_state = Arc::clone(&state);
+                    let _slot = ConnectionSlot {
+                        slots: &slot_state.web_connections,
+                    };
+                    handle_web_connection(stream, state);
+                });
             }
             Err(error) => eprintln!("grok-bridge server: WebUI accept failed: {error}"),
         }
@@ -339,7 +599,8 @@ fn run_web_ui(listener: TcpListener, state: Arc<RuntimeState>) {
 }
 
 fn handle_web_connection(mut stream: TcpStream, state: Arc<RuntimeState>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(WEB_HTTP_READ_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(WEB_HTTP_WRITE_TIMEOUT));
     let request = match read_http_request(&mut stream) {
         Ok(request) => request,
         Err(error) => {
@@ -579,16 +840,28 @@ fn handle_events_websocket(
     // Host Condvar is the primary sleep; keep socket reads short so a quiet
     // client socket cannot delay event pushes after a revision wake-up.
     let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(WEB_HTTP_WRITE_TIMEOUT));
 
+    let mut websocket = WebSocket::from_raw_socket(stream, Role::Server, Some(web_socket_config()));
+    run_events_websocket(&mut websocket, &state);
+}
+
+/// Bounded WebSocket configuration: every frame, message, read and write
+/// buffer has an explicit cap so a hostile or broken peer can never grow
+/// memory without bound or pin the connection thread.
+fn web_socket_config() -> WebSocketConfig {
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(WEB_EVENTS_MAX_MESSAGE_BYTES);
     config.max_frame_size = Some(WEB_EVENTS_MAX_MESSAGE_BYTES);
     // Eager writes so session events are not stuck in the 128 KiB default buffer.
     config.write_buffer_size = 0;
+    // Explicit write-buffer cap: tungstenite's default is unbounded
+    // (usize::MAX). With eager writes the buffer only grows while the peer is
+    // not draining, so one max-size frame is the most backpressure we allow
+    // before the connection fails with WriteBufferFull.
+    config.max_write_buffer_size = WEB_EVENTS_MAX_MESSAGE_BYTES;
     config.read_buffer_size = 8 * 1024;
-    let mut websocket = WebSocket::from_raw_socket(stream, Role::Server, Some(config));
-    run_events_websocket(&mut websocket, &state);
+    config
 }
 
 fn run_events_websocket(websocket: &mut WebSocket<TcpStream>, state: &RuntimeState) {
@@ -1133,7 +1406,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ParsedHttpRequest {
     method: String,
     path: String,
@@ -1147,12 +1420,20 @@ struct ParsedHttpRequest {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> std::result::Result<ParsedHttpRequest, String> {
+    read_http_request_with_deadline(stream, Instant::now() + WEB_HTTP_REQUEST_DEADLINE)
+}
+
+/// Parse one HTTP request, bounded by the documented request line/header caps
+/// and a wall-clock deadline. `deadline` is injectable for tests.
+fn read_http_request_with_deadline(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> std::result::Result<ParsedHttpRequest, String> {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|error| error.to_string())?;
-    let mut parts = line.split_whitespace();
+    let request_line = read_http_line(&mut reader, WEB_HTTP_MAX_REQUEST_LINE_BYTES, deadline)?;
+    let request_line = std::str::from_utf8(&request_line)
+        .map_err(|_| "request line is not valid UTF-8".to_owned())?;
+    let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or("missing HTTP method")?.to_owned();
     let path = parts.next().ok_or("missing HTTP path")?.to_owned();
     let mut bridge_header = false;
@@ -1162,15 +1443,27 @@ fn read_http_request(stream: &mut TcpStream) -> std::result::Result<ParsedHttpRe
     let mut connection_upgrade = false;
     let mut sec_websocket_key = None;
     let mut sec_websocket_version = None;
+    let mut header_count = 0usize;
+    let mut header_bytes = 0usize;
     loop {
-        line.clear();
-        reader
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?;
-        if line == "\r\n" || line == "\n" || line.is_empty() {
+        let line = read_http_line(&mut reader, WEB_HTTP_MAX_HEADER_LINE_BYTES, deadline)?;
+        if line.is_empty() {
             break;
         }
-        let header = line.trim_end_matches(['\r', '\n']);
+        header_count += 1;
+        header_bytes += line.len();
+        if header_count > WEB_HTTP_MAX_HEADER_COUNT {
+            return Err(format!(
+                "too many HTTP headers; the limit is {WEB_HTTP_MAX_HEADER_COUNT}"
+            ));
+        }
+        if header_bytes > WEB_HTTP_MAX_HEADER_BYTES {
+            return Err(format!(
+                "HTTP headers exceed the total size limit of {WEB_HTTP_MAX_HEADER_BYTES} bytes"
+            ));
+        }
+        let header =
+            std::str::from_utf8(&line).map_err(|_| "header is not valid UTF-8".to_owned())?;
         let Some((name, value)) = header.split_once(':') else {
             continue;
         };
@@ -1207,6 +1500,55 @@ fn read_http_request(stream: &mut TcpStream) -> std::result::Result<ParsedHttpRe
     })
 }
 
+/// Read one CRLF/LF-terminated line with a hard byte cap and a wall-clock
+/// deadline, so a hostile or broken peer can neither make the server allocate
+/// an unbounded line nor hold a handler thread past the request budget.
+///
+/// An empty line (blank separator or EOF) yields an empty `Vec`. A line longer
+/// than `cap` or a request that outlives `deadline` fails the parse; idle reads
+/// are retried with a short sleep (mirroring the IPC frame poll) so a trickling
+/// client cannot stall the deadline.
+fn read_http_line(
+    reader: &mut impl BufRead,
+    cap: usize,
+    deadline: Instant,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut line = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            return Err("HTTP request read timed out".to_owned());
+        }
+        let buffer = match reader.fill_buf() {
+            Ok(buffer) => buffer,
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                thread::sleep(WEB_HTTP_POLL);
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if buffer.is_empty() {
+            return Ok(line);
+        }
+        if let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+            line.extend_from_slice(&buffer[..index]);
+            reader.consume(index + 1);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if line.len() > cap {
+                return Err(format!("HTTP line exceeds the {cap}-byte size limit"));
+            }
+            return Ok(line);
+        }
+        let length = buffer.len();
+        line.extend_from_slice(buffer);
+        reader.consume(length);
+        if line.len() > cap {
+            return Err(format!("HTTP line exceeds the {cap}-byte size limit"));
+        }
+    }
+}
+
 fn write_http(
     stream: &mut TcpStream,
     status: &str,
@@ -1222,12 +1564,59 @@ fn write_http_bytes(
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
-    write!(
-        stream,
+    if body.len() > WEB_HTTP_MAX_RESPONSE_BYTES {
+        // Keep the wire response bounded even if a route produced an oversized
+        // body; the replacement body is tiny and cannot recurse.
+        return write_http_bytes(
+            stream,
+            "500 Internal Server Error",
+            "text/plain; charset=utf-8",
+            b"server response exceeds the size limit",
+        );
+    }
+    let headers = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
         body.len()
-    )?;
-    stream.write_all(body)
+    );
+    let mut response = Vec::with_capacity(headers.len() + body.len());
+    response.extend_from_slice(headers.as_bytes());
+    response.extend_from_slice(body);
+    write_tcp_all_with_deadline(stream, &response, WEB_HTTP_WRITE_TIMEOUT)
+}
+
+/// Write one bounded HTTP response under a total wall-clock deadline. A
+/// socket write timeout alone is per syscall, so a peer that accepts a few
+/// bytes repeatedly could otherwise keep resetting `write_all` forever.
+fn write_tcp_all_with_deadline(
+    stream: &mut TcpStream,
+    mut data: &[u8],
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !data.is_empty() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "HTTP response write exceeded its total I/O deadline",
+            ));
+        }
+        stream.set_write_timeout(Some(deadline.saturating_duration_since(now)))?;
+        match stream.write(data) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "peer closed while receiving the HTTP response",
+                ));
+            }
+            Ok(written) => data = &data[written..],
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 struct StaticWebAsset {
@@ -1430,6 +1819,266 @@ mod tests {
             Some("https://127.0.0.1:47653"),
             Some("127.0.0.1:47653")
         ));
+    }
+
+    #[test]
+    fn parses_only_loopback_web_addr_as_socket_addr() {
+        // Default and other IPv4 127.0.0.0/8 addresses, including port 0.
+        for value in [
+            "127.0.0.1:47653",
+            "127.0.0.0:80",
+            "127.255.255.254:1",
+            "127.0.0.1:0",
+        ] {
+            assert_eq!(
+                parse_web_addr(value).unwrap(),
+                value.parse::<SocketAddr>().unwrap(),
+                "{value}"
+            );
+        }
+        // IPv6 ::1 is accepted; this only parses, it never needs the machine
+        // to support binding an IPv6 socket.
+        for value in ["[::1]:47653", "[::1]:0"] {
+            assert_eq!(
+                parse_web_addr(value).unwrap(),
+                value.parse::<SocketAddr>().unwrap(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_wildcard_lan_and_public_web_addr_before_binding() {
+        for value in [
+            "0.0.0.0:47653",            // IPv4 wildcard
+            "[::]:47653",               // IPv6 wildcard
+            "192.168.1.10:47653",       // LAN (RFC 1918)
+            "10.0.0.5:47653",           // LAN (RFC 1918)
+            "172.16.0.1:47653",         // LAN (RFC 1918)
+            "169.254.1.1:47653",        // link-local
+            "8.8.8.8:47653",            // public IPv4
+            "1.2.3.4:80",               // public IPv4
+            "[2001:db8::1]:47653",      // public IPv6
+            "[::ffff:127.0.0.1]:47653", // IPv4-mapped IPv6 is not loopback
+        ] {
+            let err = parse_web_addr(value).unwrap_err();
+            assert!(
+                matches!(err, WebAddrError::NotLoopback(_)),
+                "expected NotLoopback for {value:?}, got {err:?}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("local-only"), "{value:?}: {message}");
+            assert!(message.contains("127.0.0.0/8"), "{value:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn rejects_hostname_and_unresolvable_web_addr_without_dns() {
+        for value in [
+            "",
+            "   ",
+            "not-an-address",
+            "127.0.0.1",          // missing port
+            "127.0.0.1:notaport", // non-numeric port
+            "127.0.0.1:70000",    // port out of range
+            "localhost:47653",    // hostname must not be resolved
+            "myhost.local:47653", // hostname must not be resolved
+        ] {
+            let err = parse_web_addr(value).unwrap_err();
+            assert!(
+                matches!(err, WebAddrError::InvalidAddress(_)),
+                "expected InvalidAddress for {value:?}, got {err:?}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("local-only"), "{value:?}: {message}");
+            assert!(message.contains("hostnames"), "{value:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn non_loopback_or_invalid_web_addr_is_a_startup_error() {
+        // These must fail before any TcpListener::bind attempt.
+        for value in [
+            "0.0.0.0:47653",
+            "8.8.8.8:47653",
+            "localhost:47653",
+            "garbage",
+        ] {
+            let err = bind_web_ui_from(value).unwrap_err();
+            assert!(err.to_string().contains("local-only"), "{value:?}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn occupied_loopback_port_disables_webui_without_startup_error() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap().to_string();
+        assert!(
+            parse_web_addr(&address).is_ok(),
+            "{address} must be loopback"
+        );
+        let result = bind_web_ui_from(&address).unwrap();
+        assert!(
+            result.is_none(),
+            "occupied port must keep WebUI unavailable"
+        );
+    }
+
+    #[test]
+    fn non_addr_in_use_web_bind_errors_remain_startup_errors() {
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::AddrNotAvailable] {
+            let error = classify_web_ui_bind(
+                "127.0.0.1:47653",
+                Err(io::Error::new(kind, "injected bind failure")),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("failed to bind WebUI"));
+            assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+        }
+    }
+
+    #[test]
+    fn http_line_reading_is_capped_and_strips_line_endings() {
+        let mut reader = BufReader::new(&b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"[..]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            read_http_line(&mut reader, 64, deadline).unwrap(),
+            b"GET / HTTP/1.1"
+        );
+        assert_eq!(
+            read_http_line(&mut reader, 64, deadline).unwrap(),
+            b"Host: x"
+        );
+        assert!(
+            read_http_line(&mut reader, 64, deadline)
+                .unwrap()
+                .is_empty()
+        );
+
+        let long = [b'a'; 16];
+        let mut reader = BufReader::new(&long[..]);
+        assert!(read_http_line(&mut reader, 8, deadline).is_err());
+    }
+
+    #[test]
+    fn oversized_request_line_is_rejected_with_400() {
+        let path = format!("/{}", "x".repeat(WEB_HTTP_MAX_REQUEST_LINE_BYTES));
+        let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let response = serve_web_request(request.as_bytes());
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        let (_, body) = split_http_response(&response);
+        assert!(
+            String::from_utf8_lossy(body).contains("size limit"),
+            "{}",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    #[test]
+    fn too_many_headers_are_rejected_with_400() {
+        let mut request = String::from("GET / HTTP/1.1\r\nHost: localhost\r\n");
+        for _ in 0..(WEB_HTTP_MAX_HEADER_COUNT + 1) {
+            request.push_str("X-Pad: 1\r\n");
+        }
+        request.push_str("\r\n");
+        let response = serve_web_request(request.as_bytes());
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        let (_, body) = split_http_response(&response);
+        assert!(String::from_utf8_lossy(body).contains("headers"));
+    }
+
+    #[test]
+    fn oversized_total_header_bytes_are_rejected_with_400() {
+        // Five ~7 KiB headers stay under the per-line cap but exceed the
+        // 32 KiB total header budget.
+        let mut request = String::from("GET / HTTP/1.1\r\nHost: localhost\r\n");
+        for index in 0..5 {
+            request.push_str(&format!("X-Pad-{index}: {}\r\n", "x".repeat(7000)));
+        }
+        request.push_str("\r\n");
+        let response = serve_web_request(request.as_bytes());
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        let (_, body) = split_http_response(&response);
+        assert!(
+            String::from_utf8_lossy(body).contains("size limit"),
+            "{}",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    #[test]
+    fn http_request_read_stops_at_the_wall_clock_deadline_for_a_trickling_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client.write_all(b"GET / HT").unwrap(); // incomplete request line
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let started = Instant::now();
+        let err = read_http_request_with_deadline(&mut server, deadline).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn http_response_body_over_the_limit_is_replaced_with_a_bounded_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let oversized = vec![0u8; WEB_HTTP_MAX_RESPONSE_BYTES + 1];
+
+        write_http_bytes(
+            &mut server,
+            "200 OK",
+            "application/octet-stream",
+            &oversized,
+        )
+        .unwrap();
+        drop(server);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let (headers, body) = split_http_response(&response);
+        assert!(headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+        assert_eq!(body, b"server response exceeds the size limit");
+    }
+
+    #[test]
+    fn connection_admission_is_bounded_and_releases_slots() {
+        let slots = AtomicUsize::new(0);
+        for _ in 0..3 {
+            assert!(admit_connection(&slots, 3));
+        }
+        assert!(!admit_connection(&slots, 3));
+        assert_eq!(slots.load(Ordering::Relaxed), 3);
+
+        drop(ConnectionSlot { slots: &slots });
+        assert_eq!(slots.load(Ordering::Relaxed), 2);
+        assert!(admit_connection(&slots, 3));
+    }
+
+    #[test]
+    fn websocket_config_has_explicit_frame_message_and_buffer_limits() {
+        let config = web_socket_config();
+        assert_eq!(config.max_message_size, Some(WEB_EVENTS_MAX_MESSAGE_BYTES));
+        assert_eq!(config.max_frame_size, Some(WEB_EVENTS_MAX_MESSAGE_BYTES));
+        assert_eq!(config.write_buffer_size, 0);
+        assert_eq!(config.max_write_buffer_size, WEB_EVENTS_MAX_MESSAGE_BYTES);
+        assert_eq!(config.read_buffer_size, 8 * 1024);
+    }
+
+    #[test]
+    fn connection_caps_and_http_limits_are_bounded() {
+        assert!((1..=256).contains(&WEB_MAX_ACTIVE_CONNECTIONS));
+        assert!((1..=256).contains(&IPC_MAX_ACTIVE_CONNECTIONS));
+        // Compile-time invariants: header lines nest inside the header budget
+        // and the request line/response budgets stay large enough to be useful.
+        const {
+            assert!(WEB_HTTP_MAX_HEADER_LINE_BYTES <= WEB_HTTP_MAX_HEADER_BYTES);
+            assert!(WEB_HTTP_MAX_REQUEST_LINE_BYTES >= 256);
+            assert!(WEB_HTTP_MAX_RESPONSE_BYTES >= 1024 * 1024);
+        }
     }
 
     #[test]
@@ -1741,6 +2390,8 @@ mod tests {
                     stopping: AtomicBool::new(false),
                     web_url: None,
                     version_checker: Arc::new(VersionChecker::new()),
+                    web_connections: AtomicUsize::new(0),
+                    ipc_connections: AtomicUsize::new(0),
                 }),
             );
         });
@@ -1760,5 +2411,35 @@ mod tests {
             std::str::from_utf8(&response[..separator + 2]).unwrap(),
             &response[separator + 4..],
         )
+    }
+
+    /// The Unix liveness probe must accept a live listener and refuse a stale
+    /// socket file, on a throwaway path that never touches the real runtime.
+    #[cfg(unix)]
+    #[test]
+    fn unix_liveness_probe_distinguishes_live_and_stale_sockets() {
+        let dir =
+            std::env::temp_dir().join(format!("grok-bridge-probe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("probe.sock");
+        let name = socket
+            .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+            .unwrap();
+
+        // No listener behind the path: must not probe as alive.
+        assert!(!runtime_server_is_alive_for(&name));
+
+        let listener = interprocess::local_socket::ListenerOptions::new()
+            .name(name.clone())
+            .create_sync()
+            .unwrap();
+        assert!(runtime_server_is_alive_for(&name));
+
+        // Dropping the listener reclaims the socket file, so the path is stale
+        // again and must no longer probe as alive.
+        drop(listener);
+        assert!(!runtime_server_is_alive_for(&name));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
