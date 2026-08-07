@@ -342,6 +342,11 @@ pub(crate) fn read_frame(reader: &mut impl BufRead, deadline: Option<Instant>) -
 /// the peer's receive buffer is full. Non-blocking peers that stop draining
 /// produce a bounded write error instead of blocking the caller forever.
 ///
+/// Windows named pipes in nonblocking (PIPE_NOWAIT) mode report a full buffer
+/// as `Ok(0)`: a successful zero-byte completion, not a peer close. Such a
+/// zero-byte write is retried under the same bounded backoff and deadline.
+/// On every other platform `Ok(0)` still means the peer closed the stream.
+///
 /// There is deliberately no trailing `flush()`: these frames are written
 /// directly to the underlying OS handle (never through a userspace
 /// `BufWriter`), so there is no buffered data to flush, and a flush on a
@@ -356,17 +361,24 @@ fn write_frame_all(stream: &mut impl Write, mut data: &[u8], deadline: Duration)
                 "protocol frame write timed out; the peer did not drain the data within the I/O deadline"
             );
         }
-        match stream.write(data) {
+        let stalled = match stream.write(data) {
+            #[cfg(windows)]
+            Ok(0) => true,
+            #[cfg(not(windows))]
             Ok(0) => bail!("protocol peer closed while receiving the frame"),
             Ok(written) => {
                 data = &data[written..];
                 poll_delay = IPC_POLL_MIN;
+                false
             }
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                thread::sleep(poll_delay);
-                poll_delay = (poll_delay * 2).min(IPC_POLL_MAX);
+                true
             }
             Err(error) => return Err(error.into()),
+        };
+        if stalled {
+            thread::sleep(poll_delay);
+            poll_delay = (poll_delay * 2).min(IPC_POLL_MAX);
         }
     }
     Ok(())
@@ -884,18 +896,27 @@ mod tests {
         let _client = Stream::connect(name).unwrap();
         let mut server = listener.accept().unwrap();
         // The peer never reads. Fill the pipe until a non-blocking write
-        // signals WouldBlock/TimedOut, then attempt a fresh frame under a
-        // short deadline. Unix pipes accept bytes until the buffer is
-        // genuinely full, while Windows named pipes can report the full pipe
-        // on the very first non-blocking write — so the blocking signal is
-        // the reliable "full" marker and `filled` may legitimately stay 0.
+        // signals backpressure: a WouldBlock/TimedOut error on either
+        // platform, or Ok(0) on Windows PIPE_NOWAIT pipes, which report a
+        // successful zero-byte write when the buffer is full. Unix pipes
+        // instead accept bytes until the buffer is genuinely full and only
+        // then start returning WouldBlock, so `filled` may stay 0 on Windows
+        // but is expected to be large on Unix.
         server.set_nonblocking(true).unwrap();
         let filler = vec![0x55u8; 64 * 1024];
         let mut filled = 0usize;
         let pipe_full = loop {
             match server.write(&filler) {
-                // Ok(0) means the peer half-closed the connection, not that
-                // the buffer is full; treat it as an unexpected shutdown.
+                // Windows named pipes in nonblocking (PIPE_NOWAIT) mode return
+                // Ok(0) when the write could not make progress (the pipe
+                // buffer is full), with no implication that the peer closed;
+                // WriteFileEx reports a successful zero-byte completion. That
+                // is the platform's backpressure signal. On Unix, Ok(0) still
+                // means the peer half-closed the connection and must not be
+                // mistaken for a full buffer.
+                #[cfg(windows)]
+                Ok(0) => break true,
+                #[cfg(not(windows))]
                 Ok(0) => panic!("IPC peer closed while filling the send buffer"),
                 Ok(written) => filled += written,
                 Err(error)
@@ -911,7 +932,7 @@ mod tests {
         };
         assert!(
             pipe_full,
-            "fill loop ended without a WouldBlock/TimedOut signal after {filled} bytes"
+            "fill loop ended without a backpressure signal (WouldBlock/TimedOut, or Ok(0) on Windows) after {filled} bytes"
         );
 
         // A full-size frame can never fit in the small filled pipe, so the
