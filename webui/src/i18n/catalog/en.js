@@ -159,6 +159,9 @@ export default {
   "interactive.error": "Terminal input failed: {detail}",
   "interactive.unavailable": "Terminal input unavailable",
   "interactive.unavailableShort": "input offline",
+  "interactive.tooLarge": "Input exceeds the 64 KiB limit; the whole input was rejected and nothing was sent.",
+  "interactive.queueFull": "The command queue is full; the input was rejected as a whole.",
+  "interactive.indeterminate": "Input delivery could not be confirmed; it was not re-sent.",
 
   "action.confirmCloseSession": "Close {id} and its Grok process?",
   "action.closedSession":

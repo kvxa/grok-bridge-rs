@@ -162,6 +162,9 @@ export default {
   "interactive.error": "端末入力に失敗：{detail}",
   "interactive.unavailable": "端末入力を利用できません",
   "interactive.unavailableShort": "入力オフライン",
+  "interactive.tooLarge": "入力が 64 KiB の上限を超えたため、入力全体が拒否され、何も送信されませんでした。",
+  "interactive.queueFull": "コマンドキューがいっぱいのため、入力全体が拒否されました。",
+  "interactive.indeterminate": "入力が届いたか確認できなかったため、自動で再送信しませんでした。",
 
   "action.confirmCloseSession": "{id} とその Grok プロセスを閉じますか？",
   "action.closedSession":

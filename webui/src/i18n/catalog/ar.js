@@ -159,6 +159,9 @@ export default {
   "interactive.error": "فشل إدخال الطرفية: {detail}",
   "interactive.unavailable": "إدخال الطرفية غير متاح",
   "interactive.unavailableShort": "الإدخال غير متصل",
+  "interactive.tooLarge": "يتجاوز الإدخال حد 64 KiB؛ رُفض الإدخال بالكامل ولم يُرسل أي محتوى.",
+  "interactive.queueFull": "قائمة انتظار الأوامر ممتلئة؛ رُفض الإدخال بالكامل.",
+  "interactive.indeterminate": "تعذّر تأكيد وصول الإدخال؛ لم تتم إعادة إرساله تلقائيًا.",
 
   "action.confirmCloseSession": "إغلاق {id} وعملية Grok الخاصة به؟",
   "action.closedSession":

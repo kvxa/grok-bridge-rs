@@ -165,6 +165,9 @@ export default {
   "interactive.error": "Échec de la saisie terminal : {detail}",
   "interactive.unavailable": "Saisie terminal indisponible",
   "interactive.unavailableShort": "saisie hors ligne",
+  "interactive.tooLarge": "La saisie dépasse la limite de 64 KiB ; elle a été entièrement refusée et rien n'a été envoyé.",
+  "interactive.queueFull": "La file de commandes est pleine ; la saisie a été entièrement refusée.",
+  "interactive.indeterminate": "La transmission de la saisie n'a pas pu être confirmée ; elle n'a pas été renvoyée.",
 
   "action.confirmCloseSession": "Fermer {id} et son processus Grok ?",
   "action.closedSession":

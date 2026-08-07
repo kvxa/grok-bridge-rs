@@ -94,6 +94,7 @@ describe("Terminal (xterm read-only)", () => {
   let ioState;
   let sendInput;
   let sendResize;
+  let resizeAckListeners;
 
   beforeEach(() => {
     MockXTerm.reset();
@@ -104,12 +105,21 @@ describe("Terminal (xterm read-only)", () => {
     rafQueue = [];
     sendInput = vi.fn(() => ({ ok: true, id: "t1" }));
     sendResize = vi.fn(() => ({ ok: true, id: "t2" }));
+    resizeAckListeners = new Set();
+    const subscribeResizeAck = (listener) => {
+      resizeAckListeners.add(listener);
+      return () => {
+        resizeAckListeners.delete(listener);
+      };
+    };
     ioState = {
       interactive: false,
       setInteractive: vi.fn(),
       connectionState: "connected",
       sendTerminalInput: (...args) => sendInput(...args),
       sendTerminalResize: (...args) => sendResize(...args),
+      unconfirmedInputs: 0,
+      subscribeResizeAck,
     };
     vi.stubGlobal(
       "requestAnimationFrame",
@@ -191,8 +201,9 @@ describe("Terminal (xterm read-only)", () => {
     return host;
   }
 
-  async function setInteractive(value) {
-    ioState = { ...ioState, interactive: value };
+  /** Re-render the same Terminal with merged ioState overrides (same session id). */
+  async function rerenderWith(changes) {
+    ioState = { ...ioState, ...changes };
     await act(async () => {
       root.render(
         <I18nProvider initialLocale="en">
@@ -212,6 +223,23 @@ describe("Terminal (xterm read-only)", () => {
       await Promise.resolve();
     });
     await flushRaf();
+  }
+
+  async function setInteractive(value) {
+    await rerenderWith({ interactive: value });
+  }
+
+  async function setConnectionState(value) {
+    await rerenderWith({ connectionState: value });
+  }
+
+  /** Fire a server resize ack to every registered listener, as applyMessage does. */
+  async function emitResizeAck(session, id, ok = true) {
+    await act(async () => {
+      for (const listener of [...resizeAckListeners]) {
+        listener(session, id, ok);
+      }
+    });
   }
 
   it("configures disableStdin and never registers input handlers", async () => {
@@ -589,12 +617,14 @@ describe("Terminal (xterm read-only)", () => {
     expect(sendInput).not.toHaveBeenCalled();
   });
 
-  it("still sends terminal_resize while read-only but never terminal_input", async () => {
+  it("never sends terminal_resize while read-only but still fits locally", async () => {
     vi.useFakeTimers();
     await renderTerminal({ interactive: false, hostWidth: 900, hostHeight: 400 });
     sendResize.mockClear();
     sendInput.mockClear();
     const host = container.querySelector("[data-terminal-host]");
+    const fit = MockFitAddon.instances[0];
+    const fitsBefore = fit.fitCount;
     sizeElement(host, 720, 340);
     await act(async () => {
       for (const observer of TestResizeObserver.instances) observer.trigger();
@@ -603,8 +633,10 @@ describe("Terminal (xterm read-only)", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
-    expect(sendResize).toHaveBeenCalled();
-    expect(sendInput).not.toHaveBeenCalled();
+    // Local display still adapts…
+    expect(fit.fitCount).toBeGreaterThan(fitsBefore);
+    // …but the real PTY is never resized and input is never registered.
+    expect(sendResize).not.toHaveBeenCalled();
     MockXTerm.instances[0].emitData("typed-while-readonly");
     expect(sendInput).not.toHaveBeenCalled();
     vi.useRealTimers();
@@ -613,7 +645,7 @@ describe("Terminal (xterm read-only)", () => {
   it("clamps extreme fit grids and retries resize after send failure", async () => {
     vi.useFakeTimers();
     sendResize.mockImplementation(() => ({ ok: false, error: "disconnected" }));
-    await renderTerminal({ interactive: false, hostWidth: 20, hostHeight: 20 });
+    await renderTerminal({ interactive: true, hostWidth: 20, hostHeight: 20 });
     const term = MockXTerm.instances[0];
     // Force a sub-minimum fitted grid before clamp.
     term.cols = 2;
@@ -713,7 +745,7 @@ describe("Terminal (xterm read-only)", () => {
 
   it("sends debounced resize when fit changes cols/rows and dedupes successes", async () => {
     vi.useFakeTimers();
-    await renderTerminal({ interactive: false, hostWidth: 900, hostHeight: 400 });
+    await renderTerminal({ interactive: true, hostWidth: 900, hostHeight: 400 });
     sendResize.mockClear();
     const host = container.querySelector("[data-terminal-host]");
     // New host size → FitAddon derives a new grid; Terminal should publish it.
@@ -730,8 +762,12 @@ describe("Terminal (xterm read-only)", () => {
     expect(session).toBe("gbt-1");
     expect(cols).toBeGreaterThanOrEqual(20);
     expect(rows).toBeGreaterThanOrEqual(5);
+    // Dedupe commits only when the server acks this exact pending resize id —
+    // never on send success, so a lost ack leaves the size retryable.
+    const ackId = sendResize.mock.results.at(-1).value.id;
+    await emitResizeAck("gbt-1", ackId);
     const calls = sendResize.mock.calls.length;
-    // Same fitted size should not resend after success.
+    // Same fitted size should not resend after the ack.
     await act(async () => {
       for (const observer of TestResizeObserver.instances) observer.trigger();
     });
@@ -741,5 +777,119 @@ describe("Terminal (xterm read-only)", () => {
     });
     expect(sendResize.mock.calls.length).toBe(calls);
     vi.useRealTimers();
+  });
+
+  it("clears resize dedupe on disconnect and re-publishes after reconnect", async () => {
+    vi.useFakeTimers();
+    await renderTerminal({ interactive: true, hostWidth: 900, hostHeight: 400 });
+    sendResize.mockClear();
+    const host = container.querySelector("[data-terminal-host]");
+    sizeElement(host, 720, 340);
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalled();
+    expect(sendResize.mock.calls.length).toBe(1);
+
+    // Disconnect without an ack: dedupe must be cleared so the size stays
+    // retryable; the visible grid is not re-published while offline.
+    await setConnectionState("disconnected");
+    expect(sendResize.mock.calls.length).toBe(1);
+
+    // Reconnect: the Terminal re-fits and re-publishes the visible size.
+    await setConnectionState("connected");
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize.mock.calls.length).toBeGreaterThan(1);
+    vi.useRealTimers();
+  });
+
+  it("does not duplicate an in-flight resize and retries a negative ack", async () => {
+    vi.useFakeTimers();
+    let sequence = 0;
+    sendResize.mockImplementation(() => ({ ok: true, id: `resize-${++sequence}` }));
+    await renderTerminal({ interactive: true, hostWidth: 900, hostHeight: 400 });
+    sendResize.mockClear();
+    const host = container.querySelector("[data-terminal-host]");
+    sizeElement(host, 720, 340);
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalledTimes(1);
+    const firstId = sendResize.mock.results[0].value.id;
+
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalledTimes(1);
+
+    await emitResizeAck("gbt-1", firstId, false);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it("clears resize dedupe when Keyboard mode toggles off and on", async () => {
+    vi.useFakeTimers();
+    let sequence = 0;
+    sendResize.mockImplementation(() => ({ ok: true, id: `mode-${++sequence}` }));
+    await renderTerminal({ interactive: true, hostWidth: 900, hostHeight: 400 });
+    sendResize.mockClear();
+    const host = container.querySelector("[data-terminal-host]");
+    sizeElement(host, 720, 340);
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalledTimes(1);
+    await emitResizeAck("gbt-1", sendResize.mock.results[0].value.id, true);
+
+    await setInteractive(false);
+    await setInteractive(true);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it("sends an oversized paste as one terminal_input instead of chunking", async () => {
+    await renderTerminal({ interactive: true });
+    const term = MockXTerm.instances[0];
+    const big = "y".repeat(80 * 1024);
+    term.emitData(big);
+    // Whole paste in a single terminal_input: the 64 KiB guard lives in the
+    // hook (rejects before any byte is sent), never here via partial chunks.
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    const [session, dataBase64] = sendInput.mock.calls[0];
+    expect(session).toBe("gbt-1");
+    expect(dataBase64).toBe(encodeUtf8ToBase64(big));
+  });
+
+  it("shows the indeterminate indicator when input delivery cannot be confirmed", async () => {
+    ioState.unconfirmedInputs = 2;
+    await renderTerminal({ interactive: true });
+    const indicator = container.querySelector("[data-terminal-indeterminate]");
+    expect(indicator).not.toBeNull();
+    expect(indicator.textContent).toContain("could not be confirmed");
   });
 });

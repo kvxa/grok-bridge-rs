@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{SyncSender, TrySendError, sync_channel},
     },
     thread,
@@ -30,6 +30,10 @@ const SCROLLBACK_ROWS: usize = 5_000;
 const MAX_TRANSCRIPT_BYTES: usize = 512 * 1024;
 const MAX_READ_BYTES: usize = 64 * 1024;
 const WRITER_QUEUE_CAPACITY: usize = 64;
+/// Total pending writer bytes budget (≈ four maximum-size writes). Admission is
+/// bounded by both entry count and bytes so a full queue always rejects the
+/// whole input instead of accepting a partial write.
+const WRITER_QUEUE_MAX_BYTES: usize = 4 * MAX_WRITE_BYTES;
 const QUIET_IDLE_MILLISECONDS: u64 = 3_000;
 const PROCESS_TERMINATE_TIMEOUT_MS: u32 = 5_000;
 const PROVIDER_SESSION_UUID_BYTES: usize = 16;
@@ -758,6 +762,8 @@ struct Session {
     changed: Condvar,
     host_revision: Arc<HostRevision>,
     writer_tx: Mutex<Option<SyncSender<Vec<u8>>>>,
+    /// Raw bytes currently queued to the writer channel (admission budget).
+    pending_writer_bytes: AtomicUsize,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
     shutdown: AtomicBool,
@@ -961,6 +967,7 @@ impl Session {
             changed: Condvar::new(),
             host_revision,
             writer_tx: Mutex::new(Some(writer_tx)),
+            pending_writer_bytes: AtomicUsize::new(0),
             master: Mutex::new(Some(pair.master)),
             killer: Mutex::new(Some(killer)),
             shutdown: AtomicBool::new(false),
@@ -1261,6 +1268,25 @@ impl Session {
         let Some(writer) = writer_guard.as_ref() else {
             bail!("session input channel is closed");
         };
+        // Byte budget is checked before any byte is queued; queue-full rejection
+        // is always whole-input (never a partial write).
+        let data_len = data.len();
+        if self
+            .pending_writer_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(data_len)
+            > WRITER_QUEUE_MAX_BYTES
+        {
+            bail!("session input queue is full");
+        }
+        // Count the bytes BEFORE the item becomes visible to the writer thread.
+        // The writer only ever subtracts for items it received, and an item only
+        // becomes receivable after a successful try_send that follows this
+        // increment, so the counter can never underflow and the writer can never
+        // subtract before the matching add. On Full/Disconnected the increment
+        // is rolled back under the same lock.
+        self.pending_writer_bytes
+            .fetch_add(data_len, Ordering::Release);
         match writer.try_send(data) {
             Ok(()) => {
                 let now = now_millis();
@@ -1277,8 +1303,16 @@ impl Session {
                 self.signal_changed();
                 Ok(())
             }
-            Err(TrySendError::Full(_)) => bail!("session input queue is full"),
-            Err(TrySendError::Disconnected(_)) => bail!("session input channel is closed"),
+            Err(TrySendError::Full(_)) => {
+                self.pending_writer_bytes
+                    .fetch_sub(data_len, Ordering::Acquire);
+                bail!("session input queue is full");
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.pending_writer_bytes
+                    .fetch_sub(data_len, Ordering::Acquire);
+                bail!("session input channel is closed");
+            }
         }
     }
 
@@ -2133,10 +2167,21 @@ fn spawn_writer(
 ) {
     thread::spawn(move || {
         while let Ok(data) = writer_rx.recv() {
+            let data_len = data.len();
             if let Err(error) = writer.write_all(&data).and_then(|()| writer.flush()) {
+                // The item left the queue, so release its budget too. Any items
+                // still queued when the channel later closes are dropped without
+                // release, but the session is terminating at that point and no
+                // further admission happens.
+                session
+                    .pending_writer_bytes
+                    .fetch_sub(data_len, Ordering::Acquire);
                 session.mark_writer_error(format!("failed to write Grok input: {error}"));
                 return;
             }
+            session
+                .pending_writer_bytes
+                .fetch_sub(data_len, Ordering::Acquire);
         }
     });
 }
@@ -2571,6 +2616,7 @@ mod tests {
             changed: Condvar::new(),
             host_revision,
             writer_tx: Mutex::new(Some(writer_tx)),
+            pending_writer_bytes: AtomicUsize::new(0),
             master: Mutex::new(None),
             killer: Mutex::new(None),
             shutdown: AtomicBool::new(false),
@@ -2985,6 +3031,75 @@ mod tests {
         session.write_raw(b"resume\r".to_vec()).unwrap();
         assert_eq!(writer_rx.recv().unwrap(), b"resume\r");
         assert_eq!(session.state().unwrap().phase, SessionPhase::Running);
+    }
+
+    #[test]
+    fn writer_admission_rejects_whole_input_once_byte_budget_is_full() {
+        let session = test_session(SessionPhase::Idle);
+        let (writer_tx, writer_rx) = sync_channel(64);
+        *session.writer_tx.lock().unwrap() = Some(writer_tx);
+
+        let payload = vec![0x61; crate::protocol::MAX_WRITE_BYTES];
+        for _ in 0..4 {
+            session.write_raw(payload.clone()).unwrap();
+        }
+        assert_eq!(
+            session.pending_writer_bytes.load(Ordering::Acquire),
+            4 * crate::protocol::MAX_WRITE_BYTES
+        );
+
+        // A fifth maximum-size write would exceed the byte budget: the whole
+        // input is rejected and no bytes enter the queue.
+        let error = session.write_raw(payload.clone()).unwrap_err();
+        assert!(format!("{error:#}").contains("queue is full"));
+        assert_eq!(
+            session.pending_writer_bytes.load(Ordering::Acquire),
+            4 * crate::protocol::MAX_WRITE_BYTES
+        );
+        // Exactly the four accepted writes are queued; nothing partial.
+        let queued: Vec<Vec<u8>> = drain_writer(&writer_rx);
+        assert_eq!(queued.len(), 4);
+        assert!(queued.iter().all(|write| write == &payload));
+        // Entry-count admission is still enforced for small payloads.
+        let (tiny_tx, tiny_rx) = sync_channel(1);
+        *session.writer_tx.lock().unwrap() = Some(tiny_tx);
+        session.pending_writer_bytes.store(0, Ordering::Release);
+        assert!(session.write_raw(b"a".to_vec()).is_ok());
+        assert!(
+            format!("{:#}", session.write_raw(b"b".to_vec()).unwrap_err())
+                .contains("queue is full")
+        );
+        drop(tiny_rx);
+    }
+
+    #[test]
+    fn writer_byte_budget_is_released_after_bytes_are_written() {
+        let session = Arc::new(test_session(SessionPhase::Idle));
+        let (writer_tx, writer_rx) = sync_channel(8);
+        *session.writer_tx.lock().unwrap() = Some(writer_tx);
+
+        spawn_writer(Arc::clone(&session), Box::new(std::io::sink()), writer_rx);
+        session.write_raw(vec![0x62; 4096]).unwrap();
+        session.write_raw(vec![0x63; 8192]).unwrap();
+        // The writer thread drains concurrently; the budget must never exceed
+        // the sum and must settle back to zero once everything is written.
+        let initial = session.pending_writer_bytes.load(Ordering::Acquire);
+        assert!(initial <= 4096 + 8192);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while session.pending_writer_bytes.load(Ordering::Acquire) != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer never drained");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Channel closed: the writer loop exits; budget stays released.
+        session.close_writer();
+    }
+
+    fn drain_writer(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(data) = rx.try_recv() {
+            out.push(data);
+        }
+        out
     }
 
     #[test]

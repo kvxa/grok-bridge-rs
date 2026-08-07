@@ -164,6 +164,9 @@ export default {
   "interactive.error": "Ошибка ввода в терминал: {detail}",
   "interactive.unavailable": "Ввод в терминал недоступен",
   "interactive.unavailableShort": "ввод офлайн",
+  "interactive.tooLarge": "Объём ввода превышает лимит 64 KiB; ввод отклонён целиком, ничего не отправлено.",
+  "interactive.queueFull": "Очередь команд заполнена; ввод отклонён целиком.",
+  "interactive.indeterminate": "Не удалось подтвердить доставку ввода; повторная отправка не выполнялась.",
 
   "action.confirmCloseSession": "Закрыть {id} и его процесс Grok?",
   "action.closedSession":

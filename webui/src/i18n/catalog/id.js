@@ -159,6 +159,9 @@ export default {
   "interactive.error": "Input terminal gagal: {detail}",
   "interactive.unavailable": "Input terminal tidak tersedia",
   "interactive.unavailableShort": "input luring",
+  "interactive.tooLarge": "Input melebihi batas 64 KiB; seluruh input ditolak dan tidak ada yang dikirim.",
+  "interactive.queueFull": "Antrean perintah penuh; seluruh input ditolak.",
+  "interactive.indeterminate": "Pengiriman input tidak dapat dikonfirmasi; input tidak dikirim ulang.",
 
   "action.confirmCloseSession": "Tutup {id} dan proses Grok-nya?",
   "action.closedSession":

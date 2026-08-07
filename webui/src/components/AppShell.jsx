@@ -43,6 +43,8 @@ export function AppShell() {
     setLoading,
     sendTerminalInput,
     sendTerminalResize,
+    subscribeResizeAck,
+    unconfirmedInputs,
   } = useSessionStream({ setNotice });
   const { version, visibleUpdate, dismissUpdate } = useVersionPolling();
   const {
@@ -90,6 +92,8 @@ export function AppShell() {
       interactive,
       setInteractive,
       connectionState,
+      unconfirmedInputs,
+      subscribeResizeAck,
       sendTerminalInput,
       sendTerminalResize,
     }),
@@ -97,6 +101,8 @@ export function AppShell() {
       interactive,
       setInteractive,
       connectionState,
+      unconfirmedInputs,
+      subscribeResizeAck,
       sendTerminalInput,
       sendTerminalResize,
     ],
@@ -151,6 +157,16 @@ export function AppShell() {
                   data-interactive-warning="true"
                 >
                   {t("interactive.warning")}
+                </div>
+              ) : null}
+
+              {unconfirmedInputs > 0 ? (
+                <div
+                  className="alert alert-danger"
+                  role="status"
+                  data-input-indeterminate="true"
+                >
+                  {t("interactive.indeterminate")}
                 </div>
               ) : null}
 

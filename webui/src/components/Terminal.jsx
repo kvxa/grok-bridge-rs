@@ -4,8 +4,8 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { useTerminalIO } from "../context/TerminalIOContext.jsx";
 import { useI18n } from "../i18n/index.js";
 import {
-  chunkUtf8ToBase64,
   decodeBase64ToUint8Array,
+  encodeUtf8ToBase64,
 } from "../utils/base64.js";
 import { subscribeTerminal } from "../utils/terminalFeeds.js";
 import { clampTerminalGrid } from "../utils/terminalGrid.js";
@@ -138,7 +138,8 @@ export function fitTerminalHost(fitAddon, host) {
 
 /**
  * xterm.js terminal driven by the WebSocket feed.
- * terminal_resize follows visible fit always (viewport sync).
+ * terminal_resize follows the visible fit ONLY while keyboard is on; read-only
+ * terminals fit locally without ever touching the real PTY.
  * terminal_input is gated strictly by the global interactive switch.
  */
 export function Terminal({ id, heightKey, rows, cols, label }) {
@@ -148,6 +149,8 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
     sendTerminalInput,
     sendTerminalResize,
     connectionState,
+    unconfirmedInputs,
+    subscribeResizeAck,
   } = useTerminalIO();
 
   const hostRef = useRef(null);
@@ -161,6 +164,8 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
   const sendResizeRef = useRef(sendTerminalResize);
   const onDataDisposableRef = useRef(null);
   const lastSentSizeRef = useRef({ cols: 0, rows: 0 });
+  /** In-flight resize awaiting its single result: dedupe commits only on ack. */
+  const pendingResizeRef = useRef(null);
   const resizeTimerRef = useRef(0);
   // Height is scoped to the Codex supervisor group, not the Grok session.
   const groupHeightKey = heightKey;
@@ -175,6 +180,8 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
 
   const maybeSendResize = useCallback((term) => {
     if (!term) return;
+    // Keyboard off: pure read-only display. Fit locally, never resize the PTY.
+    if (!interactiveRef.current) return;
     if (!canFitElement(hostRef.current)) return;
     const { cols: nextCols, rows: nextRows } = clampTerminalGrid(
       term.cols,
@@ -182,10 +189,18 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
     );
     const last = lastSentSizeRef.current;
     if (last.cols === nextCols && last.rows === nextRows) return;
+    const pending = pendingResizeRef.current;
+    if (pending?.cols === nextCols && pending?.rows === nextRows) return;
     const result = sendResizeRef.current(id, nextCols, nextRows);
-    // Only commit dedupe state after a successful send so failures stay retryable.
-    if (result?.ok) {
-      lastSentSizeRef.current = { cols: nextCols, rows: nextRows };
+    // Dedupe commits only when the server acks this exact id
+    // (subscribeResizeAck), never on send success, so a lost ack keeps the
+    // size retryable after failure or reconnect.
+    if (result?.ok && typeof result.id === "string") {
+      pendingResizeRef.current = {
+        id: result.id,
+        cols: nextCols,
+        rows: nextRows,
+      };
     }
   }, [id]);
 
@@ -333,11 +348,11 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
     const disposable = term.onData((data) => {
       // Never buffer: if mode flipped off mid-event, drop immediately.
       if (!interactiveRef.current) return;
-      const chunks = chunkUtf8ToBase64(data);
-      for (const dataBase64 of chunks) {
-        if (!interactiveRef.current) return;
-        sendInputRef.current(id, dataBase64);
-      }
+      // One terminal_input per event/paste (no chunking): an oversized input
+      // is rejected whole by sendTerminalInput before any byte is sent.
+      const dataBase64 = encodeUtf8ToBase64(data);
+      if (!dataBase64) return;
+      sendInputRef.current(id, dataBase64);
     });
     onDataDisposableRef.current = disposable;
 
@@ -352,6 +367,50 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
       }
     };
   }, [id, interactive]);
+
+  // Commit resize dedupe only when the server acks this terminal's exact
+  // pending resize id; a lost ack (disconnect) leaves it retryable.
+  useEffect(() => {
+    const unsubscribe = subscribeResizeAck((ackSession, ackId, ok) => {
+      const pending = pendingResizeRef.current;
+      if (!pending) return;
+      if (ackSession !== id || ackId !== pending.id) return;
+      if (ok) {
+        lastSentSizeRef.current = { cols: pending.cols, rows: pending.rows };
+      }
+      pendingResizeRef.current = null;
+      if (!ok) scheduleFit();
+    });
+    return unsubscribe;
+  }, [id, scheduleFit, subscribeResizeAck]);
+
+  // Any Keyboard mode transition invalidates the previous PTY-size claim.
+  // Turning the mode back on schedules a fresh idempotent resize; turning it
+  // off remains observational and never sends a resize.
+  const previousInteractiveRef = useRef(interactive);
+  useEffect(() => {
+    const previous = previousInteractiveRef.current;
+    previousInteractiveRef.current = interactive;
+    if (previous === interactive) return;
+    lastSentSizeRef.current = { cols: 0, rows: 0 };
+    pendingResizeRef.current = null;
+    if (interactive) scheduleFit();
+  }, [interactive, scheduleFit]);
+
+  // Resize is idempotent: after failure or disconnect the dedupe is cleared so
+  // the visible size is re-published after reconnect. Input is never replayed.
+  const previousConnectionRef = useRef(connectionState);
+  useEffect(() => {
+    const previous = previousConnectionRef.current;
+    previousConnectionRef.current = connectionState;
+    if (previous === "connected" && connectionState !== "connected") {
+      lastSentSizeRef.current = { cols: 0, rows: 0 };
+      pendingResizeRef.current = null;
+    }
+    if (connectionState === "connected" && previous !== "connected") {
+      scheduleFit();
+    }
+  }, [connectionState, scheduleFit]);
 
   useEffect(() => {
     scheduleFit();
@@ -475,6 +534,14 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
             ? ` · ${t("interactive.unavailableShort")}`
             : ""}
         </span>
+        {unconfirmedInputs > 0 ? (
+          <span
+            className="terminal-indeterminate text-warning"
+            data-terminal-indeterminate="true"
+          >
+            {t("interactive.indeterminate")}
+          </span>
+        ) : null}
       </div>
       <div
         ref={hostRef}
