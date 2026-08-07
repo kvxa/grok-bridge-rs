@@ -107,7 +107,12 @@ function mockFetch(handlers = {}) {
         return new Response("", { status: 200 });
       }
       return jsonResponse(
-        handlers.closeResult ?? { matched: 1, closed: 1, failures: [] },
+        handlers.closeResult ?? {
+          matched: 1,
+          closed: 1,
+          timed_out: [],
+          failures: [],
+        },
       );
     }
     if (path.includes("/api/sessions")) {

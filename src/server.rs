@@ -25,7 +25,7 @@ use crate::{
         validate_client_session_id, validate_owner, validate_session_handle,
         validate_terminal_size,
     },
-    session::{OrphanPolicy, SessionHost},
+    session::{CloseError, OrphanPolicy, SessionHost},
     transport::{call_anonymous, read_frame, runtime_name, write_response},
     version_check::{CHECK_INTERVAL, VersionChecker},
 };
@@ -430,8 +430,9 @@ fn handle_web_connection(mut stream: TcpStream, state: Arc<RuntimeState>) {
             }
             match state.host.close_client(&client_session_id) {
                 Ok(result) => {
-                    let body = serde_json::to_string(&result)
-                        .unwrap_or_else(|_| r#"{"matched":0,"closed":0,"failures":[]}"#.to_owned());
+                    let body = serde_json::to_string(&result).unwrap_or_else(|_| {
+                        r#"{"matched":0,"closed":0,"timed_out":[],"failures":[]}"#.to_owned()
+                    });
                     let _ = write_http(&mut stream, "200 OK", "application/json", &body);
                 }
                 Err(error) => {
@@ -489,6 +490,7 @@ fn handle_web_connection(mut stream: TcpStream, state: Arc<RuntimeState>) {
                     let body = serde_json::json!({
                         "matched": result.matched,
                         "closed": result.closed,
+                        "timed_out": result.timed_out,
                         "failures": result.failures,
                     })
                     .to_string();
@@ -531,9 +533,9 @@ fn handle_web_connection(mut stream: TcpStream, state: Arc<RuntimeState>) {
                 Err(error) => {
                     let _ = write_http(
                         &mut stream,
-                        "404 Not Found",
+                        close_error_http_status(&error),
                         "text/plain; charset=utf-8",
-                        &format!("{error:#}"),
+                        &error.to_string(),
                     );
                 }
             }
@@ -546,6 +548,14 @@ fn handle_web_connection(mut stream: TcpStream, state: Arc<RuntimeState>) {
                 "not found",
             );
         }
+    }
+}
+
+fn close_error_http_status(error: &CloseError) -> &'static str {
+    match error {
+        CloseError::NotFound(_) => "404 Not Found",
+        CloseError::Timeout => "504 Gateway Timeout",
+        CloseError::Failed(_) => "500 Internal Server Error",
     }
 }
 
@@ -1408,6 +1418,22 @@ mod tests {
     }
 
     #[test]
+    fn close_api_distinguishes_missing_timeout_and_internal_failures() {
+        let response = serve_web_request(
+            b"POST /api/sessions/missing/close HTTP/1.1\r\nHost: localhost\r\nX-Grok-Bridge-WebUI: 1\r\n\r\n",
+        );
+        assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
+        assert_eq!(
+            close_error_http_status(&CloseError::Timeout),
+            "504 Gateway Timeout"
+        );
+        assert_eq!(
+            close_error_http_status(&CloseError::Failed("termination failed".into())),
+            "500 Internal Server Error"
+        );
+    }
+
+    #[test]
     fn web_origin_requires_matching_loopback_host() {
         assert!(web_origin_allowed(
             Some("http://127.0.0.1:47653"),
@@ -1713,7 +1739,7 @@ mod tests {
         assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(body).unwrap(),
-            serde_json::json!({ "matched": 0, "closed": 0, "failures": [] })
+            serde_json::json!({ "matched": 0, "closed": 0, "timed_out": [], "failures": [] })
         );
     }
 
