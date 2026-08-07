@@ -27,6 +27,8 @@ export function SupervisorGroup({
   onCloseGroup,
   onCloseSession,
   busy,
+  onFocus = () => {},
+  onBlur = () => {},
 }) {
   const { t, locale, formatNumber } = useI18n();
   const displayOwner = owner ?? t("group.unowned");
@@ -94,9 +96,21 @@ export function SupervisorGroup({
       className="card supervisor-card group"
       data-owner-key={groupKey}
       open={!collapsed}
-      onToggle={(event) => onToggle(event.currentTarget.open)}
+      onFocusCapture={(event) => {
+        // Report only boundary crossings: focus arriving from outside.
+        if (event.currentTarget.contains(event.relatedTarget)) return;
+        onFocus();
+      }}
+      onBlurCapture={(event) => {
+        // Moving focus between controls inside the group is not a blur.
+        if (event.currentTarget.contains(event.relatedTarget)) return;
+        onBlur();
+      }}
     >
-      <summary className="card-header supervisor-summary">
+      <summary
+        className="card-header supervisor-summary"
+        onClick={() => onToggle(collapsed)}
+      >
         <ChevronRight
           aria-hidden="true"
           className="supervisor-chevron"

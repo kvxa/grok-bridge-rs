@@ -1,17 +1,12 @@
 import { useCallback, useState } from "react";
 
+/**
+ * Manual collapse state for individual child sessions only.
+ * Group folding is owned by the attention-queue reducer so automatic folds,
+ * manual group intent, and focus deferral live in one place.
+ */
 export function useCollapseState() {
-  const [collapsedOwners, setCollapsedOwners] = useState(() => new Set());
   const [collapsedSessions, setCollapsedSessions] = useState(() => new Set());
-
-  const toggleOwner = useCallback((key, open) => {
-    setCollapsedOwners((current) => {
-      const next = new Set(current);
-      if (open) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  }, []);
 
   const toggleSession = useCallback((sessionId, open) => {
     setCollapsedSessions((current) => {
@@ -22,20 +17,16 @@ export function useCollapseState() {
     });
   }, []);
 
-  const setAllExpanded = useCallback((open, groups, sessions) => {
-    setCollapsedOwners(
-      open ? new Set() : new Set(groups.map(([groupKey]) => groupKey)),
-    );
+  /** Explicit global expand/collapse of every child session. */
+  const setAllSessionsExpanded = useCallback((open, sessions) => {
     setCollapsedSessions(
       open ? new Set() : new Set(sessions.map((session) => session.session)),
     );
   }, []);
 
   return {
-    collapsedOwners,
     collapsedSessions,
-    toggleOwner,
     toggleSession,
-    setAllExpanded,
+    setAllSessionsExpanded,
   };
 }

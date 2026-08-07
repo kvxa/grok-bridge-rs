@@ -1,5 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useReducer, useState } from "react";
 import { TerminalIOContext } from "../context/TerminalIOContext.jsx";
+import {
+  attentionQueueReducer,
+  createInitialAttentionQueueState,
+  orderGroups,
+} from "../attentionQueue.js";
 import { useCollapseState } from "../hooks/useCollapseState.js";
 import { useInteractiveMode } from "../hooks/useInteractiveMode.js";
 import { useSessionActions } from "../hooks/useSessionActions.js";
@@ -41,12 +46,15 @@ export function AppShell() {
   } = useSessionStream({ setNotice });
   const { version, visibleUpdate, dismissUpdate } = useVersionPolling();
   const {
-    collapsedOwners,
     collapsedSessions,
-    toggleOwner,
     toggleSession,
-    setAllExpanded,
+    setAllSessionsExpanded,
   } = useCollapseState();
+  const [queueState, dispatchQueue] = useReducer(
+    attentionQueueReducer,
+    undefined,
+    createInitialAttentionQueueState,
+  );
   const { closeSession, closeGroup } = useSessionActions({
     loadingRef,
     setLoading,
@@ -56,6 +64,17 @@ export function AppShell() {
   const groups = useMemo(
     () => groupSessions(sessions, locale),
     [sessions, locale],
+  );
+
+  // Reconcile classification, semantic recency, and auto-fold transitions
+  // with the latest session snapshot.
+  useEffect(() => {
+    dispatchQueue({ type: "GROUP_SYNC", groups });
+  }, [groups]);
+
+  const orderedGroups = useMemo(
+    () => orderGroups(groups, queueState),
+    [groups, queueState],
   );
   const stats = useMemo(() => sessionStats(sessions), [sessions]);
   const showEmpty =
@@ -97,8 +116,20 @@ export function AppShell() {
           interactive={interactive}
           onInteractiveChange={setInteractive}
           onReconnect={reconnect}
-          onExpandAll={() => setAllExpanded(true, groups, sessions)}
-          onCollapseAll={() => setAllExpanded(false, groups, sessions)}
+          onExpandAll={() => {
+            dispatchQueue({
+              type: "GROUP_EXPAND_ALL",
+              keys: groups.map(([key]) => key),
+            });
+            setAllSessionsExpanded(true, sessions);
+          }}
+          onCollapseAll={() => {
+            dispatchQueue({
+              type: "GROUP_COLLAPSE_ALL",
+              keys: groups.map(([key]) => key),
+            });
+            setAllSessionsExpanded(false, sessions);
+          }}
         />
 
         <div className="page-wrapper">
@@ -131,8 +162,8 @@ export function AppShell() {
                 className="session-board"
                 aria-label={t("board.aria")}
               >
-                {groups.length ? (
-                  groups.map(([key, ownerSessions]) => {
+                {orderedGroups.length ? (
+                  orderedGroups.map(([key, ownerSessions]) => {
                     const owner = ownerSessions[0]?.owner ?? null;
                     const clientSessionId =
                       ownerSessions[0]?.client_session_id ?? null;
@@ -143,9 +174,17 @@ export function AppShell() {
                         owner={owner}
                         clientSessionId={clientSessionId}
                         sessions={ownerSessions}
-                        collapsed={collapsedOwners.has(key)}
+                        collapsed={queueState.collapsed.has(key)}
                         collapsedSessions={collapsedSessions}
-                        onToggle={(open) => toggleOwner(key, open)}
+                        onToggle={(open) =>
+                          dispatchQueue({ type: "GROUP_TOGGLE", key, open })
+                        }
+                        onFocus={() =>
+                          dispatchQueue({ type: "GROUP_FOCUS", key })
+                        }
+                        onBlur={() =>
+                          dispatchQueue({ type: "GROUP_BLUR", key })
+                        }
                         onToggleSession={toggleSession}
                         onCloseGroup={closeGroup}
                         onCloseSession={closeSession}
