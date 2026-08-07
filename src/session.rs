@@ -922,6 +922,8 @@ struct Session {
     /// Monotonic escalation level already sent to the owned process scope.
     /// Persists across close attempts so a retry continues from observed state
     /// instead of restarting the HUP/TERM/KILL ladder from the beginning.
+    /// This state is Unix-only; Windows targets the Job Object instead.
+    #[cfg(unix)]
     termination: Mutex<TerminationLevel>,
     /// Serializes termination escalation across explicit close, orphan reaping,
     /// and I/O-error cleanup for one session.
@@ -1269,6 +1271,7 @@ impl Session {
             writer_tx: Mutex::new(Some(writer_tx)),
             master: Mutex::new(Some(pair.master)),
             scope_id: launcher_process_id,
+            #[cfg(unix)]
             termination: Mutex::new(TerminationLevel::default()),
             close_lock: Mutex::new(()),
             #[cfg(windows)]
@@ -3837,6 +3840,7 @@ mod tests {
             host_revision,
             writer_tx: Mutex::new(Some(writer_tx)),
             master: Mutex::new(None),
+            #[cfg(unix)]
             termination: Mutex::new(TerminationLevel::default()),
             #[cfg(windows)]
             scope_job: None,
