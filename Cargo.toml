@@ -20,7 +20,9 @@ ureq = { version = "2.12", default-features = true, features = ["json"] }
 vt100 = "0.16.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# SDDL → SecurityDescriptor for explicit user-only named-pipe ACLs.
+widestring = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -30,3 +32,6 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[patch.crates-io]
+portable-pty = { path = "vendor/portable-pty" }

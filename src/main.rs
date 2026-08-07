@@ -70,7 +70,7 @@ mod app {
                 auto_start,
             } => {
                 let response = transport::call(request, auto_start)?;
-                write_json(&response)?;
+                write_cli_json(&response)?;
                 Ok(if response.ok { 0 } else { 1 })
             }
             Action::Terminal(options) => {
@@ -318,8 +318,11 @@ mod app {
         match response.result {
             Some(ResponseResult::ServerInfo(info)) => match info.web_url {
                 Some(url) => {
+                    // Open with bootstrap capability in the URL; never print the
+                    // raw token (same-host multi-user secret for this process).
                     open_browser(&url)?;
-                    eprintln!("grok-bridge WebUI: {url}");
+                    let display = server::redact_web_url_capability(&url);
+                    eprintln!("grok-bridge WebUI opened at {display}");
                     Ok(0)
                 }
                 None => bail!("runtime WebUI is unavailable; check server stderr"),
@@ -518,6 +521,21 @@ mod app {
             .context("failed to finish JSON response")
     }
 
+    fn write_cli_json(response: &ResponseEnvelope) -> Result<()> {
+        let sanitized = sanitize_cli_response(response);
+        write_json(&sanitized)
+    }
+
+    fn sanitize_cli_response(response: &ResponseEnvelope) -> ResponseEnvelope {
+        let mut sanitized = response.clone();
+        if let Some(ResponseResult::ServerInfo(info)) = sanitized.result.as_mut()
+            && let Some(url) = info.web_url.as_deref()
+        {
+            info.web_url = Some(server::redact_web_url_capability(url));
+        }
+        sanitized
+    }
+
     fn doctor() -> Result<i32> {
         let grok = env::var_os("GROK_BIN").unwrap_or_else(session::default_grok_bin);
         let output = Command::new(&grok)
@@ -535,7 +553,7 @@ mod app {
             bail!("Grok version check failed with {}", output.status);
         }
         match transport::call(Request::ServerStatus, false) {
-            Ok(response) => write_json(&response)?,
+            Ok(response) => write_cli_json(&response)?,
             Err(_) => println!("runtime_server=stopped"),
         }
         Ok(0)
@@ -687,6 +705,37 @@ mod app {
                     ..
                 }) if prompt == "修复中文"
             ));
+        }
+
+        #[test]
+        fn cli_server_info_redacts_webui_capability() {
+            let capability = "0123456789abcdef0123456789abcdef";
+            let response = ResponseEnvelope::success(
+                "server-status",
+                ResponseResult::ServerInfo(crate::protocol::ServerInfo {
+                    version: "0.8.4".to_owned(),
+                    process_id: 42,
+                    started_at_ms: 1,
+                    active_sessions: 0,
+                    web_url: Some(format!("http://127.0.0.1:47653/?c={capability}")),
+                    stopping: false,
+                }),
+            );
+            let sanitized = sanitize_cli_response(&response);
+            let ResponseResult::ServerInfo(info) = sanitized.result.unwrap() else {
+                panic!("expected server info");
+            };
+            assert_eq!(
+                info.web_url.as_deref(),
+                Some("http://127.0.0.1:47653/?c=***")
+            );
+            let ResponseResult::ServerInfo(original) = response.result.unwrap() else {
+                panic!("expected server info");
+            };
+            assert_eq!(
+                original.web_url.as_deref(),
+                Some("http://127.0.0.1:47653/?c=0123456789abcdef0123456789abcdef")
+            );
         }
     }
 }

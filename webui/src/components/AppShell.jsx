@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { TerminalIOContext } from "../context/TerminalIOContext.jsx";
 import { useCollapseState } from "../hooks/useCollapseState.js";
 import { useInteractiveMode } from "../hooks/useInteractiveMode.js";
@@ -38,25 +38,84 @@ export function AppShell() {
     setLoading,
     sendTerminalInput,
     sendTerminalResize,
-  } = useSessionStream({ setNotice });
+    setTerminalSubscriptions,
+    requestTerminalResync,
+    controlEpochs,
+  } = useSessionStream({ setNotice, interactive });
   const { version, visibleUpdate, dismissUpdate } = useVersionPolling();
+  const groups = useMemo(
+    () => groupSessions(sessions, locale),
+    [sessions, locale],
+  );
+  const [focusedGroupKey, setFocusedGroupKey] = useState(null);
+  /** Visible selected terminals that should receive PTY subscriptions. */
+  const [visibleTerminalIds, setVisibleTerminalIds] = useState(() => new Set());
+
+  useEffect(() => {
+    const groupKeyForTarget = (target) => {
+      if (!target || typeof target.closest !== "function") return null;
+      return target.closest("details.group")?.dataset.ownerKey ?? null;
+    };
+    const reconcileFocus = (target) => {
+      setFocusedGroupKey((current) => {
+        const next = groupKeyForTarget(target);
+        return current === next ? current : next;
+      });
+    };
+    const onFocusIn = (event) => {
+      reconcileFocus(event.target);
+    };
+    // When focus leaves a group (or the focused node is unmounted), clear/update
+    // protection so automatic collapse is not stuck forever.
+    const onFocusOut = (event) => {
+      const nextTarget = event.relatedTarget;
+      if (nextTarget && typeof nextTarget.closest === "function") {
+        reconcileFocus(nextTarget);
+        return;
+      }
+      // Focus left the document or landed on a non-Element: use activeElement.
+      queueMicrotask(() => {
+        reconcileFocus(document.activeElement);
+      });
+    };
+
+    document.addEventListener("focusin", onFocusIn);
+    document.addEventListener("focusout", onFocusOut);
+    reconcileFocus(document.activeElement);
+    return () => {
+      document.removeEventListener("focusin", onFocusIn);
+      document.removeEventListener("focusout", onFocusOut);
+    };
+  }, []);
+
+  // If the focused group disappears (session closed / list shrinks), drop protection.
+  useEffect(() => {
+    setFocusedGroupKey((current) => {
+      if (current == null) return current;
+      if (!groups.some(([key]) => key === current)) return null;
+      const active = document.activeElement;
+      if (!active || typeof active.closest !== "function") {
+        return null;
+      }
+      const activeKey = active.closest("details.group")?.dataset.ownerKey ?? null;
+      if (activeKey !== current) return activeKey;
+      return current;
+    });
+  }, [groups, sessions]);
+
   const {
     collapsedOwners,
     collapsedSessions,
     toggleOwner,
     toggleSession,
     setAllExpanded,
-  } = useCollapseState();
+  } = useCollapseState(groups, sessions, locale, focusedGroupKey);
   const { closeSession, closeGroup } = useSessionActions({
     loadingRef,
     setLoading,
     setNotice,
   });
 
-  const groups = useMemo(
-    () => groupSessions(sessions, locale),
-    [sessions, locale],
-  );
   const stats = useMemo(() => sessionStats(sessions), [sessions]);
   const showEmpty =
     sessions.length === 0 &&
@@ -66,6 +125,26 @@ export function AppShell() {
     sessions.length === 0 &&
     (connectionState === "initial" || connectionState === "retrying");
 
+  useEffect(() => {
+    const next = [...visibleTerminalIds].sort();
+    setTerminalSubscriptions(next);
+  }, [visibleTerminalIds, setTerminalSubscriptions]);
+
+  // Stable identity is required: SubagentCard effects depend on this callback.
+  // A new function each render toggles visible→false→true forever and spins the tab.
+  const reportVisibleTerminal = useCallback((sessionId, visible) => {
+    if (typeof sessionId !== "string" || !sessionId) return;
+    setVisibleTerminalIds((current) => {
+      const has = current.has(sessionId);
+      if (visible && has) return current;
+      if (!visible && !has) return current;
+      const next = new Set(current);
+      if (visible) next.add(sessionId);
+      else next.delete(sessionId);
+      return next;
+    });
+  }, []);
+
   const terminalIO = useMemo(
     () => ({
       interactive,
@@ -73,6 +152,9 @@ export function AppShell() {
       connectionState,
       sendTerminalInput,
       sendTerminalResize,
+      setTerminalSubscriptions,
+      requestTerminalResync,
+      controlEpochs,
     }),
     [
       interactive,
@@ -80,6 +162,9 @@ export function AppShell() {
       connectionState,
       sendTerminalInput,
       sendTerminalResize,
+      setTerminalSubscriptions,
+      requestTerminalResync,
+      controlEpochs,
     ],
   );
 
@@ -149,6 +234,7 @@ export function AppShell() {
                         onToggleSession={toggleSession}
                         onCloseGroup={closeGroup}
                         onCloseSession={closeSession}
+                        onVisibleTerminal={reportVisibleTerminal}
                         busy={loading}
                       />
                     );

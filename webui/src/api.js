@@ -1,11 +1,51 @@
-const WEB_UI_HEADER = { "X-Grok-Bridge-WebUI": "1" };
+import { getWebUiClientIdentity } from "./utils/clientIdentity.js";
+import { getWebUiCapability } from "./utils/webUiCapability.js";
+
+/** Client marker only — not a secret. Capability is sent separately. */
+const WEB_UI_MARKER = "1";
+
+function webUiHeaders(extra = {}) {
+  const headers = {
+    "X-Grok-Bridge-WebUI": WEB_UI_MARKER,
+    ...extra,
+  };
+  const capability = getWebUiCapability();
+  if (capability) {
+    headers["X-Grok-Bridge-Capability"] = capability;
+  }
+  return headers;
+}
+/** Single-session close and ordinary REST calls. */
 const DEFAULT_TIMEOUT_MS = 8000;
+/**
+ * Mirrors server `CLOSE_BATCH_DEADLINE_MS` (src/session.rs): absolute wall
+ * budget for one entire `close_owner` / `close_client` call (all rounds + final
+ * scan share one Instant — not per-round 7.5s stacking). Frontend abort must
+ * not fire before that server budget can finish.
+ */
+export const CLOSE_BATCH_DEADLINE_MS = 7_500;
+/**
+ * Response/scheduling overhead on top of the server absolute close budget.
+ * `CLOSE_GROUP_TIMEOUT_MS` must stay above one server budget (never 2× batch)
+ * so a late final-scan cannot outlive the client abort.
+ */
+export const CLOSE_GROUP_RESPONSE_OVERHEAD_MS = 4_500;
+export const CLOSE_GROUP_TIMEOUT_MS =
+  CLOSE_BATCH_DEADLINE_MS + CLOSE_GROUP_RESPONSE_OVERHEAD_MS;
 
 async function responseError(response) {
   try {
     const message = await response.text();
-    return message || `${response.status} ${response.statusText}`;
+    const body = (message || "").trim();
+    if (response.status === 403) {
+      // Stable code for i18n recovery copy (Runtime restart / lost cookie).
+      return body === "forbidden" || !body
+        ? "capability_forbidden"
+        : body;
+    }
+    return body || `${response.status} ${response.statusText}`;
   } catch {
+    if (response.status === 403) return "capability_forbidden";
     return `${response.status} ${response.statusText || "request failed"}`;
   }
 }
@@ -45,6 +85,8 @@ export async function getSessions({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   try {
     const response = await fetch("/api/sessions", {
       cache: "no-store",
+      credentials: "same-origin",
+      headers: webUiHeaders(),
       signal: timeout.signal,
     });
     if (!response.ok) throw new Error(await responseError(response));
@@ -54,10 +96,23 @@ export async function getSessions({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   }
 }
 
-/** Same-origin WebSocket URL for the fixed /api/events stream. */
-export function eventsWebSocketUrl(location = window.location) {
+/**
+ * Same-origin WebSocket URL for /api/events.
+ * Prefer HttpOnly bootstrap cookie (sent automatically on same-origin WS).
+ * Optional `c=` when JS still holds an in-memory bootstrap value (dev / tests).
+ */
+export function eventsWebSocketUrl(
+  location = window.location,
+  clientIdentity = getWebUiClientIdentity(),
+  capability = getWebUiCapability(),
+) {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${location.host}/api/events`;
+  const params = new URLSearchParams();
+  // Cookie carries auth after server bootstrap; query is optional fallback only.
+  if (capability) params.set("c", capability);
+  if (clientIdentity) params.set("client", clientIdentity);
+  const query = params.toString();
+  return `${protocol}//${location.host}/api/events${query ? `?${query}` : ""}`;
 }
 
 export function normalizeTerminalEntries(data) {
@@ -77,10 +132,13 @@ export function normalizeTerminalEntries(data) {
     .map((item) => ({
       session: item.session,
       reset: Boolean(item.reset),
+      // Multi-frame ANSI snapshot continuation (not a PTY delta).
+      reset_cont: Boolean(item.reset_cont),
       cursor: typeof item.cursor === "number" ? item.cursor : 0,
       next_cursor:
         typeof item.next_cursor === "number" ? item.next_cursor : 0,
       data_base64: item.data_base64,
+      gap: Boolean(item.gap),
     }));
 }
 
@@ -99,6 +157,38 @@ export function normalizeEventsMessage(data) {
     type: "sessions",
     sessions: normalizeSessions(data.sessions),
     terminals: normalizeTerminalEntries(data.terminals),
+  };
+}
+
+const WEB_COMMAND_RESULT_TYPES = new Set([
+  "terminal_subscribe_result",
+  "terminal_claim_result",
+  "terminal_release_result",
+  "terminal_resync_result",
+  "input_result",
+  "resize_result",
+  "client_heartbeat_result",
+]);
+
+/** Normalize a WebSocket command acknowledgement without exposing raw frames. */
+export function normalizeCommandResult(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("command result is not an object");
+  }
+  if (!WEB_COMMAND_RESULT_TYPES.has(data.type)) {
+    throw new Error(`unsupported command result type: ${String(data.type)}`);
+  }
+  if (typeof data.ok !== "boolean") {
+    throw new Error("command result is missing ok");
+  }
+  return {
+    type: data.type,
+    ok: data.ok,
+    id: typeof data.id === "string" ? data.id : null,
+    session: typeof data.session === "string" ? data.session : null,
+    error_code:
+      typeof data.error_code === "string" ? data.error_code : null,
+    error: typeof data.error === "string" ? data.error : null,
   };
 }
 
@@ -132,6 +222,8 @@ export async function getVersionStatus({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) 
   try {
     const response = await fetch("/api/version", {
       cache: "no-store",
+      credentials: "same-origin",
+      headers: webUiHeaders(),
       signal: timeout.signal,
     });
     if (!response.ok) throw new Error(await responseError(response));
@@ -148,7 +240,8 @@ export async function closeSessionRequest(id, { timeoutMs = DEFAULT_TIMEOUT_MS }
       `/api/sessions/${encodeURIComponent(id)}/close`,
       {
         method: "POST",
-        headers: WEB_UI_HEADER,
+        credentials: "same-origin",
+        headers: webUiHeaders(),
         signal: timeout.signal,
       },
     );
@@ -158,14 +251,18 @@ export async function closeSessionRequest(id, { timeoutMs = DEFAULT_TIMEOUT_MS }
   }
 }
 
-export async function closeOwnerRequest(owner, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export async function closeOwnerRequest(
+  owner,
+  { timeoutMs = CLOSE_GROUP_TIMEOUT_MS } = {},
+) {
   const timeout = withTimeout(timeoutMs);
   try {
     const response = await fetch(
       `/api/owners/${encodeURIComponent(owner)}/close`,
       {
         method: "POST",
-        headers: WEB_UI_HEADER,
+        credentials: "same-origin",
+        headers: webUiHeaders(),
         signal: timeout.signal,
       },
     );
@@ -178,7 +275,7 @@ export async function closeOwnerRequest(owner, { timeoutMs = DEFAULT_TIMEOUT_MS 
 
 export async function closeClientRequest(
   clientSessionId,
-  { timeoutMs = DEFAULT_TIMEOUT_MS } = {},
+  { timeoutMs = CLOSE_GROUP_TIMEOUT_MS } = {},
 ) {
   const timeout = withTimeout(timeoutMs);
   try {
@@ -186,7 +283,8 @@ export async function closeClientRequest(
       `/api/clients/${encodeURIComponent(clientSessionId)}/close`,
       {
         method: "POST",
-        headers: WEB_UI_HEADER,
+        credentials: "same-origin",
+        headers: webUiHeaders(),
         signal: timeout.signal,
       },
     );

@@ -69,6 +69,9 @@ export default {
   "error.timeout": "انتهت مهلة الطلب؛ تتم إعادة المحاولة تلقائيًا",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "تم رفض وصول WebUI (رمز القدرة مفقود أو منتهٍ). أعد تشغيل grok-bridge server ui أو افتح رابط التمهيد الذي طبعه هذا Runtime ثم أعد التحميل. بعد إعادة تشغيل Runtime لا يكفي التحديث وحده.",
+
   "activity.working": "يعمل",
   "activity.waiting": "في الانتظار",
   "activity.done": "مكتمل",
@@ -79,12 +82,14 @@ export default {
   "client.connected": "Codex متصل",
   "client.disconnected": "Codex غير متصل",
   "client.orphaned": "بانتظار التنظيف التلقائي",
+  "client.webControlled": "WebUI ممسكة (Codex غير متصل)",
   "client.closing": "جارٍ التنظيف",
   "client.unknown": "غير معروف",
 
   "lifecycle.unmanaged": "غير مُدار",
   "lifecycle.connected": "المشرف متصل",
   "lifecycle.disconnected": "المشرف غير متصل",
+  "lifecycle.webControlled": "ممسوكة بواسطة WebUI التفاعلية",
   "lifecycle.orphaned": "عدّاد التنظيف",
   "lifecycle.closing": "جارٍ التنظيف",
   "lifecycle.unknown": "غير معروف",
@@ -123,6 +128,10 @@ export default {
   "session.lifecycle.disconnectedTitle": "المشرف غير متصل — الإغلاق لم يبدأ بعد",
   "session.lifecycle.disconnectedBody":
     "مراحل Running أو Waiting لا تُغلق تلقائيًا أبدًا. تبدأ فترة السماح فقط بعد مرحلة Idle آمنة أو مرحلة نهائية.",
+  "session.lifecycle.webControlledTitle":
+    "Codex غير متصل — WebUI التفاعلية تمسك هذه الجلسة",
+  "session.lifecycle.webControlledBody":
+    "تحكم الكتابة ونبضات الحياة تؤجل التنظيف التلقائي مؤقتًا. التحرير أو القراءة فقط أو قطع الاتصال أو خمول 15 ثانية ينهي الإمساك ويعيد مهلة السماح.",
   "session.lifecycle.orphanedTitle": "عدّاد الإغلاق التلقائي",
   "session.lifecycle.orphanedCountdown": "مؤهل للتنظيف خلال {remaining}",
   "session.lifecycle.orphanedCountdownDue":

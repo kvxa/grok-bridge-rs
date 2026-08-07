@@ -69,6 +69,9 @@ export default {
   "error.timeout": "リクエストがタイムアウトしました。自動で再試行します",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "WebUI へのアクセスが拒否されました（capability が欠落または期限切れ）。grok-bridge server ui を再実行するか、この Runtime が出力したブートストラップ URL を開いてから再読み込みしてください。Runtime 再起動後は再読み込みだけでは復旧できません。",
+
   "activity.working": "作業中",
   "activity.waiting": "入力待ち",
   "activity.done": "完了",
@@ -79,12 +82,14 @@ export default {
   "client.connected": "Codex オンライン",
   "client.disconnected": "Codex 切断",
   "client.orphaned": "自動クリーンアップ待ち",
+  "client.webControlled": "WebUI 保持中（Codex オフライン）",
   "client.closing": "クリーンアップ中",
   "client.unknown": "不明",
 
   "lifecycle.unmanaged": "未管理",
   "lifecycle.connected": "スーパーバイザー オンライン",
   "lifecycle.disconnected": "スーパーバイザー オフライン",
+  "lifecycle.webControlled": "対話 WebUI が保持",
   "lifecycle.orphaned": "クリーンアップ カウントダウン",
   "lifecycle.closing": "クリーンアップ中",
   "lifecycle.unknown": "不明",
@@ -124,6 +129,10 @@ export default {
     "スーパーバイザー切断 — まだ終了しません",
   "session.lifecycle.disconnectedBody":
     "Running / Waiting 段階は自動終了しません。安全な Idle または終了状態になってから猶予が始まります。",
+  "session.lifecycle.webControlledTitle":
+    "Codex オフライン — 対話 WebUI がこのセッションを保持中",
+  "session.lifecycle.webControlledBody":
+    "書き込み制御とハートビートが自動クリーンアップを一時的に延期します。解放・読み取り専用・切断・15秒アイドルで保持が終わり、猶予がやり直されます。",
   "session.lifecycle.orphanedTitle": "自動終了カウントダウン",
   "session.lifecycle.orphanedCountdown":
     "{remaining} 後にクリーンアップ対象になります",

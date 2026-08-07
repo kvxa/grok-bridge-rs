@@ -69,6 +69,9 @@ export default {
   "error.timeout": "Yêu cầu hết thời gian; đang tự động thử lại",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "Truy cập WebUI bị từ chối (capability thiếu hoặc hết hạn). Chạy lại grok-bridge server ui, hoặc mở URL bootstrap do Runtime này in ra rồi tải lại. Sau khi Runtime khởi động lại, chỉ làm mới trang không khôi phục được quyền truy cập.",
+
   "activity.working": "Đang làm việc",
   "activity.waiting": "Đang chờ",
   "activity.done": "Hoàn tất",
@@ -79,12 +82,14 @@ export default {
   "client.connected": "Codex trực tuyến",
   "client.disconnected": "Codex đã ngắt",
   "client.orphaned": "Chờ dọn dẹp tự động",
+  "client.webControlled": "WebUI đang giữ (Codex ngoại tuyến)",
   "client.closing": "Đang dọn dẹp",
   "client.unknown": "Không xác định",
 
   "lifecycle.unmanaged": "Chưa quản lý",
   "lifecycle.connected": "Giám sát viên trực tuyến",
   "lifecycle.disconnected": "Giám sát viên ngoại tuyến",
+  "lifecycle.webControlled": "Được WebUI tương tác giữ",
   "lifecycle.orphaned": "Đếm ngược dọn dẹp",
   "lifecycle.closing": "Đang dọn dẹp",
   "lifecycle.unknown": "Không xác định",
@@ -123,6 +128,10 @@ export default {
   "session.lifecycle.disconnectedTitle": "Giám sát viên ngoại tuyến — chưa đóng",
   "session.lifecycle.disconnectedBody":
     "Các giai đoạn Running hoặc Waiting không bao giờ bị tự đóng. Thời gian ân hạn chỉ bắt đầu sau khi vào Idle an toàn hoặc giai đoạn kết thúc.",
+  "session.lifecycle.webControlledTitle":
+    "Codex ngoại tuyến — WebUI tương tác đang giữ phiên này",
+  "session.lifecycle.webControlledBody":
+    "Quyền ghi và heartbeat tạm hoãn dọn tự động. Nhả, chỉ đọc, ngắt kết nối hoặc 15 giây không hoạt động kết thúc giữ và khởi động lại ân hạn.",
   "session.lifecycle.orphanedTitle": "Đếm ngược tự đóng",
   "session.lifecycle.orphanedCountdown": "Đủ điều kiện dọn dẹp sau {remaining}",
   "session.lifecycle.orphanedCountdownDue":

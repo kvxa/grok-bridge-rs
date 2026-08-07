@@ -174,14 +174,14 @@ describe("SupervisorGroup session tabs", () => {
     }
   });
 
-  it("shows exactly one visible tabpanel; others stay mounted with hidden", async () => {
+  it("shows exactly one visible tabpanel; hidden tabs do not mount terminals", async () => {
     await renderGroup(multiSessions);
     expect(visiblePanels()).toHaveLength(1);
     expect(visiblePanels()[0].getAttribute("data-session-panel")).toBe("gbt-1");
     expect(panels().filter((panel) => panel.hidden)).toHaveLength(2);
-    // All session cards remain in the DOM (mounted).
-    expect(container.querySelectorAll("details.session")).toHaveLength(3);
-    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(3);
+    // Only the selected session mounts a card/terminal (no hidden parse).
+    expect(container.querySelectorAll("details.session")).toHaveLength(1);
+    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(1);
   });
 
   it("clicking a tab selects that session and links aria-selected/aria-controls", async () => {
@@ -287,36 +287,29 @@ describe("SupervisorGroup session tabs", () => {
     expect(tabs()[0].getAttribute("aria-selected")).toBe("true");
   });
 
-  it("retains xterm identity and output across tab switches", async () => {
+  it("mounts only the selected terminal and remounts on tab switch", async () => {
     await renderGroup(multiSessions);
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(MockXTerm.instances.length).toBeGreaterThanOrEqual(3);
-    const before = MockXTerm.instances.slice();
-    // Seed output on the first terminal.
-    before[0].write("stream-from-ws-1");
-    before[1].write("stream-from-ws-2");
+    expect(MockXTerm.instances).toHaveLength(1);
+    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(1);
+    expect(container.querySelector("[data-terminal]").dataset.terminal).toBe(
+      "gbt-1",
+    );
 
     await act(async () => tabs()[1].click());
-    await act(async () => tabs()[2].click());
-    await act(async () => tabs()[0].click());
-
-    expect(MockXTerm.instances).toHaveLength(before.length);
-    expect(MockXTerm.instances[0]).toBe(before[0]);
-    expect(MockXTerm.instances[1]).toBe(before[1]);
-    expect(MockXTerm.instances[2]).toBe(before[2]);
-    expect(before.every((term) => !term.disposed)).toBe(true);
-    expect(before[0].written.some((chunk) => String(chunk).includes("stream-from-ws-1"))).toBe(
-      true,
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(1);
+    expect(container.querySelector("[data-terminal]").dataset.terminal).toBe(
+      "gbt-2",
     );
-    expect(before[1].written.some((chunk) => String(chunk).includes("stream-from-ws-2"))).toBe(
-      true,
-    );
-    // All terminals stay mounted in the DOM.
-    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(3);
-    expect(panels().every((panel) => panel.isConnected)).toBe(true);
+    // Prior selected terminal is disposed so it cannot parse hidden output.
+    expect(MockXTerm.instances[0].disposed).toBe(true);
+    expect(MockXTerm.instances.length).toBeGreaterThanOrEqual(2);
   });
 
   it("preserves per-session collapse and close wiring for the visible card", async () => {
@@ -380,21 +373,27 @@ describe("SupervisorGroup session tabs", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const shells = [...container.querySelectorAll("[data-terminal]")];
-    expect(shells.length).toBeGreaterThanOrEqual(3);
-    for (const shell of shells) {
-      expect(Number(shell.dataset.terminalHeight)).toBe(TERMINAL_HEIGHT_DEFAULT);
-    }
-    const handle = shells[0].querySelector("[data-terminal-resize]");
+    let shell = container.querySelector("[data-terminal]");
+    expect(shell).not.toBeNull();
+    expect(Number(shell.dataset.terminalHeight)).toBe(TERMINAL_HEIGHT_DEFAULT);
+    const handle = shell.querySelector("[data-terminal-resize]");
     await act(async () => {
       handle.dispatchEvent(
         new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }),
       );
     });
-    for (const shell of shells) {
-      expect(Number(shell.dataset.terminalHeight)).toBe(
-        TERMINAL_HEIGHT_DEFAULT + 24,
-      );
-    }
+    expect(Number(shell.dataset.terminalHeight)).toBe(
+      TERMINAL_HEIGHT_DEFAULT + 24,
+    );
+    // Switching tabs remounts the terminal but reuses the group height key.
+    await act(async () => tabs()[1].click());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    shell = container.querySelector("[data-terminal]");
+    expect(shell).not.toBeNull();
+    expect(Number(shell.dataset.terminalHeight)).toBe(
+      TERMINAL_HEIGHT_DEFAULT + 24,
+    );
   });
 });

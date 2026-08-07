@@ -69,6 +69,9 @@ export default {
   "error.timeout": "Permintaan habis waktu; mencoba ulang otomatis",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "Akses WebUI ditolak (capability hilang atau kedaluwarsa). Jalankan ulang grok-bridge server ui, atau buka URL bootstrap yang dicetak Runtime ini, lalu muat ulang. Setelah Runtime dimulai ulang, refresh saja tidak memulihkan akses.",
+
   "activity.working": "Bekerja",
   "activity.waiting": "Menunggu",
   "activity.done": "Selesai",
@@ -79,12 +82,14 @@ export default {
   "client.connected": "Codex daring",
   "client.disconnected": "Codex terputus",
   "client.orphaned": "Menunggu pembersihan otomatis",
+  "client.webControlled": "WebUI menahan (Codex offline)",
   "client.closing": "Membersihkan",
   "client.unknown": "Tidak diketahui",
 
   "lifecycle.unmanaged": "Tidak dikelola",
   "lifecycle.connected": "Supervisor daring",
   "lifecycle.disconnected": "Supervisor luring",
+  "lifecycle.webControlled": "Ditahan WebUI interaktif",
   "lifecycle.orphaned": "Hitung mundur pembersihan",
   "lifecycle.closing": "Membersihkan",
   "lifecycle.unknown": "Tidak diketahui",
@@ -123,6 +128,10 @@ export default {
   "session.lifecycle.disconnectedTitle": "Supervisor luring — belum ditutup",
   "session.lifecycle.disconnectedBody":
     "Tahap Running atau Waiting tidak pernah ditutup otomatis. Masa tenggang dimulai hanya setelah tahap Idle atau terminal yang aman.",
+  "session.lifecycle.webControlledTitle":
+    "Codex offline — WebUI interaktif menahan sesi ini",
+  "session.lifecycle.webControlledBody":
+    "Kontrol tulis dan heartbeat menunda pembersihan otomatis sementara. Lepas, baca-saja, putus, atau idle 15 dtk mengakhiri penahanan dan memulai ulang masa tenggang.",
   "session.lifecycle.orphanedTitle": "Hitung mundur penutupan otomatis",
   "session.lifecycle.orphanedCountdown": "Memenuhi syarat pembersihan dalam {remaining}",
   "session.lifecycle.orphanedCountdownDue":

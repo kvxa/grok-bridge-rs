@@ -72,6 +72,9 @@ export default {
   "error.timeout": "Délai de requête dépassé ; nouvel essai automatique",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "Accès WebUI refusé (capability manquante ou expirée). Relancez grok-bridge server ui, ou ouvrez l’URL d’amorçage affichée par ce Runtime, puis rechargez. Un simple rechargement ne restaure pas l’accès après un redémarrage du Runtime.",
+
   "activity.working": "En cours",
   "activity.waiting": "En attente",
   "activity.done": "Terminé",
@@ -82,12 +85,14 @@ export default {
   "client.connected": "Codex en ligne",
   "client.disconnected": "Codex déconnecté",
   "client.orphaned": "Nettoyage auto en attente",
+  "client.webControlled": "WebUI en maintien (Codex hors ligne)",
   "client.closing": "Nettoyage en cours",
   "client.unknown": "Inconnu",
 
   "lifecycle.unmanaged": "Non géré",
   "lifecycle.connected": "Superviseur en ligne",
   "lifecycle.disconnected": "Superviseur hors ligne",
+  "lifecycle.webControlled": "Maintenu par la WebUI interactive",
   "lifecycle.orphaned": "Compte à rebours nettoyage",
   "lifecycle.closing": "Nettoyage",
   "lifecycle.unknown": "Inconnu",
@@ -124,6 +129,10 @@ export default {
     "Superviseur hors ligne — pas encore de fermeture",
   "session.lifecycle.disconnectedBody":
     "Les phases Running ou Waiting ne sont jamais fermées automatiquement. Le délai de grâce ne commence qu’après une phase Idle ou terminale sûre.",
+  "session.lifecycle.webControlledTitle":
+    "Codex hors ligne — la WebUI interactive maintient cette session",
+  "session.lifecycle.webControlledBody":
+    "Le contrôle en écriture et les heartbeats retardent temporairement le nettoyage auto. Libération, lecture seule, déconnexion ou 15 s d'inactivité terminent le maintien et relancent le délai de grâce.",
   "session.lifecycle.orphanedTitle": "Compte à rebours de fermeture auto",
   "session.lifecycle.orphanedCountdown":
     "Éligible au nettoyage dans {remaining}",

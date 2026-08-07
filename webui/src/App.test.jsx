@@ -215,8 +215,10 @@ describe("App", () => {
       container.querySelector('a[href="https://github.com/luodaoyi/grok-bridge-rs"]'),
     ).not.toBeNull();
     expect(container.querySelectorAll("details.group")).toHaveLength(2);
-    expect(container.querySelectorAll("details.session")).toHaveLength(2);
-    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(2);
+    // Only expanded/selected sessions mount cards and terminals (attention group
+    // is open; clean-done unowned group stays collapsed by default).
+    expect(container.querySelectorAll("details.session")).toHaveLength(1);
+    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(1);
     expect(container.querySelector(".page.app-shell")).not.toBeNull();
     expect(container.querySelector("header.navbar")).not.toBeNull();
     expect(container.querySelectorAll(".stats-grid > .card")).toHaveLength(5);
@@ -238,9 +240,9 @@ describe("App", () => {
     );
   });
 
-  it("keeps xterm instances mounted across collapse so continuous output is preserved", async () => {
+  it("unmounts terminals on collapse so hidden sessions do not parse output", async () => {
     await renderAppAndConnect();
-    expect(MockXTerm.instances).toHaveLength(2);
+    expect(MockXTerm.instances.length).toBeGreaterThanOrEqual(1);
     const before = MockXTerm.instances.slice();
 
     const button = (text) =>
@@ -253,12 +255,9 @@ describe("App", () => {
         (group) => !group.open,
       ),
     ).toBe(true);
-    // Terminal hosts remain mounted while sessions exist.
-    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(2);
-    expect(MockXTerm.instances).toHaveLength(2);
-    expect(MockXTerm.instances[0]).toBe(before[0]);
-    expect(MockXTerm.instances[1]).toBe(before[1]);
-    expect(before.every((term) => !term.disposed)).toBe(true);
+    // Collapsed groups drop terminal mounts (no hidden parse / subscriptions).
+    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(0);
+    expect(before.every((term) => term.disposed)).toBe(true);
 
     await act(async () => button("全部展开").click());
     expect(
@@ -266,6 +265,9 @@ describe("App", () => {
         (session) => session.open,
       ),
     ).toBe(true);
+    expect(
+      container.querySelectorAll("[data-terminal]").length,
+    ).toBeGreaterThan(0);
   });
 
   it("can collapse a single Grok session without collapsing its Codex group", async () => {
@@ -286,7 +288,8 @@ describe("App", () => {
       container.querySelector('details.group[data-owner-key="client:codex-a"]')
         .open,
     ).toBe(true);
-    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(2);
+    // Collapsed session unmounts its terminal so it cannot parse output.
+    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(0);
   });
 
   it("shows update banner with release link and allows dismiss", async () => {
@@ -338,7 +341,10 @@ describe("App", () => {
       "/api/sessions/gbt-a/close",
       expect.objectContaining({
         method: "POST",
-        headers: { "X-Grok-Bridge-WebUI": "1" },
+        headers: expect.objectContaining({
+          "X-Grok-Bridge-WebUI": "1",
+          "X-Grok-Bridge-Capability": expect.any(String),
+        }),
       }),
     );
 
@@ -352,7 +358,10 @@ describe("App", () => {
       "/api/clients/codex-a/close",
       expect.objectContaining({
         method: "POST",
-        headers: { "X-Grok-Bridge-WebUI": "1" },
+        headers: expect.objectContaining({
+          "X-Grok-Bridge-WebUI": "1",
+          "X-Grok-Bridge-Capability": expect.any(String),
+        }),
       }),
     );
     expect(container.textContent).toContain(
@@ -382,25 +391,54 @@ describe("App", () => {
   });
 
   it("disposes xterm when a session is removed from the stream", async () => {
-    const ws = await renderAppAndConnect();
-    expect(MockXTerm.instances).toHaveLength(2);
-    const hosts = [...container.querySelectorAll("[data-terminal]")];
-    const removedIndex = hosts.findIndex(
-      (host) => host.dataset.terminal === "gbt-a",
+    const ws = await renderAppAndConnect([
+      sessions[0],
+      {
+        ...sessions[0],
+        session: "gbt-b",
+        client_session_id: "codex-b",
+        owner: "Codex B",
+        activity: "working",
+        phase: "running",
+        process_id: 103,
+      },
+    ]);
+    // Two attention groups → two mounted selected terminals.
+    expect(container.querySelectorAll("[data-terminal]")).toHaveLength(2);
+    const removedHost = container.querySelector(
+      '[data-terminal="gbt-a"]',
     );
-    const removed = MockXTerm.instances[removedIndex];
+    expect(removedHost).not.toBeNull();
+    const removed = MockXTerm.instances.find((term) => !term.disposed);
 
     await act(async () => {
-      pushSessions(ws, [sessions[1]], [
-        {
-          session: "gbt-unowned",
-          reset: false,
-          data_base64: utf8ToBase64("+"),
-        },
-      ]);
+      pushSessions(
+        ws,
+        [
+          {
+            ...sessions[0],
+            session: "gbt-b",
+            client_session_id: "codex-b",
+            owner: "Codex B",
+            activity: "working",
+            phase: "running",
+            process_id: 103,
+          },
+        ],
+        [
+          {
+            session: "gbt-b",
+            reset: false,
+            data_base64: utf8ToBase64("+"),
+          },
+        ],
+      );
     });
     await settle();
     expect(container.querySelectorAll("[data-terminal]")).toHaveLength(1);
+    expect(
+      container.querySelector("[data-terminal]").dataset.terminal,
+    ).toBe("gbt-b");
     expect(
       MockXTerm.instances.filter((term) => !term.disposed),
     ).toHaveLength(1);
@@ -518,6 +556,56 @@ describe("App", () => {
     expect(decoded.join("")).toContain("2");
   });
 
+  it("clears focused group protection when the focused session is removed", async () => {
+    await renderAppAndConnect([
+      sessions[0],
+      {
+        ...sessions[0],
+        session: "gbt-b",
+        client_session_id: "codex-b",
+        owner: "Codex B",
+        activity: "working",
+        phase: "running",
+        process_id: 103,
+      },
+    ]);
+    const groupA = container.querySelector(
+      'details.group[data-owner-key="client:codex-a"]',
+    );
+    expect(groupA).not.toBeNull();
+    const focusTarget =
+      groupA.querySelector("button, [tabindex], summary") || groupA;
+    await act(async () => {
+      focusTarget.focus?.();
+      focusTarget.dispatchEvent(
+        new FocusEvent("focusin", { bubbles: true, target: focusTarget }),
+      );
+    });
+    // Remove the focused group's only session so the group disappears.
+    const ws = MockWebSocket.instances[0];
+    await act(async () => {
+      pushSessions(ws, [
+        {
+          ...sessions[0],
+          session: "gbt-b",
+          client_session_id: "codex-b",
+          owner: "Codex B",
+          activity: "working",
+          phase: "running",
+          process_id: 103,
+        },
+      ]);
+    });
+    await settle();
+    // Focus protection must not keep a dead group key; remaining group can collapse normally.
+    expect(
+      container.querySelector('details.group[data-owner-key="client:codex-a"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('details.group[data-owner-key="client:codex-b"]'),
+    ).not.toBeNull();
+  });
+
   it("defaults interactive mode off and does not persist the switch", async () => {
     await renderAppAndConnect();
     const toggle = container.querySelector("[data-interactive-toggle]");
@@ -546,9 +634,11 @@ describe("App", () => {
     const warning = container.querySelector("[data-interactive-warning]");
     expect(warning).not.toBeNull();
     expect(warning.textContent).toContain("交互模式已开启");
-    expect(MockXTerm.instances.every((term) => !term.options.disableStdin)).toBe(
-      true,
-    );
+    expect(
+      MockXTerm.instances
+        .filter((term) => !term.disposed)
+        .every((term) => !term.options.disableStdin),
+    ).toBe(true);
     expect(window.localStorage.getItem("grok-bridge-interactive")).toBeNull();
   });
 
@@ -561,8 +651,22 @@ describe("App", () => {
     await act(async () => term.emitData("hello"));
     await settle();
     const sent = ws.sent.map((item) => JSON.parse(String(item)));
-    expect(sent.some((msg) => msg.type === "terminal_input")).toBe(true);
-    const input = sent.find((msg) => msg.type === "terminal_input");
+    const claim = sent.find((msg) => msg.type === "terminal_claim");
+    expect(claim).toBeTruthy();
+    await act(async () =>
+      ws.emitMessage({
+        type: "terminal_claim_result",
+        ok: true,
+        id: claim.id,
+        session: "gbt-a",
+        error_code: null,
+        error: null,
+      }),
+    );
+    await settle();
+    const acknowledged = ws.sent.map((item) => JSON.parse(String(item)));
+    expect(acknowledged.some((msg) => msg.type === "terminal_input")).toBe(true);
+    const input = acknowledged.find((msg) => msg.type === "terminal_input");
     expect(input.session).toBe("gbt-a");
     expect(input.data_base64).toBe(btoa("hello"));
     expect(input.id).toBeTruthy();
@@ -574,7 +678,7 @@ describe("App", () => {
     await settle();
     const after = ws.sent.map((item) => JSON.parse(String(item)));
     expect(after.filter((msg) => msg.type === "terminal_input").length).toBe(
-      sent.filter((msg) => msg.type === "terminal_input").length,
+      acknowledged.filter((msg) => msg.type === "terminal_input").length,
     );
     expect(ws.sent.length).toBeGreaterThanOrEqual(before);
   });

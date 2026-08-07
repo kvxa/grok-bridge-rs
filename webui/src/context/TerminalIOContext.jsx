@@ -10,6 +10,10 @@ export const TerminalIOContext = createContext({
   connectionState: "initial",
   sendTerminalInput: () => ({ ok: false, error: "send_failed" }),
   sendTerminalResize: () => ({ ok: false, error: "send_failed" }),
+  setTerminalSubscriptions: () => ({ ok: false, error: "send_failed" }),
+  requestTerminalResync: () => ({ ok: false, error: "send_failed" }),
+  /** Per-session epoch bumped on (re)claim so Terminal re-sends current grid. */
+  controlEpochs: /** @type {Record<string, number>} */ ({}),
 });
 
 export function useTerminalIO() {

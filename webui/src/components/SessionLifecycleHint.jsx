@@ -51,6 +51,25 @@ export function SessionLifecycleHint({ session, now = Date.now() }) {
     );
   }
 
+  if (model.kind === "web_controlled") {
+    return (
+      <div
+        className={COMPACT_DISCONNECTED}
+        data-lifecycle-hint="web_controlled"
+        data-density="compact"
+        role="status"
+      >
+        <span className="fw-semibold">
+          {t("session.lifecycle.webControlledTitle")}
+        </span>
+        <span>
+          {" — "}
+          {t("session.lifecycle.webControlledBody")}
+        </span>
+      </div>
+    );
+  }
+
   if (model.kind === "orphaned") {
     if (model.deadlineMs == null) {
       return (

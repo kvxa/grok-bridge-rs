@@ -229,10 +229,11 @@ describe("SessionLifecycleHint", () => {
     );
     expect(collapsed).not.toBeNull();
     expect(collapsed.textContent).toMatch(/Cleanup eligible in/i);
-    // Banner stays mounted under collapsed details for xterm survival.
+    // Collapsed cards unmount the body (no banner / terminal parse).
     expect(
       container.querySelector('[data-lifecycle-hint="orphaned"]'),
-    ).not.toBeNull();
+    ).toBeNull();
+    expect(container.querySelector("[data-terminal]")).toBeNull();
   });
 
   it("surfaces waiting-for-Runtime risk in the collapsed summary when due", async () => {
@@ -260,7 +261,7 @@ describe("SessionLifecycleHint", () => {
     expect(collapsed.textContent).toMatch(/Closing now/i);
   });
 
-  it("creates at most one interval for collapsed orphaned card (summary + banner share clock)", async () => {
+  it("creates at most one interval for collapsed orphaned card and expands cleanly", async () => {
     const setIntervalSpy = vi.spyOn(window, "setInterval");
     const session = baseSession({
       client_state: "orphaned",
@@ -269,17 +270,21 @@ describe("SessionLifecycleHint", () => {
     await renderCard(session, true);
     const oneSecondIntervals = () =>
       setIntervalSpy.mock.calls.filter((call) => call[1] === 1000);
+    // Parent useNow owns the single second clock for the collapsed summary.
     expect(oneSecondIntervals()).toHaveLength(1);
     expect(
       container.querySelector("[data-lifecycle-collapsed='orphaned']"),
     ).not.toBeNull();
     expect(
       container.querySelector('[data-lifecycle-hint="orphaned"]'),
-    ).not.toBeNull();
+    ).toBeNull();
 
     // Expand: needsClock stays true, so parent must not open a second interval.
     await renderCard(session, false);
     expect(oneSecondIntervals()).toHaveLength(1);
+    expect(
+      container.querySelector('[data-lifecycle-hint="orphaned"]'),
+    ).not.toBeNull();
     setIntervalSpy.mockRestore();
   });
 
@@ -333,9 +338,9 @@ describe("SessionLifecycleHint", () => {
     const summaryBefore = container.querySelector(
       "[data-lifecycle-collapsed='orphaned']",
     ).textContent;
-    const bannerBefore = container.querySelector(
-      "[data-lifecycle-countdown]",
-    ).textContent;
+    expect(
+      container.querySelector("[data-lifecycle-countdown]"),
+    ).toBeNull();
 
     await act(async () => {
       vi.advanceTimersByTime(1000);
@@ -343,10 +348,24 @@ describe("SessionLifecycleHint", () => {
     const summaryAfter = container.querySelector(
       "[data-lifecycle-collapsed='orphaned']",
     ).textContent;
-    const bannerAfter = container.querySelector(
-      "[data-lifecycle-countdown]",
-    ).textContent;
     expect(summaryAfter).not.toBe(summaryBefore);
-    expect(bannerAfter).not.toBe(bannerBefore);
+
+    // Expand: banner appears and continues from the same parent clock.
+    await renderCard(
+      baseSession({
+        client_state: "orphaned",
+        auto_close_at_ms: deadline,
+      }),
+      false,
+    );
+    const banner = container.querySelector("[data-lifecycle-countdown]");
+    expect(banner).not.toBeNull();
+    const bannerBefore = banner.textContent;
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(
+      container.querySelector("[data-lifecycle-countdown]").textContent,
+    ).not.toBe(bannerBefore);
   });
 });

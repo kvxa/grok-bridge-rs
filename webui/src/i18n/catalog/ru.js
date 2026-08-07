@@ -72,6 +72,9 @@ export default {
   "error.timeout": "Время запроса истекло; автоматический повтор",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "Доступ к WebUI запрещён (capability отсутствует или устарела). Снова выполните grok-bridge server ui или откройте bootstrap-URL, который напечатал этот Runtime, и обновите страницу. После перезапуска Runtime одного обновления недостаточно.",
+
   "activity.working": "Работает",
   "activity.waiting": "Ожидает",
   "activity.done": "Готово",
@@ -82,12 +85,14 @@ export default {
   "client.connected": "Codex в сети",
   "client.disconnected": "Codex отключён",
   "client.orphaned": "Ожидание автоочистки",
+  "client.webControlled": "Удержание WebUI (Codex офлайн)",
   "client.closing": "Очистка",
   "client.unknown": "Неизвестно",
 
   "lifecycle.unmanaged": "Не управляется",
   "lifecycle.connected": "Супервизор в сети",
   "lifecycle.disconnected": "Супервизор офлайн",
+  "lifecycle.webControlled": "Удерживается интерактивным WebUI",
   "lifecycle.orphaned": "Обратный отсчёт очистки",
   "lifecycle.closing": "Очистка",
   "lifecycle.unknown": "Неизвестно",
@@ -124,6 +129,10 @@ export default {
     "Супервизор офлайн — закрытие ещё не начато",
   "session.lifecycle.disconnectedBody":
     "Фазы Running или Waiting никогда не закрываются автоматически. Льготный период начинается только после безопасного Idle или конечного состояния.",
+  "session.lifecycle.webControlledTitle":
+    "Codex офлайн — интерактивный WebUI удерживает сессию",
+  "session.lifecycle.webControlledBody":
+    "Контроль записи и heartbeat временно откладывают автоочистку. Освобождение, только чтение, отключение или 15 с простоя завершают удержание и заново запускают льготный период.",
   "session.lifecycle.orphanedTitle": "Обратный отсчёт автозакрытия",
   "session.lifecycle.orphanedCountdown":
     "Право на очистку через {remaining}",

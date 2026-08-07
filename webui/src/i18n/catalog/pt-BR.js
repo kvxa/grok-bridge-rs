@@ -72,6 +72,9 @@ export default {
   "error.timeout": "Tempo limite da requisição; tentando novamente",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "Acesso WebUI negado (capability ausente ou expirada). Execute novamente grok-bridge server ui ou abra a URL de bootstrap impressa por este Runtime e recarregue. Após reiniciar o Runtime, só recarregar não restaura o acesso.",
+
   "activity.working": "Trabalhando",
   "activity.waiting": "Aguardando",
   "activity.done": "Concluído",
@@ -82,12 +85,14 @@ export default {
   "client.connected": "Codex online",
   "client.disconnected": "Codex desconectado",
   "client.orphaned": "Aguardando limpeza automática",
+  "client.webControlled": "WebUI segurando (Codex offline)",
   "client.closing": "Limpando",
   "client.unknown": "Desconhecido",
 
   "lifecycle.unmanaged": "Não gerenciado",
   "lifecycle.connected": "Supervisor online",
   "lifecycle.disconnected": "Supervisor offline",
+  "lifecycle.webControlled": "Segurado pela WebUI interativa",
   "lifecycle.orphaned": "Contagem regressiva para limpeza",
   "lifecycle.closing": "Limpando",
   "lifecycle.unknown": "Desconhecido",
@@ -127,6 +132,10 @@ export default {
     "Supervisor offline — ainda não fechando",
   "session.lifecycle.disconnectedBody":
     "Estágios Running ou Waiting nunca são fechados automaticamente. O período de carência começa apenas após um estágio seguro Idle ou terminal.",
+  "session.lifecycle.webControlledTitle":
+    "Codex offline — a WebUI interativa está segurando esta sessão",
+  "session.lifecycle.webControlledBody":
+    "Controle de escrita e heartbeats atrasam temporariamente a limpeza automática. Liberar, somente leitura, desconectar ou 15s ocioso encerram a retenção e reiniciam a carência.",
   "session.lifecycle.orphanedTitle":
     "Contagem regressiva para fechamento automático",
   "session.lifecycle.orphanedCountdown":

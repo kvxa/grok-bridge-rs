@@ -69,6 +69,9 @@ export default {
   "error.timeout": "La solicitud agotó el tiempo de espera; reintentando automáticamente",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "Acceso WebUI denegado (capability ausente o caducada). Vuelva a ejecutar grok-bridge server ui o abra la URL de arranque que imprimió este Runtime y recargue. Tras reiniciar el Runtime, solo recargar no restaura el acceso.",
+
   "activity.working": "En curso",
   "activity.waiting": "En espera",
   "activity.done": "Listo",
@@ -79,12 +82,14 @@ export default {
   "client.connected": "Codex en línea",
   "client.disconnected": "Codex desconectado",
   "client.orphaned": "Limpieza automática pendiente",
+  "client.webControlled": "WebUI reteniendo (Codex desconectado)",
   "client.closing": "Limpiando",
   "client.unknown": "Desconocido",
 
   "lifecycle.unmanaged": "No gestionado",
   "lifecycle.connected": "Supervisor en línea",
   "lifecycle.disconnected": "Supervisor desconectado",
+  "lifecycle.webControlled": "Retenido por WebUI interactiva",
   "lifecycle.orphaned": "Cuenta atrás de limpieza",
   "lifecycle.closing": "Limpiando",
   "lifecycle.unknown": "Desconocido",
@@ -123,6 +128,10 @@ export default {
   "session.lifecycle.disconnectedTitle": "Supervisor desconectado — aún no se cierra",
   "session.lifecycle.disconnectedBody":
     "Las fases Running o Waiting nunca se cierran automáticamente. El período de gracia comienza solo tras una fase Idle o terminal segura.",
+  "session.lifecycle.webControlledTitle":
+    "Codex desconectado — la WebUI interactiva retiene esta sesión",
+  "session.lifecycle.webControlledBody":
+    "El control de escritura y los heartbeats retrasan temporalmente la limpieza automática. Liberar, solo lectura, desconexión o 15 s de inactividad terminan la retención y reinician la gracia.",
   "session.lifecycle.orphanedTitle": "Cuenta atrás de cierre automático",
   "session.lifecycle.orphanedCountdown": "Elegible para limpieza en {remaining}",
   "session.lifecycle.orphanedCountdownDue":

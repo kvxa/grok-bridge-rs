@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { Bot, ChevronRight, CircleStop } from "lucide-react";
 import { useI18n } from "../i18n/index.js";
 import { useNow } from "../hooks/useNow.js";
@@ -20,6 +21,7 @@ export function SubagentCard({
   collapsed,
   onToggle,
   onClose,
+  onVisibleTerminal,
   busy,
 }) {
   const { t, locale } = useI18n();
@@ -31,6 +33,14 @@ export function SubagentCard({
   const needsClock = hint.kind === "orphaned" && hint.deadlineMs != null;
   const now = useNow(needsClock);
   const riskSummary = lifecycleCollapsedSummary(session, t, locale, now);
+  // Expanded selected cards alone drive terminal subscriptions / parsing.
+  const terminalVisible = !collapsed;
+
+  useEffect(() => {
+    if (typeof onVisibleTerminal !== "function") return undefined;
+    onVisibleTerminal(session.session, terminalVisible);
+    return () => onVisibleTerminal(session.session, false);
+  }, [onVisibleTerminal, session.session, terminalVisible]);
 
   return (
     <details
@@ -94,52 +104,56 @@ export function SubagentCard({
           <span>{t("session.close")}</span>
         </button>
       </summary>
-      {/* Always keep body mounted so xterm survives collapse without losing stream. */}
+      {/* Collapse unmounts xterm so hidden terminals never parse output. */}
       <div className="subagent-body">
-        <SessionLifecycleHint session={session} now={now} />
-        <div className="meta-grid">
-          <MetaField label={t("session.meta.id")} title={session.session}>
-            {session.session}
-          </MetaField>
-          <MetaField label={t("session.meta.pid")}>
-            {t("session.meta.pidValue", {
-              pid: session.process_id ?? "-",
-            })}
-          </MetaField>
-          <MetaField label={t("session.meta.updated")}>
-            {ageLabel(session.updated_at_ms, Date.now(), locale)}
-          </MetaField>
-          <MetaField label={t("session.meta.client")}>
-            {clientStateLabel(session.client_state, t)}
-          </MetaField>
-          {session.hook_event ? (
-            <MetaField label={t("session.meta.hook")}>
-              {session.hook_event}
-            </MetaField>
-          ) : null}
-          {session.tool_name ? (
-            <MetaField label={t("session.meta.tool")} title={session.tool_name}>
-              {session.tool_name}
-            </MetaField>
-          ) : null}
-          <MetaField label={t("session.meta.cwd")} title={session.cwd} wide>
-            {session.cwd}
-          </MetaField>
-        </div>
-        {session.waiting_reason ? (
-          <p className="alert alert-warning waiting-note">
-            {t("session.waitingNote", { reason: session.waiting_reason })}
-          </p>
-        ) : (
-          <div className="terminal-spacer" />
-        )}
-        <Terminal
-          id={session.session}
-          heightKey={heightKey}
-          rows={session.rows}
-          cols={session.cols}
-          label={t("session.terminalAria", { title })}
-        />
+        {!collapsed ? (
+          <>
+            <SessionLifecycleHint session={session} now={now} />
+            <div className="meta-grid">
+              <MetaField label={t("session.meta.id")} title={session.session}>
+                {session.session}
+              </MetaField>
+              <MetaField label={t("session.meta.pid")}>
+                {t("session.meta.pidValue", {
+                  pid: session.process_id ?? "-",
+                })}
+              </MetaField>
+              <MetaField label={t("session.meta.updated")}>
+                {ageLabel(session.updated_at_ms, Date.now(), locale)}
+              </MetaField>
+              <MetaField label={t("session.meta.client")}>
+                {clientStateLabel(session.client_state, t)}
+              </MetaField>
+              {session.hook_event ? (
+                <MetaField label={t("session.meta.hook")}>
+                  {session.hook_event}
+                </MetaField>
+              ) : null}
+              {session.tool_name ? (
+                <MetaField label={t("session.meta.tool")} title={session.tool_name}>
+                  {session.tool_name}
+                </MetaField>
+              ) : null}
+              <MetaField label={t("session.meta.cwd")} title={session.cwd} wide>
+                {session.cwd}
+              </MetaField>
+            </div>
+            {session.waiting_reason ? (
+              <p className="alert alert-warning waiting-note">
+                {t("session.waitingNote", { reason: session.waiting_reason })}
+              </p>
+            ) : (
+              <div className="terminal-spacer" />
+            )}
+            <Terminal
+              id={session.session}
+              heightKey={heightKey}
+              rows={session.rows}
+              cols={session.cols}
+              label={t("session.terminalAria", { title })}
+            />
+          </>
+        ) : null}
       </div>
     </details>
   );

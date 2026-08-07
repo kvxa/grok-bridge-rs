@@ -26,6 +26,7 @@ export function SupervisorGroup({
   onToggleSession,
   onCloseGroup,
   onCloseSession,
+  onVisibleTerminal,
   busy,
 }) {
   const { t, locale, formatNumber } = useI18n();
@@ -33,6 +34,9 @@ export function SupervisorGroup({
   const lifecycleState = dominantClientState(sessions);
   const baseId = useId();
   const tabRefs = useRef(new Map());
+  const expectedOpenRef = useRef(!collapsed);
+  // Keep automatic prop synchronization from becoming a manual intent.
+  expectedOpenRef.current = !collapsed;
   const [selectedSessionId, setSelectedSessionId] = useState(
     () => sessions[0]?.session ?? null,
   );
@@ -94,7 +98,12 @@ export function SupervisorGroup({
       className="card supervisor-card group"
       data-owner-key={groupKey}
       open={!collapsed}
-      onToggle={(event) => onToggle(event.currentTarget.open)}
+      onToggle={(event) => {
+        const open = event.currentTarget.open;
+        if (open === expectedOpenRef.current) return;
+        expectedOpenRef.current = open;
+        onToggle(open);
+      }}
     >
       <summary className="card-header supervisor-summary">
         <ChevronRight
@@ -147,9 +156,10 @@ export function SupervisorGroup({
           </button>
         )}
       </summary>
-      {/* Keep children mounted when collapsed so session terminals stay alive. */}
+      {/* When the group is collapsed, unmount terminal streams so hidden
+          sessions neither subscribe nor parse PTY output. */}
       <div className="supervisor-body">
-        {sessions.length > 0 ? (
+        {!collapsed && sessions.length > 0 ? (
           <>
             <div
               role="tablist"
@@ -207,14 +217,17 @@ export function SupervisorGroup({
                   aria-labelledby={tabId}
                   hidden={!selected}
                 >
-                  <SubagentCard
-                    session={session}
-                    heightKey={groupKey}
-                    collapsed={collapsedSessions.has(session.session)}
-                    onToggle={(open) => onToggleSession(session.session, open)}
-                    onClose={onCloseSession}
-                    busy={busy}
-                  />
+                  {selected ? (
+                    <SubagentCard
+                      session={session}
+                      heightKey={groupKey}
+                      collapsed={collapsedSessions.has(session.session)}
+                      onToggle={(open) => onToggleSession(session.session, open)}
+                      onClose={onCloseSession}
+                      onVisibleTerminal={onVisibleTerminal}
+                      busy={busy}
+                    />
+                  ) : null}
                 </div>
               );
             })}

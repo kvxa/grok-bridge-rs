@@ -19,7 +19,13 @@ import {
   terminalHeightStorageKey,
 } from "../utils/terminalHeight.js";
 import { TERMINAL_FONT_FAMILY } from "../utils/terminalTheme.js";
-import { createTerminalWriteQueue, fitTerminalHost } from "./Terminal.jsx";
+import {
+  coalesceTerminalEntries,
+  createTerminalWriteQueue,
+  fitTerminalHost,
+  TERMINAL_WRITE_QUEUE_MAX,
+  TERMINAL_WRITE_QUEUE_MAX_BYTES,
+} from "./Terminal.jsx";
 
 vi.mock("@xterm/xterm", () => ({
   Terminal: MockXTerm,
@@ -103,13 +109,34 @@ describe("Terminal (xterm read-only)", () => {
     localStorage.clear();
     rafQueue = [];
     sendInput = vi.fn(() => ({ ok: true, id: "t1" }));
-    sendResize = vi.fn(() => ({ ok: true, id: "t2" }));
+    // Auto-ack resize with the exact request id + cols/rows so dedupe commits
+    // only after a matching backend result (never on queue/send alone).
+    let resizeSeq = 0;
+    sendResize = vi.fn((session, cols, rows, { onResult } = {}) => {
+      resizeSeq += 1;
+      const id = `resize-${resizeSeq}`;
+      queueMicrotask(() => {
+        onResult?.({
+          ok: true,
+          id,
+          session,
+          cols,
+          rows,
+          error_code: null,
+          error: null,
+        });
+      });
+      return { ok: true, id };
+    });
     ioState = {
       interactive: false,
       setInteractive: vi.fn(),
       connectionState: "connected",
       sendTerminalInput: (...args) => sendInput(...args),
       sendTerminalResize: (...args) => sendResize(...args),
+      setTerminalSubscriptions: vi.fn(() => ({ ok: true })),
+      requestTerminalResync: vi.fn(() => ({ ok: true })),
+      controlEpochs: {},
     };
     vi.stubGlobal(
       "requestAnimationFrame",
@@ -150,6 +177,7 @@ describe("Terminal (xterm read-only)", () => {
     MockXTerm.reset();
     MockFitAddon.reset();
     TestResizeObserver.reset();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -589,7 +617,7 @@ describe("Terminal (xterm read-only)", () => {
     expect(sendInput).not.toHaveBeenCalled();
   });
 
-  it("still sends terminal_resize while read-only but never terminal_input", async () => {
+  it("suppresses terminal_resize while read-only and never sends terminal_input", async () => {
     vi.useFakeTimers();
     await renderTerminal({ interactive: false, hostWidth: 900, hostHeight: 400 });
     sendResize.mockClear();
@@ -603,17 +631,45 @@ describe("Terminal (xterm read-only)", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
-    expect(sendResize).toHaveBeenCalled();
+    expect(sendResize).not.toHaveBeenCalled();
     expect(sendInput).not.toHaveBeenCalled();
     MockXTerm.instances[0].emitData("typed-while-readonly");
     expect(sendInput).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 
+  it("publishes the fitted grid when interactive turns on after read-only layout", async () => {
+    vi.useFakeTimers();
+    await renderTerminal({ interactive: false, hostWidth: 900, hostHeight: 400 });
+    sendResize.mockClear();
+    const host = container.querySelector("[data-terminal-host]");
+    sizeElement(host, 720, 340);
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).not.toHaveBeenCalled();
+
+    await setInteractive(true);
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalled();
+    const [session, cols, rows] = sendResize.mock.calls.at(-1);
+    expect(session).toBe("gbt-1");
+    expect(cols).toBeGreaterThanOrEqual(20);
+    expect(rows).toBeGreaterThanOrEqual(5);
+    vi.useRealTimers();
+  });
+
   it("clamps extreme fit grids and retries resize after send failure", async () => {
     vi.useFakeTimers();
     sendResize.mockImplementation(() => ({ ok: false, error: "disconnected" }));
-    await renderTerminal({ interactive: false, hostWidth: 20, hostHeight: 20 });
+    await renderTerminal({ interactive: true, hostWidth: 20, hostHeight: 20 });
     const term = MockXTerm.instances[0];
     // Force a sub-minimum fitted grid before clamp.
     term.cols = 2;
@@ -634,7 +690,19 @@ describe("Terminal (xterm read-only)", () => {
 
     // Failure must leave lastSent unset so the same size retries.
     sendResize.mockClear();
-    sendResize.mockImplementation(() => ({ ok: true, id: "ok" }));
+    sendResize.mockImplementation((session, nextCols, nextRows, { onResult } = {}) => {
+      const id = "ok-retry";
+      queueMicrotask(() => {
+        onResult?.({
+          ok: true,
+          id,
+          session,
+          cols: nextCols,
+          rows: nextRows,
+        });
+      });
+      return { ok: true, id };
+    });
     await act(async () => {
       for (const observer of TestResizeObserver.instances) observer.trigger();
     });
@@ -642,7 +710,15 @@ describe("Terminal (xterm read-only)", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
-    expect(sendResize).toHaveBeenCalledWith("gbt-1", 20, 5);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(sendResize).toHaveBeenCalledWith(
+      "gbt-1",
+      20,
+      5,
+      expect.objectContaining({ onResult: expect.any(Function) }),
+    );
     vi.useRealTimers();
   });
 
@@ -713,7 +789,7 @@ describe("Terminal (xterm read-only)", () => {
 
   it("sends debounced resize when fit changes cols/rows and dedupes successes", async () => {
     vi.useFakeTimers();
-    await renderTerminal({ interactive: false, hostWidth: 900, hostHeight: 400 });
+    await renderTerminal({ interactive: true, hostWidth: 900, hostHeight: 400 });
     sendResize.mockClear();
     const host = container.querySelector("[data-terminal-host]");
     // New host size → FitAddon derives a new grid; Terminal should publish it.
@@ -725,13 +801,17 @@ describe("Terminal (xterm read-only)", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
+    // Flush microtask onResult acks.
+    await act(async () => {
+      await Promise.resolve();
+    });
     expect(sendResize).toHaveBeenCalled();
     const [session, cols, rows] = sendResize.mock.calls.at(-1);
     expect(session).toBe("gbt-1");
     expect(cols).toBeGreaterThanOrEqual(20);
     expect(rows).toBeGreaterThanOrEqual(5);
     const calls = sendResize.mock.calls.length;
-    // Same fitted size should not resend after success.
+    // Same fitted size should not resend after a matching request-id result.
     await act(async () => {
       for (const observer of TestResizeObserver.instances) observer.trigger();
     });
@@ -739,7 +819,348 @@ describe("Terminal (xterm read-only)", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
+    await act(async () => {
+      await Promise.resolve();
+    });
     expect(sendResize.mock.calls.length).toBe(calls);
+    vi.useRealTimers();
+  });
+
+  it("coalesces overflowed write-queue deltas without dropping bytes", () => {
+    const term = new MockXTerm();
+    term.holdWriteCallbacks = true;
+    const queue = createTerminalWriteQueue(term, {
+      maxPending: 3,
+      maxBytes: 1024,
+    });
+    // Fill up to capacity with distinct deltas (1 in-flight + pending ≤ 3).
+    queue.enqueue({ reset: false, data_base64: btoa("A") });
+    queue.enqueue({ reset: false, data_base64: btoa("B") });
+    queue.enqueue({ reset: false, data_base64: btoa("C") });
+    queue.enqueue({ reset: false, data_base64: btoa("D") });
+    // Pending queue is bounded via coalescing (one item is in-flight/busy).
+    expect(queue.pending).toBeLessThanOrEqual(3);
+    // Drain everything: reconstructed output must contain A,B,C,D in order.
+    term.flushAllWriteCallbacks();
+    // Pump remaining after first flush cycle.
+    for (let i = 0; i < 8; i += 1) {
+      term.flushAllWriteCallbacks();
+    }
+    const text = term.written
+      .map((chunk) =>
+        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+      )
+      .join("");
+    expect(text).toBe("ABCD");
+    queue.dispose();
+  });
+
+  it("bounds write-queue by bytes under sustained producer and resyncs via reset", () => {
+    const term = new MockXTerm();
+    term.holdWriteCallbacks = true;
+    let resyncCalls = 0;
+    const maxPending = 4;
+    const maxBytes = 128;
+    const queue = createTerminalWriteQueue(term, {
+      maxPending,
+      maxBytes,
+      onResync: () => {
+        resyncCalls += 1;
+      },
+    });
+    // ~48 decoded bytes per entry; continuous deltas under a stalled writer.
+    const chunk = btoa("X".repeat(48));
+    for (let i = 0; i < 80; i += 1) {
+      queue.enqueue({ reset: false, data_base64: chunk, session: "gbt-bound" });
+      // True memory bound: never retain past budgets (gap marker is 0 bytes).
+      expect(queue.pendingBytes).toBeLessThanOrEqual(maxBytes);
+      expect(queue.pending).toBeLessThanOrEqual(maxPending + 1);
+    }
+    expect(resyncCalls).toBeGreaterThanOrEqual(1);
+    expect(queue.needsResync).toBe(true);
+    // Interim deltas after the gap must not accumulate.
+    queue.enqueue({ reset: false, data_base64: btoa("stale") });
+    expect(queue.pendingBytes).toBeLessThanOrEqual(maxBytes);
+
+    // Authoritative snapshot restores correct content deterministically.
+    queue.enqueue({
+      reset: true,
+      data_base64: btoa("SNAPSHOT-OK"),
+      session: "gbt-bound",
+    });
+    for (let i = 0; i < 16; i += 1) {
+      term.flushAllWriteCallbacks();
+    }
+    const text = term.written
+      .map((chunk) =>
+        typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk),
+      )
+      .join("");
+    expect(text).toBe("SNAPSHOT-OK");
+    expect(queue.needsResync).toBe(false);
+    expect(queue.pendingBytes).toBe(0);
+    expect(queue.pending).toBe(0);
+    // Default production budget remains finite (regression against unbounded coalesce).
+    expect(TERMINAL_WRITE_QUEUE_MAX_BYTES).toBe(256 * 1024);
+    queue.dispose();
+  });
+
+  it("coalesceTerminalEntries concatenates binary-safe deltas", () => {
+    const merged = coalesceTerminalEntries(
+      { reset: false, data_base64: btoa("xy") },
+      { reset: false, data_base64: btoa("z") },
+    );
+    expect(merged.reset).toBe(false);
+    expect(atob(merged.data_base64)).toBe("xyz");
+    expect(
+      coalesceTerminalEntries(
+        { reset: true, data_base64: btoa("a") },
+        { reset: false, data_base64: btoa("b") },
+      ),
+    ).toBeNull();
+  });
+
+  it("streams multi-frame reset snapshot >1MiB without resync loop", () => {
+    const term = new MockXTerm();
+    term.holdWriteCallbacks = true;
+    let resyncCalls = 0;
+    const queue = createTerminalWriteQueue(term, {
+      maxPending: 4,
+      maxBytes: 256 * 1024,
+      snapshotMaxBytes: 8 * 1024 * 1024,
+      onResync: () => {
+        resyncCalls += 1;
+      },
+    });
+    // Head + three conts: ~1.2 MiB total, each cont > 256 KiB delta budget.
+    const head = btoa("H".repeat(200 * 1024));
+    const cont = btoa("C".repeat(350 * 1024));
+    queue.enqueue({
+      reset: true,
+      reset_cont: false,
+      data_base64: head,
+      session: "gbt-big",
+    });
+    for (let i = 0; i < 3; i += 1) {
+      queue.enqueue({
+        reset: false,
+        reset_cont: true,
+        data_base64: cont,
+        session: "gbt-big",
+      });
+    }
+    // Must not treat conts as delta overflow.
+    expect(resyncCalls).toBe(0);
+    expect(queue.needsResync).toBe(false);
+    expect(queue.pending).toBeGreaterThanOrEqual(1);
+
+    // Drain slow xterm: only one write at a time.
+    for (let i = 0; i < 32; i += 1) {
+      term.flushAllWriteCallbacks();
+    }
+    expect(resyncCalls).toBe(0);
+    expect(queue.needsResync).toBe(false);
+    expect(queue.pending).toBe(0);
+    expect(term.resetCount).toBe(1);
+    const totalWritten = term.written.reduce(
+      (n, chunk) => n + (chunk?.length ?? 0),
+      0,
+    );
+    expect(totalWritten).toBe(200 * 1024 + 3 * 350 * 1024);
+    // Re-enqueue same split snapshot (as if resync returned) — still no loop.
+    queue.enqueue({
+      reset: true,
+      reset_cont: false,
+      data_base64: head,
+      session: "gbt-big",
+    });
+    queue.enqueue({
+      reset: false,
+      reset_cont: true,
+      data_base64: cont,
+      session: "gbt-big",
+    });
+    for (let i = 0; i < 16; i += 1) {
+      term.flushAllWriteCallbacks();
+    }
+    expect(resyncCalls).toBe(0);
+    queue.dispose();
+  });
+
+  it("decode failure and term.write throw enter gap/resync not stuck busy", () => {
+    const term = new MockXTerm();
+    let resyncCalls = 0;
+    const queue = createTerminalWriteQueue(term, {
+      onResync: () => {
+        resyncCalls += 1;
+      },
+    });
+    // Invalid base64 (non-empty) → decode empty → resync.
+    queue.enqueue({
+      reset: false,
+      data_base64: "!!!not-valid-base64!!!",
+      session: "gbt-err",
+    });
+    expect(resyncCalls).toBe(1);
+    expect(queue.needsResync).toBe(true);
+    expect(queue.isBusy).toBe(false);
+
+    // Reset head clears gap; write throw also resyncs.
+    term.write = () => {
+      throw new Error("xterm write failed");
+    };
+    queue.enqueue({
+      reset: true,
+      data_base64: btoa("SNAP"),
+      session: "gbt-err",
+    });
+    expect(queue.isBusy).toBe(false);
+    expect(resyncCalls).toBeGreaterThanOrEqual(2);
+    queue.dispose();
+  });
+
+  it("orphan reset_cont without head requests resync once", () => {
+    const term = new MockXTerm();
+    let resyncCalls = 0;
+    const queue = createTerminalWriteQueue(term, {
+      onResync: () => {
+        resyncCalls += 1;
+      },
+    });
+    queue.enqueue({
+      reset: false,
+      reset_cont: true,
+      data_base64: btoa("orphan"),
+      session: "gbt-orphan",
+    });
+    expect(resyncCalls).toBe(1);
+    queue.enqueue({
+      reset: false,
+      reset_cont: true,
+      data_base64: btoa("again"),
+      session: "gbt-orphan",
+    });
+    // While awaiting head, further conts are dropped (no extra resync storms).
+    expect(resyncCalls).toBe(1);
+    queue.dispose();
+  });
+
+  it("does not commit resize dedupe on session-only acks or mismatched request ids", async () => {
+    vi.useFakeTimers();
+    sendResize.mockImplementation((session, cols, rows, { onResult } = {}) => {
+      const id = "resize-race-1";
+      queueMicrotask(() => {
+        // Session-only success without cols/rows must not commit.
+        onResult?.({ ok: true, id: "other-id", session });
+        // Matching id but wrong size must not commit; clears inflight so we retry.
+        onResult?.({
+          ok: true,
+          id,
+          session,
+          cols: cols + 1,
+          rows,
+        });
+      });
+      return { ok: true, id };
+    });
+    await renderTerminal({ interactive: true, hostWidth: 900, hostHeight: 400 });
+    sendResize.mockClear();
+    const host = container.querySelector("[data-terminal-host]");
+    sizeElement(host, 720, 340);
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const callsAfterFirst = sendResize.mock.calls.length;
+    expect(callsAfterFirst).toBeGreaterThanOrEqual(1);
+    // Without a matching id+size ack, the same size must still be retryable.
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+    vi.useRealTimers();
+  });
+
+  it("forces grid resize resend when controlEpoch bumps after reclaim", async () => {
+    vi.useFakeTimers();
+    // Commit lastSentSize on matching acks so a second same-size send would
+    // normally be suppressed — epoch must clear that cache.
+    sendResize.mockImplementation((session, cols, rows, { onResult } = {}) => {
+      const id = `rz-epoch-${cols}x${rows}-${sendResize.mock.calls.length}`;
+      queueMicrotask(() => {
+        onResult?.({
+          ok: true,
+          id,
+          session,
+          cols,
+          rows,
+          error_code: null,
+          error: null,
+        });
+      });
+      return { ok: true, id };
+    });
+    await renderTerminal({ interactive: true, hostWidth: 900, hostHeight: 400 });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const callsAfterMount = sendResize.mock.calls.length;
+    expect(callsAfterMount).toBeGreaterThanOrEqual(1);
+
+    // Same size again without epoch change: dedupe holds (no extra send).
+    sendResize.mockClear();
+    const host = container.querySelector("[data-terminal-host]");
+    sizeElement(host, 900, 400);
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize.mock.calls.length).toBe(0);
+
+    // Reclaim bumps controlEpoch for this session → must re-send current grid.
+    ioState = {
+      ...ioState,
+      interactive: true,
+      controlEpochs: { "gbt-1": 1 },
+    };
+    await act(async () => {
+      root.render(
+        <I18nProvider initialLocale="en">
+          <TerminalIOContext.Provider value={ioState}>
+            <Terminal
+              id="gbt-1"
+              heightKey="client:test-group"
+              rows={24}
+              cols={80}
+              label="term"
+            />
+          </TerminalIOContext.Provider>
+        </I18nProvider>,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(sendResize.mock.calls.length).toBeGreaterThanOrEqual(1);
     vi.useRealTimers();
   });
 });

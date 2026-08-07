@@ -72,6 +72,9 @@ export default {
   "error.timeout": "Anfrage zeitüberschritten; automatischer erneuter Versuch",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "WebUI-Zugriff verweigert (fehlende oder abgelaufene Capability). Führen Sie grok-bridge server ui erneut aus oder öffnen Sie die von diesem Runtime gedruckte Bootstrap-URL und laden Sie neu. Nach einem Runtime-Neustart genügt reines Aktualisieren nicht.",
+
   "activity.working": "Aktiv",
   "activity.waiting": "Wartet",
   "activity.done": "Fertig",
@@ -82,12 +85,14 @@ export default {
   "client.connected": "Codex verbunden",
   "client.disconnected": "Codex getrennt",
   "client.orphaned": "Wartet auf Auto-Bereinigung",
+  "client.webControlled": "WebUI hält (Codex offline)",
   "client.closing": "Wird bereinigt",
   "client.unknown": "Unbekannt",
 
   "lifecycle.unmanaged": "Nicht verwaltet",
   "lifecycle.connected": "Supervisor verbunden",
   "lifecycle.disconnected": "Supervisor getrennt",
+  "lifecycle.webControlled": "Von interaktiver WebUI gehalten",
   "lifecycle.orphaned": "Bereinigungs-Countdown",
   "lifecycle.closing": "Bereinigung",
   "lifecycle.unknown": "Unbekannt",
@@ -124,6 +129,10 @@ export default {
     "Supervisor offline — noch kein Schließen",
   "session.lifecycle.disconnectedBody":
     "Running- oder Waiting-Phasen werden nie automatisch geschlossen. Die Karenz beginnt erst nach sicherem Idle oder Endzustand.",
+  "session.lifecycle.webControlledTitle":
+    "Codex offline — interaktive WebUI hält diese Sitzung",
+  "session.lifecycle.webControlledBody":
+    "Schreibkontrolle und Heartbeats verzögern die Auto-Bereinigung vorübergehend. Freigabe, Nur-Lesen, Trennung oder 15s Leerlauf beenden den Hold und starten die Grace-Zeit neu.",
   "session.lifecycle.orphanedTitle": "Auto-Schließen-Countdown",
   "session.lifecycle.orphanedCountdown":
     "Bereinigungsberechtigt in {remaining}",

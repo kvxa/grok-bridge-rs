@@ -93,6 +93,50 @@ describe("session grouping", () => {
       "1 waiting",
     );
   });
+
+  it("prioritizes attention groups and updates order for later same-working Hooks", () => {
+    const first = {
+      session: "first",
+      owner: "First",
+      client_session_id: "client-first",
+      phase: "running",
+      activity: "working",
+      hook_at_ms: 100,
+      created_at_ms: 1,
+    };
+    const second = {
+      session: "second",
+      owner: "Second",
+      client_session_id: "client-second",
+      phase: "idle",
+      activity: "done",
+      updated_at_ms: 300,
+      created_at_ms: 1,
+    };
+    expect(groupSessions([second, first]).map(([key]) => key)).toEqual([
+      "client:client-first",
+      "client:client-second",
+    ]);
+
+    expect(
+      groupSessions([
+        first,
+        {
+          ...second,
+          phase: "running",
+          activity: "working",
+          hook_at_ms: 200,
+        },
+      ]).map(([key]) => key),
+    ).toEqual(["client:client-second", "client:client-first"]);
+
+    expect(
+      groupSessions([
+        { ...first, hook_at_ms: 400 },
+        { ...second, phase: "running", activity: "working", hook_at_ms: 200 },
+      ]).map(([key]) => key),
+    ).toEqual(["client:client-first", "client:client-second"]);
+  });
 });
 
 describe("localized labels and times", () => {
@@ -214,6 +258,16 @@ describe("lifecycle hint model", () => {
     expect(lifecycleHintModel({ client_state: "closing" })).toEqual({
       kind: "closing",
     });
+    expect(lifecycleHintModel({ client_state: "web_controlled" })).toEqual({
+      kind: "web_controlled",
+    });
+    expect(
+      dominantClientState([
+        { client_state: "disconnected" },
+        { client_state: "web_controlled" },
+      ]),
+    ).toBe("web_controlled");
+
     expect(
       lifecycleCollapsedSummary({ client_state: "closing" }, t, "en"),
     ).toBe("Closing now");

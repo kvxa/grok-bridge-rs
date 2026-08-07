@@ -8,9 +8,17 @@ import {
 import { createTranslator } from "./i18n/translate.js";
 
 export const STOPPED_PHASES = new Set(["exited", "failed", "stopped"]);
+export const GROUP_PHASE = Object.freeze({
+  ATTENTION: "attention",
+  CLEAN_DONE: "clean-done",
+});
+
+const CLEAN_DONE_ACTIVITIES = new Set(["done", "stopped"]);
 
 export function activityOf(session) {
   if (STOPPED_PHASES.has(session.phase)) return "stopped";
+  // Cancelling is not clean-done; keep it out of the done bucket.
+  if (session.activity === "cancelling") return "working";
   if (session.activity && session.activity !== "unknown") {
     return session.activity;
   }
@@ -40,6 +48,93 @@ export function sessionGroupKey(session) {
     : ownerKey(session.owner ?? null);
 }
 
+export function isCleanDoneActivity(activity) {
+  return CLEAN_DONE_ACTIVITIES.has(activity);
+}
+
+export function groupPhase(sessions) {
+  return sessions.length > 0 &&
+    sessions.every((session) => isCleanDoneActivity(activityOf(session)))
+    ? GROUP_PHASE.CLEAN_DONE
+    : GROUP_PHASE.ATTENTION;
+}
+
+/** Session timestamps that represent work, output, or completion, not lease noise. */
+export function sessionSemanticActiveAt(session) {
+  // New runtimes publish a timestamp that excludes lease/control/resize noise.
+  // completed_at_ms orders clean-done cycles without treating later bookkeeping
+  // as a new completion. Keep legacy field fallbacks for older Runtime binaries.
+  if (
+    typeof session.semantic_active_at_ms === "number" &&
+    Number.isFinite(session.semantic_active_at_ms)
+  ) {
+    const values = [session.semantic_active_at_ms, session.created_at_ms];
+    if (isCleanDoneActivity(activityOf(session))) {
+      values.push(session.completed_at_ms);
+    }
+    return values.reduce((latest, value) => {
+      if (typeof value !== "number" || !Number.isFinite(value)) return latest;
+      return Math.max(latest, value);
+    }, 0);
+  }
+
+  const values = [session.hook_at_ms, session.last_output_at_ms];
+  if (isCleanDoneActivity(activityOf(session))) values.push(session.updated_at_ms);
+  values.push(session.created_at_ms);
+
+  return values.reduce((latest, value) => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return latest;
+    return Math.max(latest, value);
+  }, 0);
+}
+
+export function groupSemanticActiveAt(sessions) {
+  return sessions.reduce(
+    (latest, session) => Math.max(latest, sessionSemanticActiveAt(session)),
+    0,
+  );
+}
+
+export function sessionSetSignature(sessions) {
+  return JSON.stringify(
+    sessions
+      .map((session) => session.session)
+      .filter((session) => typeof session === "string")
+      .sort(),
+  );
+}
+
+export function isRealSupervisorGroup(sessions) {
+  return sessions.some(
+    (session) =>
+      typeof session.client_session_id === "string" &&
+      session.client_session_id.length > 0,
+  );
+}
+
+export function compareGroupEntries(left, right, locale = "en") {
+  const leftSessions = left[1];
+  const rightSessions = right[1];
+  const leftPhase = groupPhase(leftSessions);
+  const rightPhase = groupPhase(rightSessions);
+  if (leftPhase !== rightPhase) {
+    return leftPhase === GROUP_PHASE.ATTENTION ? -1 : 1;
+  }
+
+  const leftActiveAt = groupSemanticActiveAt(leftSessions);
+  const rightActiveAt = groupSemanticActiveAt(rightSessions);
+  if (leftActiveAt !== rightActiveAt) {
+    return rightActiveAt > leftActiveAt ? 1 : -1;
+  }
+
+  const ownerOrder = String(leftSessions[0]?.owner ?? "").localeCompare(
+    String(rightSessions[0]?.owner ?? ""),
+    locale,
+  );
+  if (ownerOrder !== 0) return ownerOrder;
+  return String(left[0]).localeCompare(String(right[0]), locale);
+}
+
 export function groupSessions(sessions, locale = "en") {
   const grouped = new Map();
   for (const session of sessions) {
@@ -47,11 +142,8 @@ export function groupSessions(sessions, locale = "en") {
     if (!grouped.has(key)) grouped.set(key, []);
     grouped.get(key).push(session);
   }
-  return [...grouped.entries()].sort(([, left], [, right]) =>
-    String(left[0]?.owner ?? "").localeCompare(
-      String(right[0]?.owner ?? ""),
-      locale,
-    ),
+  return [...grouped.entries()].sort((left, right) =>
+    compareGroupEntries(left, right, locale),
   );
 }
 
@@ -72,6 +164,7 @@ export function clientStateLabel(state, t = createTranslator("en")) {
     connected: "client.connected",
     disconnected: "client.disconnected",
     orphaned: "client.orphaned",
+    web_controlled: "client.webControlled",
     closing: "client.closing",
   }[state];
   return key ? t(key) : t("client.unknown");
@@ -84,6 +177,7 @@ export function clientLifecycle(state) {
       unmanaged: "unmanaged",
       connected: "connected",
       disconnected: "disconnected",
+      web_controlled: "web_held",
       orphaned: "cleanup",
       closing: "cleanup",
     }[state] ?? "unknown"
@@ -95,6 +189,7 @@ export function clientLifecycleLabel(state, t = createTranslator("en")) {
     unmanaged: "lifecycle.unmanaged",
     connected: "lifecycle.connected",
     disconnected: "lifecycle.disconnected",
+    web_controlled: "lifecycle.webControlled",
     orphaned: "lifecycle.orphaned",
     closing: "lifecycle.closing",
   }[state];
@@ -105,6 +200,7 @@ export function dominantClientState(sessions) {
   const priority = [
     "closing",
     "orphaned",
+    "web_controlled",
     "disconnected",
     "connected",
     "unmanaged",
@@ -181,6 +277,10 @@ export function lifecycleHintModel(session) {
   if (state === "disconnected") {
     return { kind: "disconnected" };
   }
+  // Codex offline but interactive WebUI write control is temporarily holding.
+  if (state === "web_controlled") {
+    return { kind: "web_controlled" };
+  }
   if (state === "orphaned") {
     return { kind: "orphaned", deadlineMs };
   }
@@ -236,6 +336,9 @@ export function sessionsSignature(sessions) {
       session.cwd,
       session.process_id,
       session.updated_at_ms,
+      session.semantic_active_at_ms,
+      session.completed_at_ms,
+      session.last_output_at_ms,
       session.activity,
       session.hook_event,
       session.hook_at_ms,

@@ -69,6 +69,9 @@ export default {
   "error.timeout": "请求超时，正在自动重试",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "WebUI 访问被拒绝（能力令牌缺失或已失效）。请重新运行 grok-bridge server ui，或打开本次 Runtime 打印的引导链接后再刷新。Runtime 重启后仅刷新页面无法恢复。",
+
   "activity.working": "工作中",
   "activity.waiting": "等待输入",
   "activity.done": "已完成",
@@ -79,12 +82,14 @@ export default {
   "client.connected": "Codex 在线",
   "client.disconnected": "Codex 已断开",
   "client.orphaned": "等待自动关闭",
+  "client.webControlled": "WebUI 暂持（Codex 已断开）",
   "client.closing": "正在关闭",
   "client.unknown": "未知",
 
   "lifecycle.unmanaged": "未托管",
   "lifecycle.connected": "监督者在线",
   "lifecycle.disconnected": "监督者已断开",
+  "lifecycle.webControlled": "交互 WebUI 暂持",
   "lifecycle.orphaned": "自动关闭倒计时",
   "lifecycle.closing": "关闭中",
   "lifecycle.unknown": "状态未知",
@@ -122,6 +127,10 @@ export default {
   "session.lifecycle.disconnectedTitle": "监督者连接已断开",
   "session.lifecycle.disconnectedBody":
     "会话处于工作中或等待输入状态时不会自动关闭；进入空闲或结束状态后，才会开始自动关闭倒计时。",
+  "session.lifecycle.webControlledTitle":
+    "Codex 已断开 — 交互 WebUI 正在暂持此会话",
+  "session.lifecycle.webControlledBody":
+    "写控制权与心跳会暂时推迟自动清理。释放控制、切回只读、断线或 15 秒无心跳后，清理宽限期从撤销时刻重新起算。",
   "session.lifecycle.orphanedTitle": "自动关闭倒计时",
   "session.lifecycle.orphanedCountdown": "预计 {remaining} 后自动关闭",
   "session.lifecycle.orphanedCountdownDue":

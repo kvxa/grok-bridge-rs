@@ -19,6 +19,17 @@ const MAX_TERMINAL_COLS: u16 = 500;
 const MIN_TERMINAL_ROWS: u16 = 5;
 const MAX_TERMINAL_ROWS: u16 = 200;
 
+/// `Request::Read.wait_ms`: `0` means return immediately (no block).
+pub(crate) const MIN_READ_WAIT_MS: u64 = 0;
+/// Upper bound for read blocking wait (5 minutes). Reject above this at decode.
+pub(crate) const MAX_READ_WAIT_MS: u64 = 300_000;
+/// Default when `Request::Wait.timeout_ms` is omitted.
+pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: u64 = 300_000;
+/// `Request::Wait.timeout_ms` must be ≥ 1 ms when provided.
+pub(crate) const MIN_WAIT_TIMEOUT_MS: u64 = 1;
+/// Upper bound for wait timeout (2 hours). Reject above this at decode.
+pub(crate) const MAX_WAIT_TIMEOUT_MS: u64 = 7_200_000;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RequestEnvelope {
@@ -112,6 +123,8 @@ pub(crate) enum HookActivity {
     Unknown,
     Working,
     Waiting,
+    /// Ctrl-C / interrupt accepted but not yet confirmed complete by hooks/title/exit.
+    Cancelling,
     Done,
 }
 
@@ -230,9 +243,15 @@ pub(crate) enum SessionPhase {
 pub(crate) enum ClientLeaseState {
     #[default]
     Unmanaged,
+    /// Codex client lease is fresh.
     Connected,
+    /// Codex lease expired; phase not yet safe for orphan cleanup.
     Disconnected,
+    /// Codex lease expired and phase is cleanup-safe; grace countdown active.
     Orphaned,
+    /// Interactive WebUI holds write control after Codex disconnect — temporary
+    /// keep-alive only (not a forged Codex "connected" state).
+    WebControlled,
     Closing,
 }
 
@@ -270,6 +289,13 @@ pub(crate) struct SessionState {
     pub(crate) last_output_at_ms: Option<u64>,
     pub(crate) created_at_ms: u64,
     pub(crate) updated_at_ms: u64,
+    /// Last work/output/input/completion signal. Lease, control, and viewport
+    /// bookkeeping must not change this timestamp.
+    #[serde(default)]
+    pub(crate) semantic_active_at_ms: u64,
+    /// Most recent transition into Idle or a terminal phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) completed_at_ms: Option<u64>,
     pub(crate) exit_code: Option<u32>,
     pub(crate) error: Option<String>,
     #[serde(default)]
@@ -322,12 +348,20 @@ impl WebEventsMessage {
 }
 
 /// One terminal payload inside a `WebEventsMessage`.
-/// `reset=true` carries a full ANSI snapshot; `reset=false` is raw PTY delta.
+///
+/// - `reset=true`: first piece of an authoritative ANSI snapshot (client must
+///   `term.reset()` then write).
+/// - `reset_cont=true`: later piece of the same snapshot after WS frame split
+///   (append only; **not** a PTY delta — clients must not overflow-resync).
+/// - both false: raw PTY delta.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TerminalStreamEntry {
     pub(crate) session: String,
     pub(crate) reset: bool,
+    /// Continuation of a multi-frame `reset` snapshot (see `split_terminal_entry_to_fit`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) reset_cont: bool,
     pub(crate) cursor: u64,
     pub(crate) next_cursor: u64,
     pub(crate) data_base64: String,
@@ -338,6 +372,7 @@ impl TerminalStreamEntry {
         Self {
             session: state.session.clone(),
             reset: true,
+            reset_cont: false,
             cursor: 0,
             next_cursor: state.last_cursor,
             data_base64: state.screen_ansi_base64.clone(),
@@ -348,6 +383,7 @@ impl TerminalStreamEntry {
         Self {
             session: read.session.clone(),
             reset: false,
+            reset_cont: false,
             cursor: read.cursor,
             next_cursor: read.next_cursor,
             data_base64: read.data_base64.clone(),
@@ -385,6 +421,20 @@ pub(crate) fn decode_request(frame: &[u8]) -> Result<RequestEnvelope> {
     }
     validate_request(&envelope.request)?;
     Ok(envelope)
+}
+
+/// Recover a client request id for error responses when full `decode_request` fails.
+///
+/// Only returns an id that passes the same `validate_identifier` rules as a
+/// successful decode. Malformed JSON, missing `id`, oversized/untrusted ids, or
+/// multi-frame input yield `None` so the caller can use a fixed safe id.
+/// Does not validate the request body or relax any parameter / frame limits.
+pub(crate) fn extract_validated_request_id(frame: &[u8]) -> Option<String> {
+    let payload = single_frame_payload(frame).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let id = value.get("id")?.as_str()?;
+    validate_identifier(id, "request id").ok()?;
+    Some(id.to_owned())
 }
 
 pub(crate) fn decode_response(frame: &[u8]) -> Result<ResponseEnvelope> {
@@ -476,17 +526,37 @@ fn validate_request(request: &Request) -> Result<()> {
         | Request::Wait { session, .. }
         | Request::Close { session } => {
             validate_identifier(session, "session handle")?;
-            if let Request::Read {
-                limit: Some(limit), ..
-            } = request
-                && (*limit == 0 || *limit > MAX_READ_LIMIT)
-            {
-                bail!("read limit must be between 1 and {MAX_READ_LIMIT}");
+            if let Request::Read { limit, wait_ms, .. } = request {
+                if let Some(limit) = limit
+                    && (*limit == 0 || *limit > MAX_READ_LIMIT)
+                {
+                    bail!("read limit must be between 1 and {MAX_READ_LIMIT}");
+                }
+                if let Some(wait_ms) = wait_ms
+                    && *wait_ms > MAX_READ_WAIT_MS
+                {
+                    bail!(
+                        "wait_ms must be between {MIN_READ_WAIT_MS} and {MAX_READ_WAIT_MS} (0 = non-blocking)"
+                    );
+                }
             }
-            if let Request::Send { input, .. } = request
-                && input.is_empty()
+            if let Request::Wait {
+                timeout_ms: Some(timeout_ms),
+                ..
+            } = request
+                && !(*timeout_ms >= MIN_WAIT_TIMEOUT_MS && *timeout_ms <= MAX_WAIT_TIMEOUT_MS)
             {
-                bail!("terminal input must not be empty");
+                bail!("timeout_ms must be between {MIN_WAIT_TIMEOUT_MS} and {MAX_WAIT_TIMEOUT_MS}");
+            }
+            if let Request::Send { input, .. } = request {
+                if input.is_empty() {
+                    bail!("terminal input must not be empty");
+                }
+                // Same UTF-8 byte cap as raw write so a single Send cannot near
+                // the 1 MiB frame and inflate every session writer queue.
+                if input.len() > MAX_WRITE_BYTES {
+                    bail!("terminal input exceeds the 64 KiB limit");
+                }
             }
             if let Request::Write { data_base64, .. } = request {
                 decode_write_data(data_base64)?;
@@ -579,6 +649,15 @@ fn validate_session_state(session: &SessionState) -> Result<()> {
     }
     if session.updated_at_ms < session.created_at_ms {
         bail!("session updated_at_ms predates created_at_ms");
+    }
+    if session.semantic_active_at_ms != 0 && session.semantic_active_at_ms < session.created_at_ms {
+        bail!("session semantic_active_at_ms predates created_at_ms");
+    }
+    if session
+        .completed_at_ms
+        .is_some_and(|completed| completed < session.created_at_ms)
+    {
+        bail!("session completed_at_ms predates created_at_ms");
     }
     validate_terminal_size(session.cols, session.rows)?;
     BASE64
@@ -848,6 +927,46 @@ mod tests {
     }
 
     #[test]
+    fn extract_validated_request_id_keeps_trusted_ids_only() {
+        let ok = RequestEnvelope {
+            id: "req-abc-1".to_owned(),
+            client_session_id: None,
+            request: Request::Read {
+                session: "gbt-1".to_owned(),
+                cursor: Some(0),
+                limit: Some(262_144),
+                wait_ms: None,
+            },
+        };
+        let frame = encode_frame(&ok).unwrap();
+        assert!(
+            decode_request(&frame).is_err(),
+            "oversized limit must fail decode"
+        );
+        assert_eq!(
+            extract_validated_request_id(&frame).as_deref(),
+            Some("req-abc-1")
+        );
+
+        assert!(
+            extract_validated_request_id(
+                br#"{"id":"bad id","request":{"method":"server_status"}}"#
+            )
+            .is_none()
+        );
+        assert!(
+            extract_validated_request_id(br#"{"request":{"method":"server_status"}}"#).is_none()
+        );
+        assert!(extract_validated_request_id(b"not-json\n").is_none());
+        let mut multi = frame.clone();
+        multi.extend_from_slice(&frame);
+        assert!(
+            extract_validated_request_id(&multi).is_none(),
+            "multi-frame input is untrusted"
+        );
+    }
+
+    #[test]
     fn validates_optional_session_owner() {
         let request = |owner: Option<String>| RequestEnvelope {
             id: "request-1".to_owned(),
@@ -940,6 +1059,44 @@ mod tests {
             let request = hook_request(valid_provider_session_id(), event);
             assert!(decode_request(&encode_frame(&request).unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn validates_read_wait_ms_and_wait_timeout_ms_bounds() {
+        let read = |wait_ms: Option<u64>| RequestEnvelope {
+            id: "request-1".to_owned(),
+            client_session_id: None,
+            request: Request::Read {
+                session: "session-1".to_owned(),
+                cursor: Some(0),
+                limit: Some(100),
+                wait_ms,
+            },
+        };
+        let wait = |timeout_ms: Option<u64>| RequestEnvelope {
+            id: "request-1".to_owned(),
+            client_session_id: None,
+            request: Request::Wait {
+                session: "session-1".to_owned(),
+                for_condition: WaitCondition::TuiIdle,
+                timeout_ms,
+            },
+        };
+
+        // Read wait_ms: 0 and MAX are valid; above MAX is rejected.
+        assert!(decode_request(&encode_frame(&read(Some(0))).unwrap()).is_ok());
+        assert!(decode_request(&encode_frame(&read(Some(MAX_READ_WAIT_MS))).unwrap()).is_ok());
+        assert!(decode_request(&encode_frame(&read(Some(MAX_READ_WAIT_MS + 1))).unwrap()).is_err());
+        assert!(decode_request(&encode_frame(&read(None)).unwrap()).is_ok());
+
+        // Wait timeout_ms: 1 and MAX valid; 0 and MAX+1 rejected; None = default later.
+        assert!(decode_request(&encode_frame(&wait(Some(MIN_WAIT_TIMEOUT_MS))).unwrap()).is_ok());
+        assert!(decode_request(&encode_frame(&wait(Some(MAX_WAIT_TIMEOUT_MS))).unwrap()).is_ok());
+        assert!(decode_request(&encode_frame(&wait(Some(0))).unwrap()).is_err());
+        assert!(
+            decode_request(&encode_frame(&wait(Some(MAX_WAIT_TIMEOUT_MS + 1))).unwrap()).is_err()
+        );
+        assert!(decode_request(&encode_frame(&wait(None)).unwrap()).is_ok());
     }
 
     #[test]
@@ -1120,6 +1277,7 @@ mod tests {
             (HookActivity::Unknown, "\"unknown\""),
             (HookActivity::Working, "\"working\""),
             (HookActivity::Waiting, "\"waiting\""),
+            (HookActivity::Cancelling, "\"cancelling\""),
             (HookActivity::Done, "\"done\""),
         ];
         for (activity, expected) in activities {
@@ -1155,6 +1313,8 @@ mod tests {
                 last_output_at_ms: Some(15),
                 created_at_ms: 20,
                 updated_at_ms: 10,
+                semantic_active_at_ms: 20,
+                completed_at_ms: None,
                 exit_code: None,
                 error: None,
                 activity: HookActivity::Waiting,
@@ -1207,6 +1367,8 @@ mod tests {
             last_output_at_ms: None,
             created_at_ms: 1,
             updated_at_ms: 1,
+            semantic_active_at_ms: 1,
+            completed_at_ms: Some(1),
             exit_code: None,
             error: None,
             activity: HookActivity::Unknown,

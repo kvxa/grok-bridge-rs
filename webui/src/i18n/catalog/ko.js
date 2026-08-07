@@ -69,6 +69,9 @@ export default {
   "error.timeout": "요청 시간 초과, 자동으로 다시 시도 중",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "WebUI 접근이 거부되었습니다(capability 누락 또는 만료). grok-bridge server ui를 다시 실행하거나 이 Runtime이 출력한 부트스트랩 URL을 연 뒤 새로고침하세요. Runtime 재시작 후에는 새로고침만으로는 복구할 수 없습니다.",
+
   "activity.working": "작업 중",
   "activity.waiting": "입력 대기",
   "activity.done": "완료",
@@ -79,12 +82,14 @@ export default {
   "client.connected": "Codex 온라인",
   "client.disconnected": "Codex 연결 끊김",
   "client.orphaned": "자동 정리 대기",
+  "client.webControlled": "WebUI 유지 중(Codex 오프라인)",
   "client.closing": "정리 중",
   "client.unknown": "알 수 없음",
 
   "lifecycle.unmanaged": "관리되지 않음",
   "lifecycle.connected": "슈퍼바이저 온라인",
   "lifecycle.disconnected": "슈퍼바이저 오프라인",
+  "lifecycle.webControlled": "대화형 WebUI가 유지",
   "lifecycle.orphaned": "정리 카운트다운",
   "lifecycle.closing": "정리 중",
   "lifecycle.unknown": "알 수 없음",
@@ -124,6 +129,10 @@ export default {
     "슈퍼바이저 오프라인 — 아직 종료하지 않음",
   "session.lifecycle.disconnectedBody":
     "Running / Waiting 단계는 자동 종료되지 않습니다. 안전한 Idle 또는 종료 상태 이후에만 유예가 시작됩니다.",
+  "session.lifecycle.webControlledTitle":
+    "Codex 오프라인 — 대화형 WebUI가 이 세션을 유지 중",
+  "session.lifecycle.webControlledBody":
+    "쓰기 제어와 하트비트가 자동 정리를 잠시 미룹니다. 해제, 읽기 전용, 연결 끊김 또는 15초 유휴 시 유지가 끝나고 유예가 다시 시작됩니다.",
   "session.lifecycle.orphanedTitle": "자동 종료 카운트다운",
   "session.lifecycle.orphanedCountdown":
     "{remaining} 후 정리 대상이 됩니다",

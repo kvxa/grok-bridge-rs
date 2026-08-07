@@ -69,6 +69,9 @@ export default {
   "error.timeout": "คำขอหมดเวลา จะลองใหม่อัตโนมัติ",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "ปฏิเสธการเข้าถึง WebUI (capability หายหรือหมดอายุ) ให้รัน grok-bridge server ui อีกครั้ง หรือเปิด URL bootstrap ที่ Runtime นี้พิมพ์ แล้วโหลดใหม่ หลัง Runtime รีสตาร์ท การรีเฟรชอย่างเดียวไม่สามารถกู้คืนได้",
+
   "activity.working": "กำลังทำงาน",
   "activity.waiting": "รออินพุต",
   "activity.done": "เสร็จ",
@@ -79,12 +82,14 @@ export default {
   "client.connected": "Codex ออนไลน์",
   "client.disconnected": "Codex ตัดการเชื่อมต่อ",
   "client.orphaned": "รอการล้างอัตโนมัติ",
+  "client.webControlled": "WebUI กำลังถือ (Codex ออฟไลน์)",
   "client.closing": "กำลังล้าง",
   "client.unknown": "ไม่ทราบ",
 
   "lifecycle.unmanaged": "ไม่มีการจัดการ",
   "lifecycle.connected": "ซูเปอร์ไวเซอร์ออนไลน์",
   "lifecycle.disconnected": "ซูเปอร์ไวเซอร์ออฟไลน์",
+  "lifecycle.webControlled": "ถูก WebUI แบบโต้ตอบถือไว้",
   "lifecycle.orphaned": "นับถอยหลังการล้าง",
   "lifecycle.closing": "กำลังล้าง",
   "lifecycle.unknown": "ไม่ทราบ",
@@ -123,6 +128,10 @@ export default {
   "session.lifecycle.disconnectedTitle": "ซูเปอร์ไวเซอร์ออฟไลน์ — ยังไม่ปิด",
   "session.lifecycle.disconnectedBody":
     "ขั้น Running หรือ Waiting จะไม่ถูกปิดอัตโนมัติ ระยะผ่อนผันเริ่มหลังถึงสถานะ Idle หรือสถานะปลายทางที่ปลอดภัยเท่านั้น",
+  "session.lifecycle.webControlledTitle":
+    "Codex ออฟไลน์ — WebUI แบบโต้ตอบกำลังถือเซสชันนี้",
+  "session.lifecycle.webControlledBody":
+    "การควบคุมการเขียนและ heartbeat ชะลอการล้างอัตโนมัติชั่วคราว ปล่อย โหมดอ่านอย่างเดียว ตัดการเชื่อมต่อ หรือว่าง 15 วินาทีจะสิ้นสุดการถือและเริ่มนับช่วงผ่อนผันใหม่",
   "session.lifecycle.orphanedTitle": "นับถอยหลังปิดอัตโนมัติ",
   "session.lifecycle.orphanedCountdown": "มีสิทธิ์ล้างใน {remaining}",
   "session.lifecycle.orphanedCountdownDue":

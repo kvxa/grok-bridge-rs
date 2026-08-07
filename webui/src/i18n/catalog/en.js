@@ -69,6 +69,9 @@ export default {
   "error.timeout": "Request timed out; retrying automatically",
   "error.brand": "GROK BRIDGE",
 
+  "capability.forbidden":
+    "WebUI access denied (missing or expired capability). Re-run grok-bridge server ui, or open the bootstrap URL this Runtime printed, then reload. Refresh alone cannot recover after a Runtime restart.",
+
   "activity.working": "Working",
   "activity.waiting": "Waiting",
   "activity.done": "Done",
@@ -79,12 +82,14 @@ export default {
   "client.connected": "Codex online",
   "client.disconnected": "Codex disconnected",
   "client.orphaned": "Awaiting auto-cleanup",
+  "client.webControlled": "WebUI holding (Codex offline)",
   "client.closing": "Cleaning up",
   "client.unknown": "Unknown",
 
   "lifecycle.unmanaged": "Unmanaged",
   "lifecycle.connected": "Supervisor online",
   "lifecycle.disconnected": "Supervisor offline",
+  "lifecycle.webControlled": "Held by interactive WebUI",
   "lifecycle.orphaned": "Cleanup countdown",
   "lifecycle.closing": "Cleaning up",
   "lifecycle.unknown": "Unknown",
@@ -123,6 +128,10 @@ export default {
   "session.lifecycle.disconnectedTitle": "Supervisor offline — not closing yet",
   "session.lifecycle.disconnectedBody":
     "Running or Waiting stages are never auto-closed. Grace starts only after a safe Idle or terminal stage.",
+  "session.lifecycle.webControlledTitle":
+    "Codex offline — interactive WebUI is holding this session",
+  "session.lifecycle.webControlledBody":
+    "Write control and live heartbeats temporarily delay auto-cleanup. Release, read-only, disconnect, or a 15s idle ends the hold and restarts the cleanup grace.",
   "session.lifecycle.orphanedTitle": "Auto-close countdown",
   "session.lifecycle.orphanedCountdown": "Eligible for cleanup in {remaining}",
   "session.lifecycle.orphanedCountdownDue":
