@@ -3740,6 +3740,22 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn wait_for_windows_intermediates_exit(pids: [u32; 2]) {
+        let deadline = Instant::now() + WINDOWS_PROCESS_TREE_TIMEOUT;
+        loop {
+            let states = pids.map(process_alive);
+            if states.iter().all(|state| *state == ScopeAlive::Gone) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "wrapper and short-lived child did not exit within {WINDOWS_PROCESS_TREE_TIMEOUT:?}: pids={pids:?}, states={states:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
     fn wait_for_windows_marker(path: &Path) {
         let deadline = Instant::now() + WINDOWS_PROCESS_TREE_TIMEOUT;
         while !path.exists() {
@@ -5186,8 +5202,11 @@ mod tests {
         assert_ne!(pids[0], pids[1]);
         assert_ne!(pids[1], pids[2]);
         wait_for_windows_marker(&directory.join("wrapper-exited"));
-        assert_eq!(process_alive(pids[0]), ScopeAlive::Gone);
-        assert_eq!(process_alive(pids[1]), ScopeAlive::Gone);
+        // The marker only proves the wrapper wrote it; the wrapper and
+        // short-lived child processes may still be tearing down. Wait for
+        // both to actually exit before asserting Gone, while the grandchild
+        // and the job must remain alive.
+        wait_for_windows_intermediates_exit([pids[0], pids[1]]);
         assert_eq!(process_alive(pids[2]), ScopeAlive::Alive);
         assert_eq!(job.process_scope_alive(), ScopeAlive::Alive);
 
