@@ -1,7 +1,9 @@
+#[cfg(unix)]
+use std::io;
 use std::{
     env,
     ffi::OsString,
-    io::{self, BufRead, BufReader, ErrorKind, Write},
+    io::{BufRead, BufReader, ErrorKind, Write},
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -10,9 +12,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 #[cfg(not(unix))]
 use interprocess::local_socket::GenericNamespaced;
+#[cfg(any(unix, test))]
+use interprocess::local_socket::ListenerOptions;
 #[cfg(unix)]
 use interprocess::local_socket::{GenericFilePath, Listener};
-use interprocess::local_socket::{ListenerOptions, Name, Stream, prelude::*};
+use interprocess::local_socket::{Name, Stream, prelude::*};
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
