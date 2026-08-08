@@ -138,9 +138,10 @@ export function fitTerminalHost(fitAddon, host) {
 
 /**
  * xterm.js terminal driven by the WebSocket feed.
- * terminal_resize follows the visible fit ONLY while keyboard is on; read-only
- * terminals fit locally without ever touching the real PTY.
- * terminal_input is gated strictly by the global interactive switch.
+ * terminal_resize follows the visible fit always (viewport sync): read-only
+ * terminals still publish their grid so the server-side PTY/vt100 screen stays
+ * in step with the local viewport. terminal_input is gated strictly by the
+ * global interactive switch.
  */
 export function Terminal({ id, heightKey, rows, cols, label }) {
   const { t } = useI18n();
@@ -180,8 +181,6 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
 
   const maybeSendResize = useCallback((term) => {
     if (!term) return;
-    // Keyboard off: pure read-only display. Fit locally, never resize the PTY.
-    if (!interactiveRef.current) return;
     if (!canFitElement(hostRef.current)) return;
     const { cols: nextCols, rows: nextRows } = clampTerminalGrid(
       term.cols,
@@ -386,7 +385,7 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
 
   // Any Keyboard mode transition invalidates the previous PTY-size claim.
   // Turning the mode back on schedules a fresh idempotent resize; turning it
-  // off remains observational and never sends a resize.
+  // off just clears the claim — the next fit still re-publishes the size.
   const previousInteractiveRef = useRef(interactive);
   useEffect(() => {
     const previous = previousInteractiveRef.current;

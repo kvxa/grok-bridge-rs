@@ -617,7 +617,7 @@ describe("Terminal (xterm read-only)", () => {
     expect(sendInput).not.toHaveBeenCalled();
   });
 
-  it("never sends terminal_resize while read-only but still fits locally", async () => {
+  it("still sends terminal_resize while read-only but never terminal_input", async () => {
     vi.useFakeTimers();
     await renderTerminal({ interactive: false, hostWidth: 900, hostHeight: 400 });
     sendResize.mockClear();
@@ -633,10 +633,11 @@ describe("Terminal (xterm read-only)", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
-    // Local display still adapts…
+    // The local grid re-fits and the new size is published to the PTY so the
+    // server-side vt100 screen stays in step with the read-only viewport.
     expect(fit.fitCount).toBeGreaterThan(fitsBefore);
-    // …but the real PTY is never resized and input is never registered.
-    expect(sendResize).not.toHaveBeenCalled();
+    expect(sendResize).toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
     MockXTerm.instances[0].emitData("typed-while-readonly");
     expect(sendInput).not.toHaveBeenCalled();
     vi.useRealTimers();
@@ -645,7 +646,7 @@ describe("Terminal (xterm read-only)", () => {
   it("clamps extreme fit grids and retries resize after send failure", async () => {
     vi.useFakeTimers();
     sendResize.mockImplementation(() => ({ ok: false, error: "disconnected" }));
-    await renderTerminal({ interactive: true, hostWidth: 20, hostHeight: 20 });
+    await renderTerminal({ interactive: false, hostWidth: 20, hostHeight: 20 });
     const term = MockXTerm.instances[0];
     // Force a sub-minimum fitted grid before clamp.
     term.cols = 2;
@@ -745,7 +746,7 @@ describe("Terminal (xterm read-only)", () => {
 
   it("sends debounced resize when fit changes cols/rows and dedupes successes", async () => {
     vi.useFakeTimers();
-    await renderTerminal({ interactive: true, hostWidth: 900, hostHeight: 400 });
+    await renderTerminal({ interactive: false, hostWidth: 900, hostHeight: 400 });
     sendResize.mockClear();
     const host = container.querySelector("[data-terminal-host]");
     // New host size → FitAddon derives a new grid; Terminal should publish it.
