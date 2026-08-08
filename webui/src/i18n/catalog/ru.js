@@ -167,6 +167,8 @@ export default {
   "interactive.tooLarge": "Объём ввода превышает лимит 64 KiB; ввод отклонён целиком, ничего не отправлено.",
   "interactive.queueFull": "Очередь команд заполнена; ввод отклонён целиком.",
   "interactive.indeterminate": "Не удалось подтвердить доставку ввода; повторная отправка не выполнялась.",
+  "interactive.dismiss": "Скрыть",
+  "interactive.dismissAria": "Скрыть уведомление о неподтверждённом вводе",
 
   "action.confirmCloseSession": "Закрыть {id} и его процесс Grok?",
   "action.closedSession":

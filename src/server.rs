@@ -619,9 +619,9 @@ fn run_events_websocket(websocket: &mut WebSocket<TcpStream>, state: &RuntimeSta
         // Sleep until the next host revision *or* the next pure-time lease
         // transition, but never longer than WEB_EVENTS_CLIENT_POLL so client
         // frames stay low-latency. Timeouts without a revision/lease signal
-        // never push frames. The WebUI is a pure observer here: it never
-        // refreshes Codex leases, so real lease transitions still arrive
-        // promptly for display.
+        // never push frames. The event stream itself never refreshes Codex
+        // leases (only inbound terminal commands do), so real lease
+        // transitions still arrive promptly for display.
         let wait = match lease_deadline {
             Some(deadline) if deadline > now => Duration::from_millis(deadline - now)
                 .min(Duration::from_secs(30))
@@ -774,53 +774,120 @@ enum WebEventsClientCommand {
     },
 }
 
-/// Parse a single WebUI client command without panicking on junk.
-/// Unknown types yield `Ok(None)` (ignored). Malformed known types yield `Err`.
-fn parse_web_events_client_command(text: &str) -> Result<Option<WebEventsClientCommand>, String> {
-    if text.len() > WEB_EVENTS_MAX_MESSAGE_BYTES {
-        return Err("message exceeds size limit".to_owned());
+/// A parse failure that may still carry enough structure — a legal request id,
+/// a recognized command type, and a cleanly extractable session — to correlate
+/// the error result with the browser's pending command. Only messages where
+/// nothing usable can be identified (invalid JSON, non-object, oversized, or a
+/// malformed id) stay id-less with the generic `input_result` type.
+#[derive(Debug)]
+struct WebEventsParseError {
+    message: String,
+    id: Option<String>,
+    session: Option<String>,
+    result_type: &'static str,
+}
+
+impl WebEventsParseError {
+    fn generic(message: impl Into<String>) -> Self {
+        WebEventsParseError {
+            message: message.into(),
+            id: None,
+            session: None,
+            result_type: "input_result",
+        }
     }
-    let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|error| format!("invalid JSON: {error}"))?;
+
+    fn with_context(
+        message: impl Into<String>,
+        id: Option<String>,
+        session: Option<String>,
+        result_type: &'static str,
+    ) -> Self {
+        WebEventsParseError {
+            message: message.into(),
+            id,
+            session,
+            result_type,
+        }
+    }
+}
+
+/// Parse a single WebUI client command without panicking on junk.
+/// Unknown types yield `Ok(None)` (ignored). Malformed known types yield `Err`
+/// carrying the recognized request id and result type when available.
+fn parse_web_events_client_command(
+    text: &str,
+) -> Result<Option<WebEventsClientCommand>, WebEventsParseError> {
+    if text.len() > WEB_EVENTS_MAX_MESSAGE_BYTES {
+        return Err(WebEventsParseError::generic("message exceeds size limit"));
+    }
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| WebEventsParseError::generic(format!("invalid JSON: {error}")))?;
     let Some(object) = value.as_object() else {
-        return Err("message must be a JSON object".to_owned());
+        return Err(WebEventsParseError::generic(
+            "message must be a JSON object",
+        ));
     };
     let message_type = object
         .get("type")
         .and_then(|value| value.as_str())
         .unwrap_or("");
+    // Best-effort extraction before the field checks below, so a malformed
+    // known-shape command can still be settled by its request id and type.
     let id = match object.get("id") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(value)) => {
             if value.len() > WEB_EVENTS_MAX_REQUEST_ID_BYTES {
-                return Err("request id is too long".to_owned());
+                return Err(WebEventsParseError::generic("request id is too long"));
             }
             Some(value.clone())
         }
-        Some(_) => return Err("request id must be a string".to_owned()),
+        Some(_) => return Err(WebEventsParseError::generic("request id must be a string")),
+    };
+    let session = object
+        .get("session")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let result_type = match message_type {
+        "terminal_input" => "input_result",
+        "terminal_resize" => "resize_result",
+        // Unknown / push-only types (e.g. future clients): ignore safely.
+        _ => return Ok(None),
+    };
+    // Errors past this point keep the recognized id/session/type so the
+    // browser can release its pending entry and see a correlated failure.
+    // The closure owns its own clones so `id` below can still be moved into
+    // the command variants.
+    let context_error = {
+        let id = id.clone();
+        let session = session.clone();
+        move |message: String| {
+            WebEventsParseError::with_context(message, id.clone(), session.clone(), result_type)
+        }
     };
 
     match message_type {
         "terminal_input" => {
             let Some(id) = id else {
-                return Err("request id is required".to_owned());
+                return Err(context_error("request id is required".to_owned()));
             };
             if id.is_empty() {
-                return Err("request id is required".to_owned());
+                return Err(context_error("request id is required".to_owned()));
             }
             let session = object
                 .get("session")
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_owned();
-            validate_session_handle(&session).map_err(|error| format!("{error:#}"))?;
+            validate_session_handle(&session).map_err(|err| context_error(format!("{err:#}")))?;
             let data_base64 = object
                 .get("data_base64")
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_owned();
             if data_base64.is_empty() {
-                return Err("data_base64 is required".to_owned());
+                return Err(context_error("data_base64 is required".to_owned()));
             }
             Ok(Some(WebEventsClientCommand::TerminalInput {
                 id,
@@ -830,27 +897,29 @@ fn parse_web_events_client_command(text: &str) -> Result<Option<WebEventsClientC
         }
         "terminal_resize" => {
             let Some(id) = id else {
-                return Err("request id is required".to_owned());
+                return Err(context_error("request id is required".to_owned()));
             };
             if id.is_empty() {
-                return Err("request id is required".to_owned());
+                return Err(context_error("request id is required".to_owned()));
             }
             let session = object
                 .get("session")
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_owned();
-            validate_session_handle(&session).map_err(|error| format!("{error:#}"))?;
+            validate_session_handle(&session).map_err(|err| context_error(format!("{err:#}")))?;
             let cols = object
                 .get("cols")
                 .and_then(|value| value.as_u64())
-                .ok_or_else(|| "cols is required".to_owned())?;
+                .ok_or_else(|| context_error("cols is required".to_owned()))?;
             let rows = object
                 .get("rows")
                 .and_then(|value| value.as_u64())
-                .ok_or_else(|| "rows is required".to_owned())?;
-            let cols = u16::try_from(cols).map_err(|_| "cols out of range".to_owned())?;
-            let rows = u16::try_from(rows).map_err(|_| "rows out of range".to_owned())?;
+                .ok_or_else(|| context_error("rows is required".to_owned()))?;
+            let cols =
+                u16::try_from(cols).map_err(|_| context_error("cols out of range".to_owned()))?;
+            let rows =
+                u16::try_from(rows).map_err(|_| context_error("rows out of range".to_owned()))?;
             Ok(Some(WebEventsClientCommand::TerminalResize {
                 id,
                 session,
@@ -858,7 +927,6 @@ fn parse_web_events_client_command(text: &str) -> Result<Option<WebEventsClientC
                 rows,
             }))
         }
-        // Unknown / push-only types (e.g. future clients): ignore safely.
         _ => Ok(None),
     }
 }
@@ -1072,18 +1140,20 @@ fn handle_web_events_client_text(
         }
         Err(error) => {
             // Malformed known-shape or generic junk that failed parse: never
-            // touch PTY; return a generic input_result when possible.
-            if send_web_events_command_result(
+            // touch PTY. If the parse preserved a recognized id/type/session,
+            // send a correlated failure so the browser can settle (and release
+            // the admission bytes of) its pending command; fully-unidentifiable
+            // junk falls back to a generic input_result the browser ignores.
+            let sent = send_web_events_command_result(
                 websocket,
-                "input_result",
-                None,
-                None,
+                error.result_type,
+                error.id.as_deref(),
+                error.session.as_deref(),
                 false,
-                Some(&error),
+                Some(&error.message),
                 false,
-            )
-            .is_err()
-            {
+            );
+            if sent.is_err() {
                 WsClientAction::Close
             } else {
                 WsClientAction::Continue
@@ -1914,8 +1984,9 @@ mod tests {
             );
             let err = parse_web_events_client_command(&payload).unwrap_err();
             assert!(
-                err.contains("session handle") || err.contains("session"),
-                "bad={bad:?} err={err}"
+                err.message.contains("session handle") || err.message.contains("session"),
+                "bad={bad:?} err={:?}",
+                err.message
             );
             let resize = format!(
                 r#"{{"type":"terminal_resize","id":"r1","session":{session},"cols":80,"rows":24}}"#,
@@ -1931,6 +2002,70 @@ mod tests {
             .unwrap()
             .is_some()
         );
+    }
+
+    #[test]
+    fn parse_errors_keep_recognized_id_session_and_result_type() {
+        // Malformed known-shape command: the error still carries the request
+        // id, session, and result type so the browser can settle its pending
+        // entry and release the admission bytes it holds.
+        let err = parse_web_events_client_command(
+            r#"{"type":"terminal_input","id":"r1","session":"gbt-1"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.id.as_deref(), Some("r1"));
+        assert_eq!(err.session.as_deref(), Some("gbt-1"));
+        assert_eq!(err.result_type, "input_result");
+        assert!(err.message.contains("data_base64"));
+
+        // Invalid session handle: id and result type survive.
+        let err = parse_web_events_client_command(
+            r#"{"type":"terminal_input","id":"r2","session":"bad id","data_base64":"YQ=="}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.id.as_deref(), Some("r2"));
+        assert_eq!(err.result_type, "input_result");
+        assert_eq!(err.session.as_deref(), Some("bad id"));
+
+        // resize errors keep resize_result.
+        let err = parse_web_events_client_command(
+            r#"{"type":"terminal_resize","id":"r3","session":"gbt-1"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.id.as_deref(), Some("r3"));
+        assert_eq!(err.result_type, "resize_result");
+        assert!(err.message.contains("cols"));
+
+        // Missing id: nothing to correlate, generic fallback type.
+        let err = parse_web_events_client_command(
+            r#"{"type":"terminal_input","session":"gbt-1","data_base64":"YQ=="}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.id, None);
+        assert_eq!(err.session.as_deref(), Some("gbt-1"));
+        assert_eq!(err.result_type, "input_result");
+    }
+
+    #[test]
+    fn generic_parse_errors_stay_id_less_with_input_result_type() {
+        // Junk that carries no recognizable id keeps the generic fallback.
+        for payload in ["not-json", r#"[]"#, r#""plain string""#] {
+            let err = parse_web_events_client_command(payload).unwrap_err();
+            assert_eq!(err.id, None);
+            assert_eq!(err.result_type, "input_result");
+        }
+        // A non-object with an unknown type is ignored, not an error.
+        assert_eq!(
+            parse_web_events_client_command(r#"{"type":7}"#).unwrap(),
+            None
+        );
+        // Oversized / non-string id is also not correlatable.
+        let err = parse_web_events_client_command(
+            r#"{"type":"terminal_input","id":7,"session":"gbt-1","data_base64":"YQ=="}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.id, None);
+        assert_eq!(err.result_type, "input_result");
     }
 
     #[test]

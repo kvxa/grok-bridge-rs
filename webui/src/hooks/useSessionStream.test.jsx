@@ -3,7 +3,11 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { catalogs, I18nProvider } from "../i18n/index.js";
 import { installMockWebSocket, MockWebSocket } from "../test/mockWebSocket.js";
-import { PENDING_COMMANDS_MAX, WS_BACKOFF_MS } from "../utils/constants.js";
+import {
+  PENDING_COMMANDS_MAX,
+  PENDING_COMMANDS_MAX_BYTES,
+  WS_BACKOFF_MS,
+} from "../utils/constants.js";
 import {
   peekTerminalBuffer,
   resetTerminalFeeds,
@@ -449,7 +453,7 @@ describe("useSessionStream", () => {
     await mount();
     const ws = MockWebSocket.instances[0];
     await act(async () => ws.open());
-    for (let i = 0; i < 64; i += 1) {
+    for (let i = 0; i < PENDING_COMMANDS_MAX; i += 1) {
       const result = latest.sendTerminalInput("gbt-1", btoa(`k${i}`));
       expect(result.ok).toBe(true);
     }
@@ -457,22 +461,28 @@ describe("useSessionStream", () => {
     expect(overflow.ok).toBe(false);
     expect(overflow.error).toBe(CLIENT_IO_ERROR.QUEUE_FULL);
     // Nothing for the rejected command entered the socket.
-    expect(ws.sent).toHaveLength(64);
+    expect(ws.sent).toHaveLength(PENDING_COMMANDS_MAX);
   });
 
   it("rejects whole commands when the pending byte budget is exhausted", async () => {
     await mount();
     const ws = MockWebSocket.instances[0];
     await act(async () => ws.open());
-    const big = btoa("b".repeat(52 * 1024));
-    for (let i = 0; i < 3; i += 1) {
+    const rawBytes = Math.floor(PENDING_COMMANDS_MAX_BYTES / 6);
+    const big = btoa("b".repeat(rawBytes));
+    const accepted = Math.min(
+      PENDING_COMMANDS_MAX,
+      Math.floor(PENDING_COMMANDS_MAX_BYTES / big.length),
+    );
+    expect(accepted).toBeGreaterThan(1);
+    for (let i = 0; i < accepted; i += 1) {
       const result = latest.sendTerminalInput("gbt-1", big);
       expect(result.ok).toBe(true);
     }
     const overflow = latest.sendTerminalInput("gbt-1", big);
     expect(overflow.ok).toBe(false);
     expect(overflow.error).toBe(CLIENT_IO_ERROR.QUEUE_FULL);
-    expect(ws.sent).toHaveLength(3);
+    expect(ws.sent).toHaveLength(accepted);
   });
 
   it("settles pending commands on their single result and frees the window", async () => {
@@ -480,7 +490,7 @@ describe("useSessionStream", () => {
     const ws = MockWebSocket.instances[0];
     await act(async () => ws.open());
     const ids = [];
-    for (let i = 0; i < 64; i += 1) {
+    for (let i = 0; i < PENDING_COMMANDS_MAX; i += 1) {
       const result = latest.sendTerminalInput("gbt-1", btoa(`k${i}`));
       expect(result.ok).toBe(true);
       ids.push(result.id);
@@ -491,9 +501,84 @@ describe("useSessionStream", () => {
       }
     });
     // Window is reusable after acks.
-    for (let i = 0; i < 64; i += 1) {
+    for (let i = 0; i < PENDING_COMMANDS_MAX; i += 1) {
       expect(latest.sendTerminalInput("gbt-1", btoa(`m${i}`)).ok).toBe(true);
     }
+  });
+
+  it("retires a pending id even when result metadata does not match", async () => {
+    await mount();
+    const ws = MockWebSocket.instances[0];
+    await act(async () => ws.open());
+
+    // Fill the entry window so a released entry is observable via admission.
+    const ids = [];
+    for (let i = 0; i < PENDING_COMMANDS_MAX; i += 1) {
+      const result = latest.sendTerminalInput("gbt-1", btoa(`k${i}`));
+      expect(result.ok).toBe(true);
+      ids.push(result.id);
+    }
+    const target = ids[0];
+    expect(latest.sendTerminalInput("gbt-1", btoa("x")).ok).toBe(false);
+
+    // A known id is retired immediately even when the type is wrong. It must
+    // not notify resize listeners, but it must free the admission slot.
+    await act(async () => {
+      ws.emitMessage({
+        type: "resize_result",
+        ok: true,
+        id: target,
+        session: "gbt-1",
+      });
+      ws.emitMessage({ type: "input_result", ok: true, id: "webui-999" });
+    });
+    expect(latest.sendTerminalInput("gbt-1", btoa("x")).ok).toBe(true);
+
+    // A later matching frame for the retired id is ignored and cannot consume
+    // a second pending command.
+    await act(async () => {
+      ws.emitMessage({
+        type: "input_result",
+        ok: true,
+        id: target,
+        session: "gbt-1",
+      });
+    });
+    expect(latest.sendTerminalInput("gbt-1", btoa("still-full")).ok).toBe(
+      false,
+    );
+  });
+
+  it("releases pending bytes when a known id carries mismatched metadata", async () => {
+    await mount();
+    const ws = MockWebSocket.instances[0];
+    await act(async () => ws.open());
+    // Payload sized under the single-input limits (60 KiB raw → 81920 base64
+    // chars) so the byte budget is what gates admission; how many fit is
+    // derived from PENDING_COMMANDS_MAX_BYTES, never hardcoded.
+    const payload = btoa("b".repeat(60 * 1024));
+    const fits = Math.floor(PENDING_COMMANDS_MAX_BYTES / payload.length);
+    expect(fits).toBeGreaterThanOrEqual(2);
+
+    const sent = [];
+    for (let i = 0; i < fits; i += 1) {
+      const result = latest.sendTerminalInput("gbt-1", payload);
+      expect(result.ok).toBe(true);
+      sent.push(result.id);
+    }
+    expect(latest.sendTerminalInput("gbt-1", payload).ok).toBe(false);
+
+    // The wrong session prevents returning the entry to result handlers, but
+    // the known id still releases its byte budget.
+    await act(async () => {
+      ws.emitMessage({
+        type: "input_result",
+        ok: true,
+        id: sent[0],
+        session: "other-session",
+      });
+    });
+    expect(latest.sendTerminalInput("gbt-1", payload).ok).toBe(true);
   });
 
   it("marks lost input acks as unconfirmed (indeterminate) and never replays", async () => {
@@ -516,5 +601,80 @@ describe("useSessionStream", () => {
     const sent = second.sent.map((item) => JSON.parse(String(item)));
     expect(sent.some((msg) => msg.type === "terminal_input")).toBe(false);
     expect(latest.unconfirmedInputs).toBe(1);
+  });
+
+  it("clearUnconfirmedInputs resets the count and acks never restore it", async () => {
+    await mount();
+    const first = MockWebSocket.instances[0];
+    await act(async () => first.open());
+    const sent = latest.sendTerminalInput("gbt-1", btoa("secret"));
+    expect(sent.ok).toBe(true);
+
+    await act(async () => first.close());
+    expect(latest.unconfirmedInputs).toBe(1);
+
+    await act(async () => {
+      latest.clearUnconfirmedInputs();
+    });
+    expect(latest.unconfirmedInputs).toBe(0);
+
+    // A later result ack for the lost input must not restore the alert.
+    await act(async () => {
+      first.emitMessage({
+        type: "input_result",
+        ok: true,
+        id: sent.id,
+        session: "gbt-1",
+      });
+    });
+    expect(latest.unconfirmedInputs).toBe(0);
+  });
+
+  it("a fresh abandon after dismiss increments the count again", async () => {
+    await mount();
+    const first = MockWebSocket.instances[0];
+    await act(async () => first.open());
+    latest.sendTerminalInput("gbt-1", btoa("a"));
+    await act(async () => first.close());
+    expect(latest.unconfirmedInputs).toBe(1);
+
+    await act(async () => {
+      latest.clearUnconfirmedInputs();
+    });
+    expect(latest.unconfirmedInputs).toBe(0);
+
+    // Reconnect, send a genuinely new input, then lose it: a new batch of
+    // losses must be reported again.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(WS_BACKOFF_MS[0] + 1);
+    });
+    const second = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+    await act(async () => second.open());
+    latest.sendTerminalInput("gbt-1", btoa("b"));
+    await act(async () => second.close());
+    expect(latest.unconfirmedInputs).toBe(1);
+  });
+
+  it("does not re-show the dismissed batch on the reconnect path", async () => {
+    await mount();
+    const first = MockWebSocket.instances[0];
+    await act(async () => first.open());
+    latest.sendTerminalInput("gbt-1", btoa("secret"));
+    await act(async () => first.close());
+    expect(latest.unconfirmedInputs).toBe(1);
+
+    await act(async () => {
+      latest.clearUnconfirmedInputs();
+    });
+    expect(latest.unconfirmedInputs).toBe(0);
+
+    // The reconnect re-abandons nothing (the pending set was already cleared),
+    // so the dismissed alert stays dismissed instead of re-appearing.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(WS_BACKOFF_MS[0] + 1);
+    });
+    const second = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+    await act(async () => second.open());
+    expect(latest.unconfirmedInputs).toBe(0);
   });
 });

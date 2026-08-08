@@ -160,6 +160,8 @@ export default {
   "interactive.tooLarge": "输入超过 64 KiB 上限，已整体拒绝，未发送任何内容。",
   "interactive.queueFull": "命令队列已满，输入已整体拒绝。",
   "interactive.indeterminate": "输入是否送达无法确认，未自动重发。",
+  "interactive.dismiss": "忽略",
+  "interactive.dismissAria": "忽略未确认输入提示",
 
   "action.confirmCloseSession": "确定要关闭会话 {id} 及其 Grok 进程吗？",
   "action.closedSession": "已关闭 Grok 会话 {id}，状态将通过实时通道更新。",

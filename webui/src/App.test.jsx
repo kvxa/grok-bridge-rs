@@ -594,6 +594,74 @@ describe("App", () => {
     expect(container.textContent).toMatch(/断开|断|disconnect|离线|offline|不可|fail|失败/i);
   });
 
+  it("shows a global unconfirmed-input alert with a keyboard-operable dismiss", async () => {
+    const ws = await renderAppAndConnect([sessions[0]]);
+    const toggle = container.querySelector("[data-interactive-toggle]");
+    await act(async () => toggle.click());
+    await settle();
+    const term = MockXTerm.instances[0];
+    await act(async () => term.emitData("secret"));
+    await settle();
+
+    // Loss of the in-flight input before any ack surfaces the global alert.
+    await act(async () => ws.close());
+    await settle();
+    const alert = container.querySelector("[data-input-indeterminate]");
+    expect(alert).not.toBeNull();
+    const dismiss = alert.querySelector("[data-input-indeterminate-dismiss]");
+    expect(dismiss).not.toBeNull();
+    expect(dismiss.tagName).toBe("BUTTON");
+    expect(dismiss.getAttribute("aria-label")).toBe("忽略未确认输入提示");
+
+    // Dismiss hides the alert and it stays hidden for later result acks.
+    await act(async () => dismiss.click());
+    await settle();
+    expect(container.querySelector("[data-input-indeterminate]")).toBeNull();
+    await act(async () => {
+      ws.emitMessage({ type: "input_result", ok: true, id: "webui-1", session: "gbt-a" });
+    });
+    await settle();
+    expect(container.querySelector("[data-input-indeterminate]")).toBeNull();
+  });
+
+  it("re-shows the global unconfirmed alert only for a fresh batch of losses", async () => {
+    const first = await renderAppAndConnect([sessions[0]]);
+    const toggle = container.querySelector("[data-interactive-toggle]");
+    await act(async () => toggle.click());
+    await settle();
+    const term = MockXTerm.instances[0];
+
+    await act(async () => term.emitData("one"));
+    await settle();
+    await act(async () => first.close());
+    await settle();
+    const dismiss = container
+      .querySelector("[data-input-indeterminate]")
+      ?.querySelector("[data-input-indeterminate-dismiss]");
+    expect(dismiss).not.toBeNull();
+    await act(async () => dismiss.click());
+    await settle();
+    expect(container.querySelector("[data-input-indeterminate]")).toBeNull();
+
+    // Reconnect and lose a brand-new input: the alert must appear again.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    const second = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+    await act(async () => second.open());
+    await act(async () => {
+      pushSessions(second, [sessions[0]], [
+        { session: "gbt-a", reset: true, data_base64: utf8ToBase64("again") },
+      ]);
+    });
+    await settle();
+    await act(async () => term.emitData("two"));
+    await settle();
+    await act(async () => second.close());
+    await settle();
+    expect(container.querySelector("[data-input-indeterminate]")).not.toBeNull();
+  });
+
   it("exposes a language switcher that localizes chrome without touching terminal bytes", async () => {
     const waitingSession = {
       ...sessions[0],

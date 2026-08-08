@@ -165,6 +165,8 @@ export default {
   "interactive.tooLarge": "入力が 64 KiB の上限を超えたため、入力全体が拒否され、何も送信されませんでした。",
   "interactive.queueFull": "コマンドキューがいっぱいのため、入力全体が拒否されました。",
   "interactive.indeterminate": "入力が届いたか確認できなかったため、自動で再送信しませんでした。",
+  "interactive.dismiss": "閉じる",
+  "interactive.dismissAria": "未確認入力のお知らせを閉じる",
 
   "action.confirmCloseSession": "{id} とその Grok プロセスを閉じますか？",
   "action.closedSession":

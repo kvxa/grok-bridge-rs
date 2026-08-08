@@ -162,6 +162,8 @@ export default {
   "interactive.tooLarge": "La entrada supera el límite de 64 KiB; se rechazó por completo y no se envió nada.",
   "interactive.queueFull": "La cola de comandos está llena; la entrada se rechazó por completo.",
   "interactive.indeterminate": "No se pudo confirmar la entrega de la entrada; no se volvió a enviar.",
+  "interactive.dismiss": "Descartar",
+  "interactive.dismissAria": "Descartar aviso de entrada no confirmada",
 
   "action.confirmCloseSession": "¿Cerrar {id} y su proceso Grok?",
   "action.closedSession":

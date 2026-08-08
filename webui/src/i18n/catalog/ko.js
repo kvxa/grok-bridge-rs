@@ -164,6 +164,8 @@ export default {
   "interactive.tooLarge": "입력이 64 KiB 제한을 초과하여 전체 입력이 거부되었으며 아무 내용도 전송되지 않았습니다.",
   "interactive.queueFull": "명령 대기열이 가득 차 전체 입력이 거부되었습니다.",
   "interactive.indeterminate": "입력 전달 여부를 확인할 수 없어 자동으로 다시 보내지 않았습니다.",
+  "interactive.dismiss": "닫기",
+  "interactive.dismissAria": "확인되지 않은 입력 알림 닫기",
 
   "action.confirmCloseSession": "{id} 및 해당 Grok 프로세스를 닫으시겠습니까?",
   "action.closedSession":

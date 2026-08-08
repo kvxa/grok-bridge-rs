@@ -212,4 +212,163 @@ describe("terminalFeeds", () => {
     expect(anchored[0].reset).toBe(true);
     expect(anchored[0].data_base64).toBe(huge);
   });
+
+  it("retains contiguous cursor ranges across reset and deltas", () => {
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 100, data_base64: btoa("SNAP") },
+      { session: "s1", reset: false, cursor: 100, next_cursor: 105, data_base64: btoa("A") },
+      { session: "s1", reset: false, cursor: 105, next_cursor: 110, data_base64: btoa("B") },
+    ]);
+    const kept = peekTerminalBuffer("s1");
+    expect(kept.map((entry) => entry.data_base64)).toEqual([
+      btoa("SNAP"),
+      btoa("A"),
+      btoa("B"),
+    ]);
+    const received = [];
+    subscribeTerminal("s1", (entry) => received.push(entry.data_base64));
+    expect(received).toEqual([btoa("SNAP"), btoa("A"), btoa("B")]);
+  });
+
+  it("discards deltas once a trim creates a cursor gap until a reset re-anchors", () => {
+    // Two ~700 KiB deltas force the byte cap to drop the bridging delta.
+    const big = btoa("x".repeat(700 * 1024));
+    pushTerminalEntries([
+      {
+        session: "s1",
+        reset: true,
+        cursor: 0,
+        next_cursor: 10,
+        data_base64: btoa("SNAP"),
+      },
+      {
+        session: "s1",
+        reset: false,
+        cursor: 10,
+        next_cursor: 20,
+        data_base64: big,
+      },
+    ]);
+    // Anchor + first big delta still fit.
+    expect(peekTerminalBuffer("s1")).toHaveLength(2);
+
+    // The second big delta overflows: the trim drops delta 10→20, so the
+    // retained chain jumps 10 → 20 and the whole stream turns gap-invalid.
+    pushTerminalEntries([
+      {
+        session: "s1",
+        reset: false,
+        cursor: 20,
+        next_cursor: 30,
+        data_base64: big,
+      },
+    ]);
+    expect(peekTerminalBuffer("s1")).toHaveLength(0);
+
+    // Subsequent deltas keep being discarded, even contiguous-looking ones.
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 30, next_cursor: 40, data_base64: btoa("C") },
+      { session: "s1", reset: false, cursor: 40, next_cursor: 50, data_base64: btoa("D") },
+    ]);
+    expect(peekTerminalBuffer("s1")).toHaveLength(0);
+
+    // A reset re-anchors the stream and delta retention resumes.
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 50, data_base64: btoa("FRESH") },
+      { session: "s1", reset: false, cursor: 50, next_cursor: 55, data_base64: btoa("E") },
+    ]);
+    const recovered = peekTerminalBuffer("s1");
+    expect(recovered.map((entry) => entry.data_base64)).toEqual([
+      btoa("FRESH"),
+      btoa("E"),
+    ]);
+  });
+
+  it("keeps a trimmed gap invalid after subscribe until a live reset", () => {
+    const big = btoa("x".repeat(700 * 1024));
+    pushTerminalEntries([
+      {
+        session: "s1",
+        reset: true,
+        cursor: 0,
+        next_cursor: 10,
+        data_base64: btoa("SNAP"),
+      },
+      {
+        session: "s1",
+        reset: false,
+        cursor: 10,
+        next_cursor: 20,
+        data_base64: big,
+      },
+      {
+        session: "s1",
+        reset: false,
+        cursor: 20,
+        next_cursor: 30,
+        data_base64: big,
+      },
+    ]);
+    expect(peekTerminalBuffer("s1")).toHaveLength(0);
+
+    const received = [];
+    subscribeTerminal("s1", (entry) => received.push(entry));
+    pushTerminalEntries([
+      {
+        session: "s1",
+        reset: false,
+        cursor: 30,
+        next_cursor: 40,
+        data_base64: btoa("DROP"),
+      },
+    ]);
+    expect(received).toHaveLength(0);
+
+    pushTerminalEntries([
+      {
+        session: "s1",
+        reset: true,
+        cursor: 0,
+        next_cursor: 40,
+        data_base64: btoa("FRESH"),
+      },
+      {
+        session: "s1",
+        reset: false,
+        cursor: 40,
+        next_cursor: 41,
+        data_base64: btoa("A"),
+      },
+    ]);
+    expect(received.map((entry) => entry.data_base64)).toEqual([
+      btoa("FRESH"),
+      btoa("A"),
+    ]);
+  });
+
+  it("invalidates the retained stream on an arrival-order cursor gap", () => {
+    pushTerminalEntries([
+      {
+        session: "s1",
+        reset: true,
+        cursor: 0,
+        next_cursor: 100,
+        data_base64: btoa("SNAP"),
+      },
+      // Jumps 100 → 200: data was lost before this delta arrived.
+      {
+        session: "s1",
+        reset: false,
+        cursor: 200,
+        next_cursor: 205,
+        data_base64: btoa("A"),
+      },
+    ]);
+    expect(peekTerminalBuffer("s1")).toHaveLength(0);
+
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 205, next_cursor: 210, data_base64: btoa("B") },
+    ]);
+    expect(peekTerminalBuffer("s1")).toHaveLength(0);
+  });
 });

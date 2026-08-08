@@ -56,7 +56,7 @@ export function useSessionStream({ setNotice } = {}) {
   );
   const [lastUpdated, setLastUpdated] = useState(null);
   /** Inputs whose single result was lost (disconnect): delivery is unknown and
-   *  they are never replayed. Exposed so the UI can show indeterminate. */
+   *  they are never replayed. Exposed so the UI can show a global alert. */
   const [unconfirmedInputs, setUnconfirmedInputs] = useState(0);
   const unconfirmedInputsRef = useRef(0);
   const signatureRef = useRef(null);
@@ -176,11 +176,15 @@ export function useSessionStream({ setNotice } = {}) {
   const settlePending = useCallback((id, resultType, session) => {
     const entry = pendingRef.current.get(id);
     if (!entry) return null;
+    // A result with a known request id consumes that one pending command even
+    // if its metadata is malformed. Keeping it admitted would leak both an
+    // entry slot and its byte budget forever; only the return value remains
+    // gated by the expected result type and session.
+    pendingRef.current.delete(id);
+    pendingBytesRef.current = Math.max(0, pendingBytesRef.current - entry.bytes);
     const expectedType =
       entry.kind === "input" ? "input_result" : "resize_result";
     if (resultType !== expectedType || entry.session !== session) return null;
-    pendingRef.current.delete(id);
-    pendingBytesRef.current = Math.max(0, pendingBytesRef.current - entry.bytes);
     return entry;
   }, []);
 
@@ -212,6 +216,18 @@ export function useSessionStream({ setNotice } = {}) {
       if (mountedRef.current) {
         setUnconfirmedInputs(unconfirmedInputsRef.current);
       }
+    }
+  }, []);
+
+  /**
+   * Dismiss the current unconfirmed-input alert. Result acknowledgements never
+   * mutate this counter; only a later disconnect that abandons fresh input can
+   * make the alert visible again.
+   */
+  const clearUnconfirmedInputs = useCallback(() => {
+    unconfirmedInputsRef.current = 0;
+    if (mountedRef.current) {
+      setUnconfirmedInputs(0);
     }
   }, []);
 
@@ -500,5 +516,6 @@ export function useSessionStream({ setNotice } = {}) {
     sendTerminalResize,
     subscribeResizeAck,
     unconfirmedInputs,
+    clearUnconfirmedInputs,
   };
 }

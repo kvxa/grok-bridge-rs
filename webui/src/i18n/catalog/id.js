@@ -162,6 +162,8 @@ export default {
   "interactive.tooLarge": "Input melebihi batas 64 KiB; seluruh input ditolak dan tidak ada yang dikirim.",
   "interactive.queueFull": "Antrean perintah penuh; seluruh input ditolak.",
   "interactive.indeterminate": "Pengiriman input tidak dapat dikonfirmasi; input tidak dikirim ulang.",
+  "interactive.dismiss": "Abaikan",
+  "interactive.dismissAria": "Abaikan pemberitahuan input yang tak terkonfirmasi",
 
   "action.confirmCloseSession": "Tutup {id} dan proses Grok-nya?",
   "action.closedSession":

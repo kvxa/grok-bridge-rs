@@ -181,6 +181,8 @@ export default {
     "A fila de comandos está cheia; toda a entrada foi rejeitada.",
   "interactive.indeterminate":
     "Não foi possível confirmar a entrega da entrada; não foi reenviada automaticamente.",
+  "interactive.dismiss": "Dispensar",
+  "interactive.dismissAria": "Dispensar aviso de entrada não confirmada",
 
   "action.confirmCloseSession":
     "Fechar {id} e o respetivo processo Grok?",

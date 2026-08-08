@@ -160,6 +160,8 @@ export default {
   "interactive.tooLarge": "輸入超過 64 KiB 上限，已整體拒絕，未傳送任何內容。",
   "interactive.queueFull": "命令佇列已滿，輸入已整體拒絕。",
   "interactive.indeterminate": "無法確認輸入是否送達，未自動重送。",
+  "interactive.dismiss": "忽略",
+  "interactive.dismissAria": "忽略未確認輸入提示",
 
   "action.confirmCloseSession": "確定要關閉工作階段 {id} 及其 Grok 處理程序嗎？",
   "action.closedSession": "已關閉 Grok 工作階段 {id}，狀態將透過即時通道更新。",

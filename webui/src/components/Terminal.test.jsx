@@ -19,7 +19,12 @@ import {
   terminalHeightStorageKey,
 } from "../utils/terminalHeight.js";
 import { TERMINAL_FONT_FAMILY } from "../utils/terminalTheme.js";
-import { createTerminalWriteQueue, fitTerminalHost } from "./Terminal.jsx";
+import {
+  RESIZE_RETRY_MAX,
+  RESIZE_RETRY_MS,
+  createTerminalWriteQueue,
+  fitTerminalHost,
+} from "./Terminal.jsx";
 
 vi.mock("@xterm/xterm", () => ({
   Terminal: MockXTerm,
@@ -886,11 +891,107 @@ describe("Terminal (xterm read-only)", () => {
     expect(dataBase64).toBe(encodeUtf8ToBase64(big));
   });
 
-  it("shows the indeterminate indicator when input delivery cannot be confirmed", async () => {
-    ioState.unconfirmedInputs = 2;
-    await renderTerminal({ interactive: true });
-    const indicator = container.querySelector("[data-terminal-indeterminate]");
-    expect(indicator).not.toBeNull();
-    expect(indicator.textContent).toContain("could not be confirmed");
+  it("retries an immediate resize send failure once through the fit flow", async () => {
+    vi.useFakeTimers();
+    sendResize.mockImplementation(() => ({ ok: false, error: "queue_full" }));
+    await renderTerminal({ interactive: false, hostWidth: 900, hostHeight: 400 });
+    sendResize.mockClear();
+    const host = container.querySelector("[data-terminal-host]");
+    sizeElement(host, 720, 340);
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalledTimes(1);
+
+    // The automatic retry re-fits via scheduleFit after the bounded delay and
+    // re-publishes the exact same visible size.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RESIZE_RETRY_MS);
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalledTimes(2);
+    expect(sendResize.mock.calls[1][1]).toBe(sendResize.mock.calls[0][1]);
+    expect(sendResize.mock.calls[1][2]).toBe(sendResize.mock.calls[0][2]);
+    vi.useRealTimers();
+  });
+
+  it("bounds automatic resize retries so a persistent failure cannot storm timers", async () => {
+    vi.useFakeTimers();
+    sendResize.mockImplementation(() => ({ ok: false, error: "queue_full" }));
+    await renderTerminal({ interactive: false, hostWidth: 900, hostHeight: 400 });
+    sendResize.mockClear();
+    const host = container.querySelector("[data-terminal-host]");
+    sizeElement(host, 720, 340);
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalledTimes(1);
+
+    // Keep the failure; each retry cycle is retry delay + fit + debounce.
+    for (let i = 0; i < RESIZE_RETRY_MAX + 3; i += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RESIZE_RETRY_MS + 200);
+      });
+      await flushRaf();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(150);
+      });
+    }
+    const attempts = sendResize.mock.calls.length;
+    // Initial attempt + at most RESIZE_RETRY_MAX automatic retries.
+    expect(attempts).toBeLessThanOrEqual(1 + RESIZE_RETRY_MAX);
+
+    // After the cap the retry chain stops: more time changes nothing.
+    const settled = sendResize.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RESIZE_RETRY_MS * 10);
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize.mock.calls.length).toBe(settled);
+    vi.useRealTimers();
+  });
+
+  it("clears pending resize retry timers on unmount", async () => {
+    vi.useFakeTimers();
+    sendResize.mockImplementation(() => ({ ok: false, error: "queue_full" }));
+    await renderTerminal({ interactive: false, hostWidth: 900, hostHeight: 400 });
+    sendResize.mockClear();
+    const host = container.querySelector("[data-terminal-host]");
+    sizeElement(host, 720, 340);
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(sendResize).toHaveBeenCalledTimes(1);
+
+    await act(async () => root.unmount());
+    const before = sendResize.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RESIZE_RETRY_MS * 5);
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    // No further sends after unmount: every retry/rAF timer was cancelled.
+    expect(sendResize.mock.calls.length).toBe(before);
+    vi.useRealTimers();
   });
 });

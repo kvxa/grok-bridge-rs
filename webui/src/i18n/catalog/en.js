@@ -162,6 +162,8 @@ export default {
   "interactive.tooLarge": "Input exceeds the 64 KiB limit; the whole input was rejected and nothing was sent.",
   "interactive.queueFull": "The command queue is full; the input was rejected as a whole.",
   "interactive.indeterminate": "Input delivery could not be confirmed; it was not re-sent.",
+  "interactive.dismiss": "Dismiss",
+  "interactive.dismissAria": "Dismiss unconfirmed input notice",
 
   "action.confirmCloseSession": "Close {id} and its Grok process?",
   "action.closedSession":

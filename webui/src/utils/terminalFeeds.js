@@ -9,6 +9,13 @@ import {
 const buffers = new Map();
 /** @type {Map<string, number>} Total retained payload bytes per session. */
 const bufferBytes = new Map();
+/**
+ * @type {Map<string, boolean>} Retained-stream integrity per session. Once a
+ * trim (or an arrival-order jump) breaks the cursor chain, the retained
+ * buffer can no longer be replayed faithfully: all subsequent deltas are
+ * discarded until the next reset re-anchors a fresh snapshot.
+ */
+const gapInvalid = new Map();
 /** @type {Map<string, Set<(entry: TerminalEntry) => void>>} */
 const listeners = new Map();
 
@@ -31,12 +38,48 @@ function hasLiveListeners(session) {
   return Boolean(set && set.size > 0);
 }
 
+function hasCursorRange(entry) {
+  return (
+    entry &&
+    typeof entry.cursor === "number" &&
+    typeof entry.next_cursor === "number"
+  );
+}
+
+/** True when any adjacent retained pair breaks the cursor continuity. */
+function hasCursorGap(buffer) {
+  for (let i = 1; i < buffer.length; i += 1) {
+    const prev = buffer[i - 1];
+    const next = buffer[i];
+    if (
+      hasCursorRange(prev) &&
+      hasCursorRange(next) &&
+      prev.next_cursor !== next.cursor
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Drop the retained stream and mark the session gap-invalid until a reset. */
+function invalidateRetainedStream(session) {
+  const buffer = buffers.get(session);
+  if (buffer) buffer.length = 0;
+  bufferBytes.set(session, 0);
+  gapInvalid.set(session, true);
+}
+
 /**
  * Bound a retained buffer after a push: drop the oldest (stale) entries while
  * over either limit. The full-snapshot anchor — the newest reset entry, always
  * at index 0 because a reset clears the buffer before being pushed — is never
  * dropped: replay relies on it for recovery, so only deltas (or, when no
  * anchor exists yet, leading deltas) are trimmed.
+ *
+ * Trimming can remove the delta that bridged two retained ranges. The cursor
+ * chain then has a gap and the buffer can no longer be replayed faithfully:
+ * the whole retained stream is invalidated until the next reset.
  */
 function trimRetainedBuffer(session, buffer) {
   let bytes = bufferBytes.get(session) ?? 0;
@@ -48,6 +91,11 @@ function trimRetainedBuffer(session, buffer) {
     if (buffer.length <= 1) break;
     const dropped = buffer.splice(hasAnchor ? 1 : 0, 1)[0];
     bytes -= entryBytes(dropped);
+  }
+  if (hasCursorGap(buffer)) {
+    buffer.length = 0;
+    bytes = 0;
+    gapInvalid.set(session, true);
   }
   bufferBytes.set(session, bytes);
 }
@@ -66,6 +114,13 @@ export function pushTerminalEntries(entries) {
     if (!entry || typeof entry.session !== "string" || !entry.session) continue;
 
     if (hasLiveListeners(entry.session)) {
+      if (entry.reset) {
+        gapInvalid.delete(entry.session);
+      } else if (gapInvalid.get(entry.session)) {
+        // A newly mounted terminal has no faithful replay anchor after a
+        // retained gap. Keep dropping deltas until the Runtime sends a reset.
+        continue;
+      }
       const set = listeners.get(entry.session);
       for (const listener of set) listener(entry);
       continue;
@@ -73,8 +128,25 @@ export function pushTerminalEntries(entries) {
 
     const buffer = ensureBuffer(entry.session);
     if (entry.reset) {
+      // A fresh full snapshot re-anchors the retained stream.
       buffer.length = 0;
       bufferBytes.set(entry.session, 0);
+      gapInvalid.delete(entry.session);
+    } else if (gapInvalid.get(entry.session)) {
+      // The retained chain is broken; deltas stay discarded until a reset.
+      continue;
+    }
+    // A delta that does not continue the last retained range means data was
+    // lost before it: the retained stream is no longer faithful.
+    const prev = buffer.at(-1);
+    if (
+      prev &&
+      hasCursorRange(prev) &&
+      hasCursorRange(entry) &&
+      prev.next_cursor !== entry.cursor
+    ) {
+      invalidateRetainedStream(entry.session);
+      continue;
     }
     buffer.push(entry);
     bufferBytes.set(
@@ -118,6 +190,7 @@ export function subscribeTerminal(session, listener) {
 export function disposeTerminalSession(session) {
   buffers.delete(session);
   bufferBytes.delete(session);
+  gapInvalid.delete(session);
   listeners.delete(session);
 }
 
@@ -139,6 +212,7 @@ export function reconcileTerminalSessions(activeSessionIds) {
 export function resetTerminalFeeds() {
   buffers.clear();
   bufferBytes.clear();
+  gapInvalid.clear();
   listeners.clear();
 }
 

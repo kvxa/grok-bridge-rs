@@ -162,6 +162,8 @@ export default {
   "interactive.tooLarge": "Dữ liệu nhập vượt quá giới hạn 64 KiB; toàn bộ dữ liệu đã bị từ chối và không nội dung nào được gửi.",
   "interactive.queueFull": "Hàng đợi lệnh đã đầy; toàn bộ dữ liệu nhập đã bị từ chối.",
   "interactive.indeterminate": "Không thể xác nhận dữ liệu nhập đã được chuyển đến; dữ liệu không được tự động gửi lại.",
+  "interactive.dismiss": "Bỏ qua",
+  "interactive.dismissAria": "Bỏ qua thông báo đầu vào chưa xác nhận",
 
   "action.confirmCloseSession": "Đóng {id} và tiến trình Grok của nó?",
   "action.closedSession":

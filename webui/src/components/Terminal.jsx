@@ -28,6 +28,13 @@ const DEFAULT_ROWS = 24;
 const DEFAULT_COLS = 80;
 const RESIZE_STEP_PX = 24;
 const RESIZE_DEBOUNCE_MS = 120;
+/** Bounded delay before one automatic resize retry after an immediate send
+ *  failure, routed through the existing scheduleFit flow. */
+export const RESIZE_RETRY_MS = 300;
+/** Cap on consecutive automatic resize retries: after this many failures the
+ *  terminal stops retrying on its own and waits for the next natural trigger
+ *  (user resize, reconnect, negative ack). */
+export const RESIZE_RETRY_MAX = 3;
 
 function safeRows(rows) {
   const value = Number(rows);
@@ -150,7 +157,6 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
     sendTerminalInput,
     sendTerminalResize,
     connectionState,
-    unconfirmedInputs,
     subscribeResizeAck,
   } = useTerminalIO();
 
@@ -168,12 +174,18 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
   /** In-flight resize awaiting its single result: dedupe commits only on ack. */
   const pendingResizeRef = useRef(null);
   const resizeTimerRef = useRef(0);
+  /** Bounded auto-retry after an immediate resize send failure (see
+   *  scheduleFit): the timer id plus how many consecutive retries ran. */
+  const resizeRetryTimerRef = useRef(0);
+  const resizeRetryCountRef = useRef(0);
+  const connectionStateRef = useRef(connectionState);
   // Height is scoped to the Codex supervisor group, not the Grok session.
   const groupHeightKey = heightKey;
 
   interactiveRef.current = interactive;
   sendInputRef.current = sendTerminalInput;
   sendResizeRef.current = sendTerminalResize;
+  connectionStateRef.current = connectionState;
 
   const [height, setHeight] = useState(() =>
     readTerminalHeight(groupHeightKey),
@@ -200,9 +212,32 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
         cols: nextCols,
         rows: nextRows,
       };
+      if (resizeRetryTimerRef.current) {
+        window.clearTimeout(resizeRetryTimerRef.current);
+        resizeRetryTimerRef.current = 0;
+      }
+      resizeRetryCountRef.current = 0;
+      return;
+    }
+    // Immediate send failed (offline / queue full / send threw). Retry once
+    // through the existing scheduleFit flow after a bounded delay, but only
+    // while connected (a disconnect clears the dedupe and re-publishes on
+    // reconnect) and never more than RESIZE_RETRY_MAX times in a row, so a
+    // persistent failure cannot turn into a timer storm.
+    if (
+      connectionStateRef.current === "connected" &&
+      resizeRetryCountRef.current < RESIZE_RETRY_MAX &&
+      !resizeRetryTimerRef.current
+    ) {
+      resizeRetryCountRef.current += 1;
+      resizeRetryTimerRef.current = window.setTimeout(() => {
+        resizeRetryTimerRef.current = 0;
+        scheduleFitRef.current();
+      }, RESIZE_RETRY_MS);
     }
   }, [id]);
 
+  const scheduleFitRef = useRef(() => {});
   const scheduleFit = useCallback(() => {
     if (fitRafRef.current) {
       cancelAnimationFrame(fitRafRef.current);
@@ -222,6 +257,7 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
       }, RESIZE_DEBOUNCE_MS);
     });
   }, [maybeSendResize]);
+  scheduleFitRef.current = scheduleFit;
 
   const applyHeight = useCallback(
     (next) => {
@@ -303,6 +339,11 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
         window.clearTimeout(resizeTimerRef.current);
         resizeTimerRef.current = 0;
       }
+      if (resizeRetryTimerRef.current) {
+        window.clearTimeout(resizeRetryTimerRef.current);
+        resizeRetryTimerRef.current = 0;
+      }
+      resizeRetryCountRef.current = 0;
       if (onDataDisposableRef.current) {
         try {
           onDataDisposableRef.current.dispose();
@@ -405,8 +446,15 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
     if (previous === "connected" && connectionState !== "connected") {
       lastSentSizeRef.current = { cols: 0, rows: 0 };
       pendingResizeRef.current = null;
+      // Stop any in-flight auto-retry; the reconnect path re-publishes.
+      if (resizeRetryTimerRef.current) {
+        window.clearTimeout(resizeRetryTimerRef.current);
+        resizeRetryTimerRef.current = 0;
+      }
+      resizeRetryCountRef.current = 0;
     }
     if (connectionState === "connected" && previous !== "connected") {
+      resizeRetryCountRef.current = 0;
       scheduleFit();
     }
   }, [connectionState, scheduleFit]);
@@ -533,14 +581,6 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
             ? ` · ${t("interactive.unavailableShort")}`
             : ""}
         </span>
-        {unconfirmedInputs > 0 ? (
-          <span
-            className="terminal-indeterminate text-warning"
-            data-terminal-indeterminate="true"
-          >
-            {t("interactive.indeterminate")}
-          </span>
-        ) : null}
       </div>
       <div
         ref={hostRef}
