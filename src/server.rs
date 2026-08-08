@@ -1631,6 +1631,21 @@ fn write_http_bytes_with_deadline(
     write_tcp_all_with_deadline(stream, &response, deadline)
 }
 
+/// Minimal write surface for [`write_tcp_all_with_deadline`]: a blocking
+/// `write` plus a per-syscall write timeout. The deadline loop is generic
+/// over this trait so tests can drive it with a fake writer that reports
+/// `WouldBlock` forever, instead of depending on kernel socket buffers,
+/// which std::net does not expose and whose sizes differ per platform.
+trait DeadlineWrite: Write {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl DeadlineWrite for TcpStream {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
 /// Write one bounded HTTP response under a total wall-clock deadline. A
 /// socket write timeout alone is per syscall, so a peer that accepts a few
 /// bytes repeatedly could otherwise keep resetting `write_all` forever.
@@ -1638,7 +1653,7 @@ fn write_http_bytes_with_deadline(
 /// backoff instead of a busy loop, and the per-syscall timeout is never set
 /// below 1 ms so a nearly-expired deadline cannot degrade into spinning.
 fn write_tcp_all_with_deadline(
-    stream: &mut TcpStream,
+    stream: &mut impl DeadlineWrite,
     mut data: &[u8],
     timeout: Duration,
 ) -> std::io::Result<()> {
@@ -2112,16 +2127,49 @@ mod tests {
 
     #[test]
     fn http_write_stops_at_the_total_deadline_for_a_peer_that_stops_draining() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut server, _) = listener.accept().unwrap();
-        // The peer never reads; a payload far larger than any socket buffer
-        // must stall the write until the total deadline, with the bounded
-        // backoff keeping the loop from running past it by much.
-        let payload = vec![0x55u8; 64 * 1024 * 1024];
+        // Deterministic fake peer: accepts a bounded prefix, then reports
+        // WouldBlock forever — the same failure mode as a real receive
+        // buffer filling up, without depending on per-platform kernel socket
+        // buffers (which std::net does not expose, and whose sizes differ
+        // between Windows loopback and Unix).
+        struct StalledWrite {
+            accepted: usize,
+        }
+
+        impl Write for StalledWrite {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.accepted >= 4 * 1024 {
+                    return Err(io::Error::new(
+                        ErrorKind::WouldBlock,
+                        "peer stopped draining",
+                    ));
+                }
+                let take = (4 * 1024 - self.accepted).min(buf.len());
+                self.accepted += take;
+                Ok(take)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl DeadlineWrite for StalledWrite {
+            fn set_write_timeout(&mut self, _timeout: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // The payload far exceeds what the peer accepts; the write must
+        // stall until the total deadline, with the bounded backoff keeping
+        // the loop from running past it by much.
+        let payload = vec![0x55u8; 8 * 1024];
         let started = Instant::now();
-        let error = write_tcp_all_with_deadline(&mut server, &payload, Duration::from_millis(200))
-            .unwrap_err();
+        let error = write_tcp_all_with_deadline(
+            &mut StalledWrite { accepted: 0 },
+            &payload,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
