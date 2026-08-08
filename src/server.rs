@@ -1284,6 +1284,10 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::SessionPhase;
+    use crate::session::tests::{
+        test_host_with_poisoned_close_lock, with_test_host_holding_close_lock,
+    };
     use std::io::Read as _;
 
     #[test]
@@ -1419,17 +1423,63 @@ mod tests {
 
     #[test]
     fn close_api_distinguishes_missing_timeout_and_internal_failures() {
+        // 404: a missing session through the real request path.
         let response = serve_web_request(
             b"POST /api/sessions/missing/close HTTP/1.1\r\nHost: localhost\r\nX-Grok-Bridge-WebUI: 1\r\n\r\n",
         );
-        assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
-        assert_eq!(
-            close_error_http_status(&CloseError::Timeout),
-            "504 Gateway Timeout"
+        let (headers, body) = split_http_response(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{headers}"
         );
-        assert_eq!(
-            close_error_http_status(&CloseError::Failed("termination failed".into())),
-            "500 Internal Server Error"
+        assert!(
+            std::str::from_utf8(body)
+                .unwrap()
+                .contains("session not found: missing"),
+            "404 body: {body:?}"
+        );
+
+        // 504: the close lock is held past the deadline, so close really times
+        // out and the route maps it to Gateway Timeout with the error body.
+        let response = with_test_host_holding_close_lock(
+            "provider-timeout",
+            SessionPhase::Running,
+            |host| {
+                serve_web_request_with_host(
+                    b"POST /api/sessions/gbt-test/close HTTP/1.1\r\nHost: localhost\r\nX-Grok-Bridge-WebUI: 1\r\n\r\n",
+                    host,
+                )
+            },
+        );
+        let (headers, body) = split_http_response(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 504 Gateway Timeout\r\n"),
+            "{headers}"
+        );
+        assert!(
+            std::str::from_utf8(body)
+                .unwrap()
+                .contains("close timed out"),
+            "504 body: {body:?}"
+        );
+
+        // 500: a poisoned close lock is an internal failure through the real
+        // request path and surfaces as Internal Server Error.
+        let host = test_host_with_poisoned_close_lock("provider-failed", SessionPhase::Running);
+        let response = serve_web_request_with_host(
+            b"POST /api/sessions/gbt-test/close HTTP/1.1\r\nHost: localhost\r\nX-Grok-Bridge-WebUI: 1\r\n\r\n",
+            host,
+        );
+        let (headers, body) = split_http_response(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "{headers}"
+        );
+        assert!(
+            std::str::from_utf8(body)
+                .unwrap()
+                .contains("session close lock was poisoned"),
+            "500 body: {body:?}"
         );
     }
 
@@ -1744,6 +1794,16 @@ mod tests {
     }
 
     fn serve_web_request(request: &[u8]) -> Vec<u8> {
+        serve_web_request_with_host(
+            request,
+            SessionHost::new(OrphanPolicy {
+                lease_ms: 120_000,
+                grace_ms: 600_000,
+            }),
+        )
+    }
+
+    fn serve_web_request_with_host(request: &[u8], host: SessionHost) -> Vec<u8> {
         let timeout = Duration::from_secs(10);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -1759,10 +1819,7 @@ mod tests {
             handle_web_connection(
                 server,
                 Arc::new(RuntimeState {
-                    host: SessionHost::new(OrphanPolicy {
-                        lease_ms: 120_000,
-                        grace_ms: 600_000,
-                    }),
+                    host,
                     started_at_ms: 0,
                     stopping: AtomicBool::new(false),
                     web_url: None,

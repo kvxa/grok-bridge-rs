@@ -44,6 +44,11 @@ const GROUP_CLOSE_WORKERS: usize = 4;
 /// Minimum grace between HUP, TERM, and KILL inside one close deadline so a
 /// graceful child is not force-killed prematurely.
 const TERMINATION_GRACE_MIN_MS: u64 = 500;
+/// Lead time before the close deadline during which the Linux liveness probe
+/// runs its stable two-scan verification. Before that window a successful
+/// kill(-pgid, 0) answers `Alive` immediately, so escalation does not walk
+/// /proc (twice) on every round.
+const STABLE_SCOPE_SCAN_LEAD_MS: u64 = 500;
 /// Bounded escalation budget used by reader/writer/waiter error edges that
 /// cannot block the close path.
 const ERROR_ESCALATION_TIMEOUT_MS: u64 = 1_500;
@@ -647,9 +652,14 @@ impl SessionHost {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
             registry.clients.remove(client_session_id);
+            drop(registry);
+            // The client lease map changed after apply_close_outcomes already
+            // notified; wake the WebUI again so it observes the removal.
+            self.notify_revision();
+            return Ok(result);
         }
-        // apply_close_outcomes already notifies on successful closes; also wake
-        // when the client lease map changes even if no sessions matched.
+        // apply_close_outcomes already notifies when sessions matched; wake
+        // explicitly when nothing matched.
         if result.matched == 0 {
             self.notify_revision();
         }
@@ -1724,21 +1734,25 @@ impl Session {
     /// does not prove that a descendant inside the same process group
     /// disappeared, and on Windows the root exit does not prove the descendant
     /// tree is gone. The immutable `scope_id` drives the liveness probe; a
-    /// probe failure is never treated as done.
+    /// probe failure is never treated as done. Always asks for the stable
+    /// verification because this decision finalizes the record.
     fn process_is_done_or_terminal(&self) -> bool {
-        matches!(self.probe_scope(), ScopeAlive::Gone)
+        matches!(self.probe_scope(true), ScopeAlive::Gone)
     }
 
     /// Probe the owned process scope. Unix uses the immutable process-group id;
     /// Windows queries the Job Object that contains the gated launcher and all
-    /// of its descendants.
-    fn probe_scope(&self) -> ScopeAlive {
+    /// of its descendants. `stable_verification` is passed through to the Unix
+    /// probe so the escalation loop can skip the expensive all-zombie scan
+    /// until its final confirmation window.
+    fn probe_scope(&self, stable_verification: bool) -> ScopeAlive {
         #[cfg(unix)]
         {
-            process_scope_alive(self.scope_id)
+            process_scope_alive(self.scope_id, stable_verification)
         }
         #[cfg(windows)]
         {
+            let _ = stable_verification;
             self.scope_job.as_ref().map_or_else(
                 || process_alive(self.scope_id),
                 WindowsJob::process_scope_alive,
@@ -1750,8 +1764,8 @@ impl Session {
     /// platform liveness probe. `Gone` requires the probe to verify the whole
     /// scope is gone; the waiter observing the root exit alone is never
     /// treated as the whole scope being gone.
-    fn scope_state(&self) -> ScopeState {
-        match self.probe_scope() {
+    fn scope_state(&self, stable_verification: bool) -> ScopeState {
+        match self.probe_scope(stable_verification) {
             ScopeAlive::Gone => ScopeState::Gone,
             ScopeAlive::Alive => ScopeState::Alive,
             ScopeAlive::Unknown => ScopeState::Unknown,
@@ -1788,16 +1802,23 @@ impl Session {
             .max(term_after + Duration::from_millis(TERMINATION_GRACE_MIN_MS));
         let term_at = started_at + term_after;
         let kill_at = started_at + kill_after;
+        let stable_scan_at = deadline
+            .checked_sub(Duration::from_millis(STABLE_SCOPE_SCAN_LEAD_MS))
+            .unwrap_or(deadline);
         let mut last_target = TerminationLevel::None;
         loop {
-            match self.scope_state() {
+            let now = Instant::now();
+            // Outside the final confirmation window a successful kill(0) probe
+            // answers Alive immediately; only near the deadline do we walk
+            // /proc (twice) to distinguish a living member from an all-zombie
+            // group, so each round costs one syscall instead of two scans.
+            match self.scope_state(now >= stable_scan_at) {
                 ScopeState::Gone => {
                     self.record_verified_process_done();
                     return EscalationResult::Done;
                 }
                 ScopeState::Alive | ScopeState::Unknown => {}
             }
-            let now = Instant::now();
             if now >= deadline {
                 return EscalationResult::Timeout;
             }
@@ -1971,7 +1992,13 @@ impl Session {
         match result {
             Some(Ok(())) => {}
             Some(Err(TrySendError::Full(_))) => {
-                self.mark_writer_error("terminal response queue is full".to_owned());
+                // Queue full is transient backpressure, not a fatal writer
+                // failure: record the error for observers but never escalate
+                // the owned process scope, matching enqueue_input semantics.
+                self.mark_writer_error_with_escalation(
+                    "terminal response queue is full".to_owned(),
+                    false,
+                );
             }
             Some(Err(TrySendError::Disconnected(_))) | None => {
                 if !self.shutdown.load(Ordering::Acquire) {
@@ -2009,6 +2036,14 @@ impl Session {
     }
 
     fn mark_writer_error(&self, message: String) {
+        self.mark_writer_error_with_escalation(message, true);
+    }
+
+    /// Record a writer failure and optionally escalate the owned process scope.
+    /// `escalate` must be false for recoverable backpressure (a full queue):
+    /// the stream is still usable and the scope must survive; escalation is
+    /// reserved for unrecoverable failures like a closed channel.
+    fn mark_writer_error_with_escalation(&self, message: String, escalate: bool) {
         let finalized = if let Ok(mut inner) = self.inner.lock() {
             record_error(&mut inner, message);
             finalize_session(&mut inner, self.shutdown.load(Ordering::Acquire))
@@ -2016,7 +2051,7 @@ impl Session {
             false
         };
         self.finish_transition(finalized);
-        if !self.process_is_done_or_terminal() {
+        if escalate && !self.process_is_done_or_terminal() {
             self.run_error_edge_escalation();
         }
     }
@@ -2107,6 +2142,17 @@ impl Session {
             self.release_master();
         }
         self.signal_changed();
+    }
+
+    #[cfg(test)]
+    fn test_hold_close_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.close_lock.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    fn test_poison_close_lock(&self) {
+        let _guard = self.close_lock.lock().unwrap();
+        panic!("test poisons the session close lock");
     }
 }
 
@@ -2770,8 +2816,16 @@ fn send_termination_signal(pid: u32, level: TerminationLevel) -> std::io::Result
 /// retained the PTY after the root exited — remains. Only `ESRCH` proves the
 /// whole scope is gone; `EPERM` means it exists but is not signalable (still
 /// alive), and any other error leaves the answer unknown.
+///
+/// `stable_verification` enables the all-zombie distinction on Linux: an
+/// all-zombie group can still answer kill(-pgid, 0) with success (EPERM on
+/// macOS), so a successful existence probe alone cannot certify `Gone`; the
+/// stable two-scan view is required. Escalation asks for that only in its
+/// final confirmation window (`STABLE_SCOPE_SCAN_LEAD_MS`); outside it a
+/// successful existence probe answers `Alive` without walking /proc.
 #[cfg(unix)]
-fn process_scope_alive(pid: u32) -> ScopeAlive {
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn process_scope_alive(pid: u32, stable_verification: bool) -> ScopeAlive {
     // SAFETY: signal 0 only probes existence; `-pid` addresses the group owned
     // by the session leader that called setsid, so no unrelated group is hit.
     let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
@@ -2779,7 +2833,7 @@ fn process_scope_alive(pid: u32) -> ScopeAlive {
         #[cfg(target_os = "macos")]
         return macos_process_group_alive(pid);
         #[cfg(target_os = "linux")]
-        return linux_process_group_alive(pid);
+        return linux_process_group_alive(pid, stable_verification);
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         return ScopeAlive::Alive;
     }
@@ -2852,10 +2906,16 @@ fn macos_process_group_scan(pgid: u32) -> (ScopeAlive, Vec<u32>) {
     (verdict, members)
 }
 
-/// Linux exposes process-group and state fields in `/proc/<pid>/stat`. Scan
-/// twice and require stable membership before certifying an all-zombie group.
+/// Linux exposes process-group and state fields in `/proc/<pid>/stat`. When
+/// `stable_verification` is set, scan twice and require stable membership
+/// before certifying an all-zombie group; otherwise a successful kill(0) probe
+/// already proved the group exists and a living member answers `Alive`
+/// immediately, skipping the /proc traversal.
 #[cfg(target_os = "linux")]
-fn linux_process_group_alive(pgid: u32) -> ScopeAlive {
+fn linux_process_group_alive(pgid: u32, stable_verification: bool) -> ScopeAlive {
+    if !stable_verification {
+        return ScopeAlive::Alive;
+    }
     stable_process_group_scan_result(
         linux_process_group_scan(pgid),
         linux_process_group_scan(pgid),
@@ -3579,7 +3639,7 @@ fn now_millis() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const TEST_PROVIDER_SESSION_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
@@ -3852,13 +3912,23 @@ mod tests {
     }
 
     fn test_host(provider_session_id: &str, phase: SessionPhase) -> SessionHost {
+        test_host_with_session(provider_session_id, phase).0
+    }
+
+    /// Build a host that owns one test session plus the session itself, so
+    /// tests can drive host APIs and manipulate the session (e.g. its close
+    /// lock) from outside the session module.
+    fn test_host_with_session(
+        provider_session_id: &str,
+        phase: SessionPhase,
+    ) -> (SessionHost, Arc<Session>) {
         let revision = Arc::new(HostRevision::new());
         let session = Arc::new(test_session_with_revision(phase, Arc::clone(&revision)));
         let handle = session.state().unwrap().session;
-        SessionHost {
+        let host = SessionHost {
             registry: Mutex::new(SessionRegistry {
                 accepting: true,
-                sessions: HashMap::from([(handle.clone(), session)]),
+                sessions: HashMap::from([(handle.clone(), Arc::clone(&session))]),
                 provider_sessions: HashMap::from([(provider_session_id.to_owned(), handle)]),
                 clients: HashMap::new(),
                 closed: HashMap::new(),
@@ -3869,7 +3939,30 @@ mod tests {
                 grace_ms: 600_000,
             },
             revision,
-        }
+        };
+        (host, session)
+    }
+
+    pub(crate) fn with_test_host_holding_close_lock<R>(
+        provider_session_id: &str,
+        phase: SessionPhase,
+        run: impl FnOnce(SessionHost) -> R,
+    ) -> R {
+        let (host, session) = test_host_with_session(provider_session_id, phase);
+        let _held = session.test_hold_close_lock();
+        run(host)
+    }
+
+    pub(crate) fn test_host_with_poisoned_close_lock(
+        provider_session_id: &str,
+        phase: SessionPhase,
+    ) -> SessionHost {
+        let (host, session) = test_host_with_session(provider_session_id, phase);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.test_poison_close_lock();
+        }));
+        assert!(poisoned.is_err());
+        host
     }
 
     #[cfg(windows)]
@@ -4116,6 +4209,17 @@ mod tests {
         assert_eq!(
             completed_phase(SessionPhase::Running, true, true, true, false, Some(1)),
             Some(SessionPhase::Stopped)
+        );
+        // An explicit close finalizes as soon as the process scope is verified
+        // gone; a missing reader EOF must not keep the record half-open.
+        assert_eq!(
+            completed_phase(SessionPhase::Running, true, false, true, false, None),
+            Some(SessionPhase::Stopped)
+        );
+        // Without an explicit close, reader EOF is still required.
+        assert_eq!(
+            completed_phase(SessionPhase::Running, true, false, false, true, None),
+            None
         );
     }
 
@@ -4511,6 +4615,70 @@ mod tests {
         let registry = host.registry.lock().unwrap();
         assert!(registry.sessions.is_empty());
         assert!(registry.provider_sessions.is_empty());
+    }
+
+    #[test]
+    fn close_client_removes_the_lease_and_publishes_a_revision() {
+        let host = test_host(TEST_PROVIDER_SESSION_ID, SessionPhase::Exited);
+        let lease = Arc::new(AtomicU64::new(1_000));
+        {
+            let session = host.get("gbt-test").unwrap();
+            let mut inner = session.inner.lock().unwrap();
+            inner.client_session_id = Some("codex-close".to_owned());
+            inner.client_lease = Some(Arc::clone(&lease));
+        }
+        host.registry
+            .lock()
+            .unwrap()
+            .clients
+            .insert("codex-close".to_owned(), lease);
+        let seen = host.revision();
+        let result = host.close_client("codex-close").unwrap();
+        assert_eq!(result.closed, 1);
+        assert!(
+            host.registry.lock().unwrap().clients.is_empty(),
+            "the client lease must be removed after a fully successful close"
+        );
+        // A WebUI waiter must observe a revision published after the lease
+        // removal, not only the one apply_close_outcomes emitted before it.
+        let advanced = host.wait_revision(seen, Duration::from_millis(50));
+        assert_ne!(advanced, seen);
+        assert_ne!(host.revision(), seen);
+    }
+
+    #[test]
+    fn close_client_keeps_the_lease_when_the_close_fails() {
+        let host = test_host(TEST_PROVIDER_SESSION_ID, SessionPhase::Running);
+        let lease = Arc::new(AtomicU64::new(1_000));
+        {
+            let session = host.get("gbt-test").unwrap();
+            let mut inner = session.inner.lock().unwrap();
+            inner.client_session_id = Some("codex-fail".to_owned());
+            inner.client_lease = Some(Arc::clone(&lease));
+        }
+        host.registry
+            .lock()
+            .unwrap()
+            .clients
+            .insert("codex-fail".to_owned(), lease);
+        // Poison the close lock so the group close fails fast and
+        // deterministically instead of terminating a real process scope.
+        let session = host.get("gbt-test").unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.test_poison_close_lock();
+        }));
+        assert!(poisoned.is_err());
+        let result = host.close_client("codex-fail").unwrap();
+        assert_eq!(result.closed, 0);
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            host.registry
+                .lock()
+                .unwrap()
+                .clients
+                .contains_key("codex-fail"),
+            "a failed close must retain the client lease for a later retry"
+        );
     }
 
     #[test]
@@ -5287,11 +5455,11 @@ mod tests {
             .parse::<u32>()
             .unwrap();
 
-        assert_eq!(process_scope_alive(pgid), ScopeAlive::Alive);
+        assert_eq!(process_scope_alive(pgid, true), ScopeAlive::Alive);
         let deadline = default_close_deadline();
         let mut scope_gone = false;
         while Instant::now() < deadline {
-            if process_scope_alive(pgid) == ScopeAlive::Gone {
+            if process_scope_alive(pgid, true) == ScopeAlive::Gone {
                 scope_gone = true;
                 break;
             }
@@ -5308,6 +5476,172 @@ mod tests {
             "tracked descendant {descendant_pid} remained executable"
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// True once `pid` has exited but is still an unreaped zombie held by this
+    /// test process. Linux reads the state field from /proc; macOS reports no
+    /// process info for an exited-but-unreaped child (proc_pidinfo returns 0).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn test_unreaped_zombie(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, fields)| fields.split_whitespace().next() == Some("Z")),
+                Err(_) => false,
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid as libc::pid_t,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    std::ptr::from_mut(&mut info).cast(),
+                    std::mem::size_of_val(&info) as libc::c_int,
+                )
+            };
+            read == 0
+        }
+    }
+
+    /// A full terminal-response queue is transient backpressure: the error is
+    /// recorded, but the owned process scope must never be escalated.
+    #[test]
+    #[cfg(unix)]
+    fn full_terminal_response_queue_does_not_terminate_the_process_scope() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let mut root = Command::new("/bin/sh");
+        root.args(["-c", "exec sleep 60", "grok-bridge-queue-backpressure-test"]);
+        unsafe {
+            root.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut root = root.spawn().unwrap();
+        let pgid = root.id();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process_scope_alive(pgid, true) != ScopeAlive::Alive {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(process_scope_alive(pgid, true), ScopeAlive::Alive);
+
+        // A zero-capacity writer queue makes the next enqueue report Full.
+        let mut session = test_session(SessionPhase::Running);
+        session.scope_id = pgid;
+        let (writer_tx, _writer_rx) = sync_channel(0);
+        *session.writer_tx.lock().unwrap() = Some(writer_tx);
+
+        session.queue_terminal_response(vec![0x1b; 64]);
+        assert!(
+            session
+                .inner
+                .lock()
+                .unwrap()
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("queue is full")),
+            "queue backpressure must be recorded for observers"
+        );
+        assert_eq!(session.state().unwrap().phase, SessionPhase::Running);
+        assert_eq!(
+            process_scope_alive(pgid, true),
+            ScopeAlive::Alive,
+            "queue backpressure must not escalate the owned process scope"
+        );
+
+        // Cleanup: the scope is killed only by an explicit termination signal,
+        // then reaped so the probe can observe the group empty.
+        send_termination_signal(pgid, TerminationLevel::Kill).unwrap();
+        let _ = root.wait();
+        let deadline = default_close_deadline();
+        let mut scope_gone = false;
+        while Instant::now() < deadline {
+            if process_scope_alive(pgid, true) == ScopeAlive::Gone {
+                scope_gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(scope_gone, "process group {pgid} survived cleanup SIGKILL");
+    }
+
+    /// The Linux fast kill(0) probe must answer Alive without the /proc scan,
+    /// while the stable probe still distinguishes an all-zombie group; macOS
+    /// keeps its existing always-scan behavior (an unreaped zombie answers
+    /// kill(0) with EPERM, mapped to Alive as before).
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fast_scope_probe_skips_the_scan_outside_the_stable_confirmation_window() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let mut child = Command::new("/bin/sh");
+        child.args(["-c", "exec sleep 60", "grok-bridge-fast-probe-test"]);
+        unsafe {
+            child.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = child.spawn().unwrap();
+        let pgid = child.id();
+
+        // Live group: both probe modes agree the scope is alive.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process_scope_alive(pgid, true) != ScopeAlive::Alive {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(process_scope_alive(pgid, true), ScopeAlive::Alive);
+        assert_eq!(process_scope_alive(pgid, false), ScopeAlive::Alive);
+
+        // SIGKILL leaves the child as an unreaped zombie held by this test.
+        send_termination_signal(pgid, TerminationLevel::Kill).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !test_unreaped_zombie(pgid) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            test_unreaped_zombie(pgid),
+            "process {pgid} never became a zombie"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            // The fast probe answers from kill(0) alone: Alive when the
+            // zombie group still answers the existence probe, Gone when it
+            // no longer does — never a /proc walk.
+            let fast = process_scope_alive(pgid, false);
+            let kill0_succeeds = unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == 0;
+            assert_eq!(
+                fast == ScopeAlive::Alive,
+                kill0_succeeds,
+                "fast probe must mirror the kill(0) result"
+            );
+            // The stable probe certifies the all-zombie group as gone.
+            assert_eq!(process_scope_alive(pgid, true), ScopeAlive::Gone);
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            process_scope_alive(pgid, true),
+            ScopeAlive::Alive,
+            "macOS keeps mapping an unreaped zombie to Alive"
+        );
+
+        // Reaping the zombie empties the group: both probes now report Gone.
+        child.wait().unwrap();
+        assert_eq!(process_scope_alive(pgid, true), ScopeAlive::Gone);
+        assert_eq!(process_scope_alive(pgid, false), ScopeAlive::Gone);
     }
 
     #[cfg(target_os = "macos")]
