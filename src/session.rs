@@ -3286,6 +3286,28 @@ mod tests {
 
         session.send("next task".to_owned()).unwrap();
         assert_eq!(writer_rx.recv().unwrap(), b"\x1b[200~next task\x1b[201~\r");
+
+        let full = test_session(SessionPhase::Idle);
+        let (full_tx, _full_rx) = sync_channel(1);
+        full_tx.try_send(vec![b'x']).unwrap();
+        *full.writer_tx.lock().unwrap() = Some(full_tx);
+        let before = full.state().unwrap();
+        let error = full.send("\u{3}".to_owned()).unwrap_err();
+        assert!(error.to_string().contains("input queue is full"));
+        let after = full.state().unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.activity, before.activity);
+
+        let closed = test_session(SessionPhase::Idle);
+        let (closed_tx, closed_rx) = sync_channel(1);
+        drop(closed_rx);
+        *closed.writer_tx.lock().unwrap() = Some(closed_tx);
+        let before = closed.state().unwrap();
+        let error = closed.send("\u{3}".to_owned()).unwrap_err();
+        assert!(error.to_string().contains("input channel is closed"));
+        let after = closed.state().unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.activity, before.activity);
     }
 
     #[test]
@@ -3304,6 +3326,28 @@ mod tests {
         assert!(raw_input_starts_turn(b"\n"));
         assert!(raw_input_starts_turn(b"new task\r"));
         assert!(!raw_input_starts_turn(b"\x03"));
+
+        let full = test_session(SessionPhase::Idle);
+        let (full_tx, _full_rx) = sync_channel(1);
+        full_tx.try_send(vec![b'x']).unwrap();
+        *full.writer_tx.lock().unwrap() = Some(full_tx);
+        let before = full.state().unwrap();
+        let error = full.write_raw(b"\x03".to_vec()).unwrap_err();
+        assert!(error.to_string().contains("input queue is full"));
+        let after = full.state().unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.activity, before.activity);
+
+        let closed = test_session(SessionPhase::Idle);
+        let (closed_tx, closed_rx) = sync_channel(1);
+        drop(closed_rx);
+        *closed.writer_tx.lock().unwrap() = Some(closed_tx);
+        let before = closed.state().unwrap();
+        let error = closed.write_raw(b"\x03".to_vec()).unwrap_err();
+        assert!(error.to_string().contains("input channel is closed"));
+        let after = closed.state().unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.activity, before.activity);
     }
 
     #[test]

@@ -737,11 +737,18 @@ describe("App", () => {
     it("keeps waiting, stopped, and failed groups in the attention class", async () => {
       const waiting = boardSession({ session: "gbt-w", owner: "Codex W", client_session_id: "client-w", activity: "waiting", waiting_reason: "user", hook_at_ms: 2000 });
       const stopped = boardSession({ session: "gbt-s", owner: "Codex S", client_session_id: "client-s", phase: "exited", hook_at_ms: 1000 });
+      const failed = boardSession({ session: "gbt-f", owner: "Codex F", client_session_id: "client-f", phase: "failed", hook_at_ms: 1500 });
       const doneG = doneSession({ session: "gbt-d", owner: "Codex D", client_session_id: "client-d", updated_at_ms: 3000 });
-      await renderAppAndConnect([waiting, stopped, doneG]);
-      expect(groupKeys()).toEqual(["client:client-w", "client:client-s", "client:client-d"]);
+      await renderAppAndConnect([waiting, stopped, failed, doneG]);
+      expect(groupKeys()).toEqual([
+        "client:client-w",
+        "client:client-f",
+        "client:client-s",
+        "client:client-d",
+      ]);
       expect(group("client:client-w").open).toBe(true);
       expect(group("client:client-s").open).toBe(true);
+      expect(group("client:client-f").open).toBe(true);
       expect(group("client:client-d").open).toBe(false);
     });
 
