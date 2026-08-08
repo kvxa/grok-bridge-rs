@@ -57,6 +57,10 @@ pub(crate) const IPC_FRAME_READ_DEADLINE: Duration = Duration::from_secs(30);
 /// Frames are at most 1 MiB and written in one burst, so a peer that stops
 /// draining surfaces an error within this window.
 pub(crate) const IPC_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+/// Short total deadline for a connection-cap rejection frame written on the
+/// accept thread: a peer that never drains must not pin acceptance of further
+/// clients for the full IPC write deadline.
+pub(crate) const IPC_REJECT_DEADLINE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const RUNTIME_STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Poll backoff bounds while an IPC peer is idle, so a waiting thread sleeps
@@ -381,7 +385,13 @@ fn write_frame_all(stream: &mut impl Write, mut data: &[u8], deadline: Duration)
             Err(error) => return Err(error.into()),
         };
         if stalled {
-            thread::sleep(poll_delay);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
+                    "protocol frame write timed out; the peer did not drain the data within the I/O deadline"
+                );
+            }
+            thread::sleep(poll_delay.min(remaining));
             poll_delay = (poll_delay * 2).min(IPC_POLL_MAX);
         }
     }
@@ -389,7 +399,18 @@ fn write_frame_all(stream: &mut impl Write, mut data: &[u8], deadline: Duration)
 }
 
 pub(crate) fn write_response(stream: &mut impl Write, response: &ResponseEnvelope) -> Result<()> {
-    write_frame_all(stream, &encode_frame(response)?, IPC_WRITE_DEADLINE)
+    write_response_with_deadline(stream, response, IPC_WRITE_DEADLINE)
+}
+
+/// Like [`write_response`], but under an explicit total deadline — used for
+/// connection-cap rejections written directly from the accept thread, where
+/// a slow peer must not stall acceptance of further clients.
+pub(crate) fn write_response_with_deadline(
+    stream: &mut impl Write,
+    response: &ResponseEnvelope,
+    deadline: Duration,
+) -> Result<()> {
+    write_frame_all(stream, &encode_frame(response)?, deadline)
         .context("failed to write runtime response")
 }
 
@@ -779,6 +800,38 @@ fn now_millis() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+/// A unique throwaway temp directory, removed on drop. Tests must never leave
+/// files behind on failure, and must never collide with the real runtime path.
+#[cfg(all(unix, test))]
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(unix, test))]
+struct TempDir(PathBuf);
+
+#[cfg(all(unix, test))]
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "grok-bridge-ipc-test-{label}-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(all(unix, test))]
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,18 +934,29 @@ mod tests {
         // headroom and can let a small frame slip through, hiding the write
         // deadline.
         #[cfg(unix)]
-        let name = {
-            let dir = std::env::temp_dir().join(format!(
-                "grok-bridge-write-deadline-test-{}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            dir.join("test.sock")
+        let (name, _dir) = {
+            let dir = TempDir::new("write-deadline");
+            let name = dir
+                .path()
+                .join("test.sock")
                 .to_fs_name::<GenericFilePath>()
-                .unwrap()
+                .unwrap();
+            (name, dir)
         };
         #[cfg(windows)]
-        let name = runtime_name().unwrap();
+        let name = {
+            // A throwaway one-shot pipe name, never the live runtime name:
+            // parallel tests must not collide with each other or with a real
+            // server, and the pipe is bound only inside this test.
+            static NEXT_PIPE_ID: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT_PIPE_ID.fetch_add(1, Ordering::Relaxed);
+            format!(
+                "grok-bridge-write-deadline-test-{}-{id}",
+                std::process::id()
+            )
+            .to_ns_name::<GenericNamespaced>()
+            .unwrap()
+        };
         let listener = ListenerOptions::new()
             .name(name.clone())
             .create_sync()
@@ -988,35 +1052,8 @@ mod unix_ipc_tests {
     use super::*;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     };
-
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-    /// A unique throwaway temp directory, removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "grok-bridge-ipc-test-{label}-{}-{}",
-                std::process::id(),
-                NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     /// Binds a real Unix domain socket at `path`, leaving the socket file in
     /// place when the listener is dropped.

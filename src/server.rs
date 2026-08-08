@@ -32,7 +32,10 @@ use crate::{
         validate_terminal_size,
     },
     session::{OrphanPolicy, SessionHost},
-    transport::{IPC_FRAME_READ_DEADLINE, read_frame, runtime_name, write_response},
+    transport::{
+        IPC_FRAME_READ_DEADLINE, IPC_REJECT_DEADLINE, read_frame, runtime_name, write_response,
+        write_response_with_deadline,
+    },
     version_check::{CHECK_INTERVAL, VersionChecker},
 };
 
@@ -71,6 +74,14 @@ const WEB_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WEB_HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 /// Socket write timeout for WebUI HTTP and WebSocket writes.
 const WEB_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Short total deadline for a WebUI rejection response written directly from
+/// the accept thread: a peer that never drains must not pin acceptance of
+/// further connections for the full write timeout.
+const WEB_HTTP_REJECT_DEADLINE: Duration = Duration::from_secs(2);
+/// Bounded backoff while an HTTP response write is blocked on a full socket
+/// buffer, so a stalled peer is retried with sleeps instead of a busy loop.
+const WEB_HTTP_WRITE_POLL_MIN: Duration = Duration::from_millis(1);
+const WEB_HTTP_WRITE_POLL_MAX: Duration = Duration::from_millis(50);
 /// Idle poll interval while waiting for HTTP request bytes.
 const WEB_HTTP_POLL: Duration = Duration::from_millis(5);
 
@@ -151,16 +162,20 @@ pub(crate) fn run() -> Result<()> {
             break;
         }
         if !admit_connection(&state.ipc_connections, IPC_MAX_ACTIVE_CONNECTIONS) {
-            // At the IPC connection cap: answer with a bounded error frame and
-            // close without spawning another handler thread.
-            let _ = connection.set_nonblocking(true);
+            // At the IPC connection cap: answer with a bounded error frame
+            // under a short deadline and close without spawning another
+            // handler thread. The short deadline keeps a peer that never
+            // drains from pinning the accept loop.
+            let nonblocking = connection.set_nonblocking(true).is_ok();
             let busy = ResponseEnvelope::failure(
                 "invalid-request",
                 "server_busy",
                 "the runtime is at its IPC connection limit; retry shortly",
             );
             let mut connection = connection;
-            let _ = write_response(&mut connection, &busy);
+            if nonblocking {
+                let _ = write_response_with_deadline(&mut connection, &busy, IPC_REJECT_DEADLINE);
+            }
             continue;
         }
         let state = Arc::clone(&state);
@@ -216,10 +231,20 @@ fn runtime_server_is_alive() -> bool {
 }
 
 /// Unix liveness probe for a single name: a live listener accepts connections,
-/// while a stale socket file refuses them. Never removes anything.
+/// while a stale socket file refuses them. ENOENT (no socket file) and
+/// ECONNREFUSED (a socket file with nothing listening behind it) are the only
+/// definitive "dead" signals. Any other connect error — EACCES, EMFILE,
+/// transient failures — must not be read as "dead", or a live Runtime's
+/// socket could be removed. Never removes anything.
 #[cfg(unix)]
 fn runtime_server_is_alive_for(name: &Name<'_>) -> bool {
-    Stream::connect(name.clone()).is_ok()
+    match Stream::connect(name.clone()) {
+        Ok(_) => true,
+        Err(error) => !matches!(
+            error.kind(),
+            ErrorKind::NotFound | ErrorKind::ConnectionRefused
+        ),
+    }
 }
 
 /// The IPC name is held by a process that did not answer the liveness probe.
@@ -234,6 +259,12 @@ fn rebind_after_stale_socket(
 ) -> Result<Listener> {
     #[cfg(unix)]
     {
+        // Re-probe under the startup lock before removing anything: a live
+        // Runtime may have claimed the name between the first probe and now,
+        // and deleting its socket would break the running server.
+        if runtime_server_is_alive() {
+            return Err(error).context("runtime socket path is occupied by another process");
+        }
         if crate::transport::remove_stale_runtime_socket(startup_lock)? {
             match bind_runtime_listener() {
                 Ok(listener) => Ok(listener),
@@ -571,14 +602,16 @@ fn run_web_ui(listener: TcpListener, state: Arc<RuntimeState>) {
         match connection {
             Ok(mut stream) => {
                 if !admit_connection(&state.web_connections, WEB_MAX_ACTIVE_CONNECTIONS) {
-                    // At the Web connection cap: answer with a bounded 503 and
-                    // close without spawning another handler thread.
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                    let _ = write_http(
+                    // At the Web connection cap: answer with a bounded 503
+                    // under a short total deadline and close without spawning
+                    // another handler thread, so a peer that never drains
+                    // cannot pin the accept loop.
+                    let _ = write_http_bytes_with_deadline(
                         &mut stream,
                         "503 Service Unavailable",
                         "text/plain; charset=utf-8",
-                        "too many active WebUI connections; retry shortly",
+                        b"too many active WebUI connections; retry shortly",
+                        WEB_HTTP_REJECT_DEADLINE,
                     );
                     continue;
                 }
@@ -1564,14 +1597,28 @@ fn write_http_bytes(
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
+    write_http_bytes_with_deadline(stream, status, content_type, body, WEB_HTTP_WRITE_TIMEOUT)
+}
+
+/// Like [`write_http_bytes`], but under an explicit total deadline. Used by
+/// the connection-cap rejection path, which writes directly from the accept
+/// thread and must not be pinned by a peer that never drains.
+fn write_http_bytes_with_deadline(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    deadline: Duration,
+) -> std::io::Result<()> {
     if body.len() > WEB_HTTP_MAX_RESPONSE_BYTES {
         // Keep the wire response bounded even if a route produced an oversized
         // body; the replacement body is tiny and cannot recurse.
-        return write_http_bytes(
+        return write_http_bytes_with_deadline(
             stream,
             "500 Internal Server Error",
             "text/plain; charset=utf-8",
             b"server response exceeds the size limit",
+            deadline,
         );
     }
     let headers = format!(
@@ -1581,18 +1628,22 @@ fn write_http_bytes(
     let mut response = Vec::with_capacity(headers.len() + body.len());
     response.extend_from_slice(headers.as_bytes());
     response.extend_from_slice(body);
-    write_tcp_all_with_deadline(stream, &response, WEB_HTTP_WRITE_TIMEOUT)
+    write_tcp_all_with_deadline(stream, &response, deadline)
 }
 
 /// Write one bounded HTTP response under a total wall-clock deadline. A
 /// socket write timeout alone is per syscall, so a peer that accepts a few
 /// bytes repeatedly could otherwise keep resetting `write_all` forever.
+/// Blocked writes (full receive buffer) are retried with a bounded 1–50 ms
+/// backoff instead of a busy loop, and the per-syscall timeout is never set
+/// below 1 ms so a nearly-expired deadline cannot degrade into spinning.
 fn write_tcp_all_with_deadline(
     stream: &mut TcpStream,
     mut data: &[u8],
     timeout: Duration,
 ) -> std::io::Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut poll_delay = WEB_HTTP_WRITE_POLL_MIN;
     while !data.is_empty() {
         let now = Instant::now();
         if now >= deadline {
@@ -1601,7 +1652,11 @@ fn write_tcp_all_with_deadline(
                 "HTTP response write exceeded its total I/O deadline",
             ));
         }
-        stream.set_write_timeout(Some(deadline.saturating_duration_since(now)))?;
+        stream.set_write_timeout(Some(
+            deadline
+                .saturating_duration_since(now)
+                .max(WEB_HTTP_WRITE_POLL_MIN),
+        ))?;
         match stream.write(data) {
             Ok(0) => {
                 return Err(std::io::Error::new(
@@ -1609,9 +1664,20 @@ fn write_tcp_all_with_deadline(
                     "peer closed while receiving the HTTP response",
                 ));
             }
-            Ok(written) => data = &data[written..],
+            Ok(written) => {
+                data = &data[written..];
+                poll_delay = WEB_HTTP_WRITE_POLL_MIN;
+            }
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                continue;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "HTTP response write exceeded its total I/O deadline",
+                    ));
+                }
+                thread::sleep(poll_delay.min(remaining));
+                poll_delay = (poll_delay * 2).min(WEB_HTTP_WRITE_POLL_MAX);
             }
             Err(error) => return Err(error),
         }
@@ -2045,6 +2111,24 @@ mod tests {
     }
 
     #[test]
+    fn http_write_stops_at_the_total_deadline_for_a_peer_that_stops_draining() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        // The peer never reads; a payload far larger than any socket buffer
+        // must stall the write until the total deadline, with the bounded
+        // backoff keeping the loop from running past it by much.
+        let payload = vec![0x55u8; 64 * 1024 * 1024];
+        let started = Instant::now();
+        let error = write_tcp_all_with_deadline(&mut server, &payload, Duration::from_millis(200))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    #[test]
     fn connection_admission_is_bounded_and_releases_slots() {
         let slots = AtomicUsize::new(0);
         for _ in 0..3 {
@@ -2413,33 +2497,76 @@ mod tests {
         )
     }
 
+    /// A unique throwaway temp directory, removed on drop, so the probe test
+    /// never leaves files behind on failure and never touches the real
+    /// runtime path.
+    #[cfg(unix)]
+    struct ProbeTempDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl ProbeTempDir {
+        fn new(label: &str) -> Self {
+            static NEXT_PROBE_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "grok-bridge-probe-test-{label}-{}-{}",
+                std::process::id(),
+                NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProbeTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// The Unix liveness probe must accept a live listener and refuse a stale
     /// socket file, on a throwaway path that never touches the real runtime.
+    /// Covered: no socket file (ENOENT), a live listener, and a socket file
+    /// with no listener behind it (ECONNREFUSED).
     #[cfg(unix)]
     #[test]
     fn unix_liveness_probe_distinguishes_live_and_stale_sockets() {
-        let dir =
-            std::env::temp_dir().join(format!("grok-bridge-probe-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("probe.sock");
+        use std::os::unix::io::IntoRawFd as _;
+
+        let temp = ProbeTempDir::new("probe");
+
+        // No socket file at the path: definitively not alive.
+        let missing = temp.0.join("missing.sock");
+        let missing_name = missing
+            .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+            .unwrap();
+        assert!(!runtime_server_is_alive_for(&missing_name));
+
+        // A live listener behind the path: must probe as alive.
+        let socket = temp.0.join("probe.sock");
         let name = socket
             .to_fs_name::<interprocess::local_socket::GenericFilePath>()
             .unwrap();
-
-        // No listener behind the path: must not probe as alive.
-        assert!(!runtime_server_is_alive_for(&name));
-
         let listener = interprocess::local_socket::ListenerOptions::new()
             .name(name.clone())
             .create_sync()
             .unwrap();
         assert!(runtime_server_is_alive_for(&name));
-
-        // Dropping the listener reclaims the socket file, so the path is stale
-        // again and must no longer probe as alive.
         drop(listener);
-        assert!(!runtime_server_is_alive_for(&name));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // A socket file with no listener behind it (a crashed Runtime's
+        // leftover): refuses the probe and must not count as alive.
+        let stale = temp.0.join("stale.sock");
+        let stale_listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
+        let fd = stale_listener.into_raw_fd();
+        unsafe {
+            libc::close(fd);
+        }
+        assert!(stale.exists(), "stale socket file must remain on disk");
+        let stale_name = stale
+            .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+            .unwrap();
+        assert!(!runtime_server_is_alive_for(&stale_name));
     }
 }
