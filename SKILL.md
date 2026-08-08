@@ -9,7 +9,7 @@ Resolve `<skill-dir>` as the directory containing this file. Resolve `<bridge>` 
 
 - On Unix, run `uname -s` and `uname -m` once.
 - On Windows, run `powershell -NoProfile -Command "[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()"` once. Map `X64` to x86_64 and `Arm64` to ARM64. This reports the underlying OS architecture even when the host agent runs under emulation. If that API is unavailable, use `PROCESSOR_ARCHITEW6432` when set, otherwise `PROCESSOR_ARCHITECTURE`.
-- Map only the detected pair through this table. Treat `AMD64` as x86_64 and `aarch64` as ARM64. If the pair is unsupported or the selected file is missing, stop and report it instead of trying another architecture.
+- Map only the detected pair through this table. Treat `uname -s` result `Darwin` as `macOS`, `AMD64` as x86_64, and `aarch64`/`arm64` as ARM64. If the pair is unsupported or the selected file is missing, stop and report it instead of trying another architecture.
 
 | Host | Executable |
 | --- | --- |
@@ -18,7 +18,7 @@ Resolve `<skill-dir>` as the directory containing this file. Resolve `<bridge>` 
 | Linux x86_64 | `<skill-dir>/bin/linux-x86_64/grok-bridge` |
 | Linux ARM64 | `<skill-dir>/bin/linux-arm64/grok-bridge` |
 | macOS x86_64 | `<skill-dir>/bin/macos-x86_64/grok-bridge` |
-| macOS Apple Silicon | `<skill-dir>/bin/macos-arm64/grok-bridge` |
+| macOS ARM64 | `<skill-dir>/bin/macos-arm64/grok-bridge` |
 
 Refer to the selected executable as `<bridge>` below. Do not download another wrapper, invoke Python, or fall back to a different bundled architecture.
 
