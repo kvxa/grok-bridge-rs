@@ -16,6 +16,12 @@ afterEach(() => {
   resetTerminalFeeds();
 });
 
+// Raw delta sized from the byte budget rather than a hard-coded 1 MiB
+// constant: base64 of n raw bytes is about 4n/3 chars, so 3/4 of the budget
+// minus a small margin keeps a single delta's base64 form under the budget
+// while two of them stably overflow it.
+const DELTA_RAW_BYTES = Math.floor((TERMINAL_BUFFER_MAX_BYTES * 3) / 4) - 64;
+
 describe("terminalFeeds", () => {
   it("replays bounded pre-subscription backlog then releases it", () => {
     pushTerminalEntries([
@@ -119,6 +125,68 @@ describe("terminalFeeds", () => {
       { session: "gone", reset: true, data_base64: btoa("z") },
     ]);
     expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("reconcile keeps active sessions and clears orphaned gap-invalid state", () => {
+    // Two budget-derived deltas gap the cursor chain: the bridging delta is
+    // trimmed away and the retained stream turns gap-invalid (emptied).
+    const big = btoa("x".repeat(DELTA_RAW_BYTES));
+    pushTerminalEntries([
+      {
+        session: "s1",
+        reset: true,
+        cursor: 0,
+        next_cursor: 10,
+        data_base64: btoa("SNAP"),
+      },
+      {
+        session: "s1",
+        reset: false,
+        cursor: 10,
+        next_cursor: 20,
+        data_base64: big,
+      },
+      {
+        session: "s1",
+        reset: false,
+        cursor: 20,
+        next_cursor: 30,
+        data_base64: big,
+      },
+    ]);
+    expect(peekTerminalBuffer("s1")).toHaveLength(0);
+    // While the gap-invalid flag lives on, subsequent deltas stay discarded.
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 30, next_cursor: 40, data_base64: btoa("C") },
+    ]);
+    expect(peekTerminalBuffer("s1")).toHaveLength(0);
+
+    // A subscribe/unsubscribe cycle releases the (now empty) retained buffer:
+    // s1 disappears from both buffers and listeners, leaving only the
+    // orphaned gap-invalid flag behind for reconcile to clear.
+    const unsubscribe = subscribeTerminal("s1", () => {});
+    unsubscribe();
+    expect(peekTerminalBuffer("s1")).toHaveLength(0);
+
+    // A healthy active session keeps its anchored backlog untouched.
+    pushTerminalEntries([
+      { session: "s2", reset: true, cursor: 0, next_cursor: 50, data_base64: btoa("SNAP2") },
+      { session: "s2", reset: false, cursor: 50, next_cursor: 55, data_base64: btoa("A") },
+    ]);
+    reconcileTerminalSessions(new Set(["s2"]));
+    expect(peekTerminalBuffer("s2").map((entry) => entry.data_base64)).toEqual([
+      btoa("SNAP2"),
+      btoa("A"),
+    ]);
+
+    // The inactive session's leftover gap-invalid flag was cleared: a fresh
+    // delta is retained again instead of being dropped by the stale flag.
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 30, next_cursor: 40, data_base64: btoa("C") },
+    ]);
+    expect(peekTerminalBuffer("s1").map((entry) => entry.data_base64)).toEqual([
+      btoa("C"),
+    ]);
   });
 
   it("rebuilds remount backlog only after all listeners leave", () => {
@@ -231,8 +299,8 @@ describe("terminalFeeds", () => {
   });
 
   it("discards deltas once a trim creates a cursor gap until a reset re-anchors", () => {
-    // Two ~700 KiB deltas force the byte cap to drop the bridging delta.
-    const big = btoa("x".repeat(700 * 1024));
+    // Two budget-derived deltas force the byte cap to drop the bridging delta.
+    const big = btoa("x".repeat(DELTA_RAW_BYTES));
     pushTerminalEntries([
       {
         session: "s1",
@@ -285,7 +353,7 @@ describe("terminalFeeds", () => {
   });
 
   it("keeps a trimmed gap invalid after subscribe until a live reset", () => {
-    const big = btoa("x".repeat(700 * 1024));
+    const big = btoa("x".repeat(DELTA_RAW_BYTES));
     pushTerminalEntries([
       {
         session: "s1",

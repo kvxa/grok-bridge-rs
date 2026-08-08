@@ -174,11 +174,14 @@ export function subscribeTerminal(session, listener) {
   set.add(listener);
 
   const buffer = buffers.get(session);
-  if (buffer && buffer.length > 0) {
-    const replay = buffer.slice();
+  // Subscribing releases the retained backlog/state even when it has drained
+  // to an empty buffer: only the actual entries are replayed.
+  if (buffers.has(session)) {
     buffers.delete(session);
     bufferBytes.delete(session);
-    for (const entry of replay) listener(entry);
+  }
+  if (buffer && buffer.length > 0) {
+    for (const entry of buffer.slice()) listener(entry);
   }
 
   return () => {
@@ -200,11 +203,17 @@ export function reconcileTerminalSessions(activeSessionIds) {
     activeSessionIds instanceof Set
       ? activeSessionIds
       : new Set(activeSessionIds || []);
-  for (const session of [...buffers.keys()]) {
+  // Reconcile every map a session can occupy: retained buffers, live
+  // listeners, and the gap-invalid flag. Sessions that are only gap-invalid
+  // (e.g. after their drained buffer was released) would otherwise leak that
+  // flag even though they are gone from buffers and listeners.
+  const sessions = new Set([
+    ...buffers.keys(),
+    ...listeners.keys(),
+    ...gapInvalid.keys(),
+  ]);
+  for (const session of sessions) {
     if (!active.has(session)) disposeTerminalSession(session);
-  }
-  for (const session of [...listeners.keys()]) {
-    if (!active.has(session)) listeners.delete(session);
   }
 }
 

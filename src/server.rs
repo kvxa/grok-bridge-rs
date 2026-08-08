@@ -1896,7 +1896,8 @@ mod tests {
         assert_eq!(second.id.as_deref(), Some("k2"));
         assert!(!second.ok);
 
-        // resize success still yields a single positive ack carrying the id.
+        // A missing session fails apply for resize too, but still resolves to
+        // exactly one resize_result carrying the id.
         let resize = WebEventsClientCommand::TerminalResize {
             id: "k3".to_owned(),
             session: "missing-session".to_owned(),

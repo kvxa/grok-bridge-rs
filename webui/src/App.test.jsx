@@ -29,7 +29,7 @@ vi.mock("@xterm/addon-fit", () => {
 });
 
 import App from "./App.jsx";
-import { SUPPORTED_LOCALES } from "./i18n/index.js";
+import { SUPPORTED_LOCALES, catalogs } from "./i18n/index.js";
 
 const sessions = [
   {
@@ -611,7 +611,9 @@ describe("App", () => {
     const dismiss = alert.querySelector("[data-input-indeterminate-dismiss]");
     expect(dismiss).not.toBeNull();
     expect(dismiss.tagName).toBe("BUTTON");
-    expect(dismiss.getAttribute("aria-label")).toBe("忽略未确认输入提示");
+    expect(dismiss.getAttribute("aria-label")).toBe(
+      catalogs["zh-CN"]["interactive.dismissAria"],
+    );
 
     // Dismiss hides the alert and it stays hidden for later result acks.
     await act(async () => dismiss.click());

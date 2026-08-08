@@ -951,6 +951,9 @@ describe("Terminal (xterm read-only)", () => {
     const attempts = sendResize.mock.calls.length;
     // Initial attempt + at most RESIZE_RETRY_MAX automatic retries.
     expect(attempts).toBeLessThanOrEqual(1 + RESIZE_RETRY_MAX);
+    // At least one retry actually ran: a single failure alone must not be the
+    // whole story, so the attempt count exceeds the initial attempt.
+    expect(attempts).toBeGreaterThan(1);
 
     // After the cap the retry chain stops: more time changes nothing.
     const settled = sendResize.mock.calls.length;
