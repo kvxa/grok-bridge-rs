@@ -250,7 +250,7 @@ describe("terminalFeeds", () => {
 
   it("keeps a fitting reset generation whole and invalidates an over-budget one", () => {
     // Snapshot sized so the anchor fits the budget together with a few deltas.
-    const raw = Math.floor((TERMINAL_BUFFER_MAX_BYTES * 3) / 4) - 64;
+    const raw = DELTA_RAW_BYTES;
     const snapshot = btoa("S".repeat(raw));
     pushTerminalEntries([
       { session: "s1", reset: true, data_base64: snapshot },
@@ -578,5 +578,166 @@ describe("terminalFeeds", () => {
       { session: "s1", reset: true, cursor: 0, next_cursor: 5, data_base64: btoa("FRESH") },
     ]);
     expect(received).toEqual([btoa("FRESH")]);
+  });
+
+  it("delivers a contiguous live stream and drops deltas after a live cursor gap until a reset", () => {
+    const received = [];
+    subscribeTerminal("s1", (entry) => received.push(entry.data_base64));
+
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 100, data_base64: btoa("SNAP") },
+      { session: "s1", reset: false, cursor: 100, next_cursor: 105, data_base64: btoa("A") },
+      { session: "s1", reset: false, cursor: 105, next_cursor: 110, data_base64: btoa("B") },
+    ]);
+    // Contiguous live entries are delivered in order.
+    expect(received).toEqual([btoa("SNAP"), btoa("A"), btoa("B")]);
+
+    // A delta that jumps the last delivered cursor is dropped and poisons
+    // the live stream.
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 200, next_cursor: 210, data_base64: btoa("J") },
+    ]);
+    expect(received).toEqual([btoa("SNAP"), btoa("A"), btoa("B")]);
+
+    // Later deltas stay suppressed, even contiguous-looking ones.
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 210, next_cursor: 220, data_base64: btoa("C") },
+      { session: "s1", reset: false, cursor: 220, next_cursor: 230, data_base64: btoa("D") },
+    ]);
+    expect(received).toEqual([btoa("SNAP"), btoa("A"), btoa("B")]);
+
+    // A reset re-anchors the stream and live delivery resumes.
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 300, data_base64: btoa("FRESH") },
+      { session: "s1", reset: false, cursor: 300, next_cursor: 305, data_base64: btoa("E") },
+    ]);
+    expect(received).toEqual([
+      btoa("SNAP"),
+      btoa("A"),
+      btoa("B"),
+      btoa("FRESH"),
+      btoa("E"),
+    ]);
+  });
+
+  it("keeps live cursor continuity across unsubscribe and resubscribe", () => {
+    const first = [];
+    const unsubscribe = subscribeTerminal("s1", (entry) => first.push(entry.data_base64));
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 100, data_base64: btoa("SNAP") },
+      { session: "s1", reset: false, cursor: 100, next_cursor: 110, data_base64: btoa("A") },
+    ]);
+    expect(first).toEqual([btoa("SNAP"), btoa("A")]);
+    unsubscribe();
+
+    // The retained stream continues from the last live next_cursor.
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 110, next_cursor: 120, data_base64: btoa("B") },
+      { session: "s1", reset: false, cursor: 120, next_cursor: 130, data_base64: btoa("C") },
+    ]);
+    expect(peekTerminalBuffer("s1").map((entry) => entry.data_base64)).toEqual([
+      btoa("B"),
+      btoa("C"),
+    ]);
+
+    // A fresh subscriber replays the backlog; the live delta continues it
+    // instead of being gapped against the stale pre-unsubscribe anchor.
+    const second = [];
+    subscribeTerminal("s1", (entry) => second.push(entry.data_base64));
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 130, next_cursor: 140, data_base64: btoa("D") },
+    ]);
+    expect(second).toEqual([btoa("B"), btoa("C"), btoa("D")]);
+  });
+
+  it("does not retain a partial sequence after unsubscribe until a reset re-anchors", () => {
+    const unsubscribe = subscribeTerminal("s1", () => {});
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 100, data_base64: btoa("SNAP") },
+      { session: "s1", reset: false, cursor: 100, next_cursor: 110, data_base64: btoa("A") },
+    ]);
+    unsubscribe();
+
+    // The first retained delta must continue the last live anchor; a jump
+    // would later replay a partial sequence to a subscriber.
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 500, next_cursor: 510, data_base64: btoa("J") },
+    ]);
+    expect(peekTerminalBuffer("s1")).toHaveLength(0);
+
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 510, next_cursor: 520, data_base64: btoa("K") },
+    ]);
+    expect(peekTerminalBuffer("s1")).toHaveLength(0);
+
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 520, data_base64: btoa("FRESH") },
+    ]);
+    expect(peekTerminalBuffer("s1").map((entry) => entry.data_base64)).toEqual([
+      btoa("FRESH"),
+    ]);
+  });
+
+  it("preserves the live cursor anchor across an immediate resubscribe without backlog", () => {
+    const first = [];
+    const unsubscribe = subscribeTerminal("s1", (entry) => first.push(entry.data_base64));
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 100, data_base64: btoa("SNAP") },
+      { session: "s1", reset: false, cursor: 100, next_cursor: 110, data_base64: btoa("A") },
+    ]);
+    expect(first).toEqual([btoa("SNAP"), btoa("A")]);
+    unsubscribe();
+
+    // No retained entry arrives before the immediate resubscribe: the live
+    // anchor delivered to the previous listener must survive the transition.
+    const second = [];
+    subscribeTerminal("s1", (entry) => second.push(entry.data_base64));
+
+    // A jumped delta must not be silently accepted as a fresh anchor.
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 500, next_cursor: 510, data_base64: btoa("J") },
+    ]);
+    expect(second).toEqual([]);
+
+    // Later deltas stay suppressed until a reset re-anchors delivery.
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 510, next_cursor: 520, data_base64: btoa("K") },
+    ]);
+    expect(second).toEqual([]);
+
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 520, data_base64: btoa("FRESH") },
+      { session: "s1", reset: false, cursor: 520, next_cursor: 525, data_base64: btoa("L") },
+    ]);
+    expect(second).toEqual([btoa("FRESH"), btoa("L")]);
+  });
+
+  it("re-anchors the retained stream on a reset after a live phase", () => {
+    const unsubscribe = subscribeTerminal("s1", () => {});
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 100, data_base64: btoa("SNAP") },
+      { session: "s1", reset: false, cursor: 100, next_cursor: 110, data_base64: btoa("A") },
+    ]);
+    unsubscribe();
+
+    // A retained reset starts a fresh 0-based coordinate system: it must not
+    // be compared against the old live anchor (110) and rejected.
+    pushTerminalEntries([
+      { session: "s1", reset: true, cursor: 0, next_cursor: 200, data_base64: btoa("FRESH") },
+    ]);
+    expect(peekTerminalBuffer("s1").map((entry) => entry.data_base64)).toEqual([
+      btoa("FRESH"),
+    ]);
+
+    // The reset is replayed to the next subscriber, and live delivery
+    // resumes from its next_cursor instead of the pre-reset live anchor.
+    const received = [];
+    subscribeTerminal("s1", (entry) => received.push(entry.data_base64));
+    expect(received).toEqual([btoa("FRESH")]);
+
+    pushTerminalEntries([
+      { session: "s1", reset: false, cursor: 200, next_cursor: 210, data_base64: btoa("B") },
+    ]);
+    expect(received).toEqual([btoa("FRESH"), btoa("B")]);
   });
 });

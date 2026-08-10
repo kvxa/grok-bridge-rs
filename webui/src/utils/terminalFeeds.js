@@ -16,6 +16,12 @@ const bufferBytes = new Map();
  * discarded until the next reset re-anchors a fresh snapshot.
  */
 const gapInvalid = new Map();
+/**
+ * @type {Map<string, number>} Last next_cursor successfully delivered to a
+ * live listener per session. A non-reset delta must continue this cursor; a
+ * jump marks the session gap-invalid until the next reset re-anchors it.
+ */
+const liveNextCursor = new Map();
 /** @type {Map<string, Set<(entry: TerminalEntry) => void>>} */
 const listeners = new Map();
 
@@ -127,9 +133,27 @@ export function pushTerminalEntries(entries) {
         // A newly mounted terminal has no faithful replay anchor after a
         // retained gap. Keep dropping deltas until the Runtime sends a reset.
         continue;
+      } else if (hasCursorRange(entry)) {
+        // Enforce cursor continuity before delivering a non-reset delta. A
+        // jump means data was lost before this entry: live delivery would
+        // replay a partial sequence into the terminal.
+        const lastNextCursor = liveNextCursor.get(entry.session);
+        if (lastNextCursor !== undefined && entry.cursor !== lastNextCursor) {
+          liveNextCursor.delete(entry.session);
+          gapInvalid.set(entry.session, true);
+          continue;
+        }
       }
       const set = listeners.get(entry.session);
       for (const listener of set) listener(entry);
+      // The next live delta must continue from where this one ends; a reset
+      // without a cursor range clears the anchor so later deltas are not
+      // checked against a stale position.
+      if (hasCursorRange(entry)) {
+        liveNextCursor.set(entry.session, entry.next_cursor);
+      } else if (entry.reset) {
+        liveNextCursor.delete(entry.session);
+      }
       continue;
     }
 
@@ -144,14 +168,22 @@ export function pushTerminalEntries(entries) {
       continue;
     }
     // A delta that does not continue the last retained range means data was
-    // lost before it: the retained stream is no longer faithful.
+    // lost before it: the retained stream is no longer faithful. The first
+    // retained delta after a live phase must continue the last live anchor
+    // too, or the buffer would later replay a partial sequence to a
+    // subscriber. A reset is exempt: it starts a fresh 0-based coordinate
+    // system and always re-anchors the stream.
     const prev = buffer.at(-1);
+    const lastDelivered = prev ? undefined : liveNextCursor.get(entry.session);
     if (
-      prev &&
-      hasCursorRange(prev) &&
+      !entry.reset &&
       hasCursorRange(entry) &&
-      prev.next_cursor !== entry.cursor
+      ((prev &&
+        hasCursorRange(prev) &&
+        prev.next_cursor !== entry.cursor) ||
+        (!prev && lastDelivered !== undefined && entry.cursor !== lastDelivered))
     ) {
+      if (!prev) liveNextCursor.delete(entry.session);
       invalidateRetainedStream(entry.session);
       continue;
     }
@@ -179,6 +211,7 @@ export function subscribeTerminal(session, listener) {
     listeners.set(session, set);
   }
   set.add(listener);
+  const isFirstListener = set.size === 1;
 
   const buffer = buffers.get(session);
   // Subscribing releases the retained backlog/state even when it has drained
@@ -189,6 +222,22 @@ export function subscribeTerminal(session, listener) {
   }
   if (buffer && buffer.length > 0) {
     for (const entry of buffer.slice()) listener(entry);
+  }
+  // Live continuity resumes from the replayed backlog's tail. Only the
+  // transition into live adjusts the anchor; later listeners joining an
+  // active live stream must not disturb the cursor already being tracked.
+  // With no backlog to replay, the stream continues from wherever live
+  // delivery left off, so a trustworthy anchor is preserved instead of
+  // erased (which would silently accept a jumped delta as a fresh anchor).
+  if (isFirstListener) {
+    const last = buffer?.at(-1);
+    if (last && hasCursorRange(last)) {
+      liveNextCursor.set(session, last.next_cursor);
+    } else if (buffer && buffer.length > 0) {
+      // A replayed backlog whose tail exposes no cursor anchor cannot
+      // establish live continuity, so any stale anchor is dropped.
+      liveNextCursor.delete(session);
+    }
   }
 
   return () => {
@@ -201,6 +250,7 @@ export function disposeTerminalSession(session) {
   buffers.delete(session);
   bufferBytes.delete(session);
   gapInvalid.delete(session);
+  liveNextCursor.delete(session);
   listeners.delete(session);
 }
 
@@ -218,6 +268,7 @@ export function reconcileTerminalSessions(activeSessionIds) {
     ...buffers.keys(),
     ...listeners.keys(),
     ...gapInvalid.keys(),
+    ...liveNextCursor.keys(),
   ]);
   for (const session of sessions) {
     if (!active.has(session)) disposeTerminalSession(session);
@@ -229,6 +280,7 @@ export function resetTerminalFeeds() {
   buffers.clear();
   bufferBytes.clear();
   gapInvalid.clear();
+  liveNextCursor.clear();
   listeners.clear();
 }
 
