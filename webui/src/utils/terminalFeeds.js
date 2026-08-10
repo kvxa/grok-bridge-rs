@@ -71,15 +71,17 @@ function invalidateRetainedStream(session) {
 }
 
 /**
- * Bound a retained buffer after a push: drop the oldest (stale) entries while
- * over either limit. The full-snapshot anchor — the newest reset entry, always
- * at index 0 because a reset clears the buffer before being pushed — is never
- * dropped: replay relies on it for recovery, so only deltas (or, when no
- * anchor exists yet, leading deltas) are trimmed.
+ * Bound a retained buffer after a push. A stream carrying a full-snapshot
+ * anchor — buffer[0].reset === true, always at index 0 because a reset clears
+ * the buffer before being pushed — is an atomic generation: the Runtime splits
+ * a large snapshot into a reset anchor plus `reset=false` continuations, and
+ * the anchor with every entry after it forms one replayable unit. Dropping
+ * any member (byte budget, entry budget, or stale-delta trim) would replay a
+ * partial snapshot into xterm, so the whole generation is invalidated instead
+ * and the session stays gap-invalid until a reset that fits entirely arrives.
  *
- * Trimming can remove the delta that bridged two retained ranges. The cursor
- * chain then has a gap and the buffer can no longer be replayed faithfully:
- * the whole retained stream is invalidated until the next reset.
+ * Without an anchor (a pure delta stream) the oldest deltas are dropped as
+ * before; a cursor chain broken by that trim still invalidates the stream.
  */
 function trimRetainedBuffer(session, buffer) {
   let bytes = bufferBytes.get(session) ?? 0;
@@ -88,8 +90,13 @@ function trimRetainedBuffer(session, buffer) {
     buffer.length > TERMINAL_BUFFER_MAX_ENTRIES ||
     bytes > TERMINAL_BUFFER_MAX_BYTES
   ) {
+    if (hasAnchor) {
+      // The generation cannot fit whole: keep no partial snapshot around.
+      invalidateRetainedStream(session);
+      return;
+    }
     if (buffer.length <= 1) break;
-    const dropped = buffer.splice(hasAnchor ? 1 : 0, 1)[0];
+    const dropped = buffer.splice(0, 1)[0];
     bytes -= entryBytes(dropped);
   }
   if (hasCursorGap(buffer)) {

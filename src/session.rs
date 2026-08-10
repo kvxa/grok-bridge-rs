@@ -766,6 +766,7 @@ struct LaunchConfig {
 /// while terminal response frames (never admitted, sent directly) carry zero.
 /// The writer releases exactly `budget` bytes after writing, so the byte
 /// counter can never go negative for a response that was never counted.
+#[derive(Debug, PartialEq)]
 struct WriterItem {
     data: Vec<u8>,
     budget: usize,
@@ -3483,7 +3484,7 @@ mod tests {
             .apply_hook_event(hook_event(HookEventKind::PreToolUse))
             .unwrap();
         session.send("\u{3}".to_owned()).unwrap();
-        assert_eq!(writer_rx.recv().unwrap(), b"\x03");
+        assert_eq!(writer_rx.recv().unwrap().data, b"\x03");
         let state = session.state().unwrap();
         assert_eq!(state.phase, SessionPhase::Running);
         assert_eq!(state.activity, HookActivity::Working);
@@ -3492,17 +3493,25 @@ mod tests {
         let (idle_tx, idle_rx) = sync_channel(1);
         *idle.writer_tx.lock().unwrap() = Some(idle_tx);
         idle.send("\u{3}".to_owned()).unwrap();
-        assert_eq!(idle_rx.recv().unwrap(), b"\x03");
+        assert_eq!(idle_rx.recv().unwrap().data, b"\x03");
         let state = idle.state().unwrap();
         assert_eq!(state.phase, SessionPhase::Idle);
         assert_eq!(state.activity, HookActivity::Unknown);
 
         session.send("next task".to_owned()).unwrap();
-        assert_eq!(writer_rx.recv().unwrap(), b"\x1b[200~next task\x1b[201~\r");
+        assert_eq!(
+            writer_rx.recv().unwrap().data,
+            b"\x1b[200~next task\x1b[201~\r"
+        );
 
         let full = test_session(SessionPhase::Idle);
         let (full_tx, _full_rx) = sync_channel(1);
-        full_tx.try_send(vec![b'x']).unwrap();
+        full_tx
+            .try_send(WriterItem {
+                data: vec![b'x'],
+                budget: 1,
+            })
+            .unwrap();
         *full.writer_tx.lock().unwrap() = Some(full_tx);
         let before = full.state().unwrap();
         let error = full.send("\u{3}".to_owned()).unwrap_err();
@@ -3530,7 +3539,7 @@ mod tests {
         *session.writer_tx.lock().unwrap() = Some(writer_tx);
 
         session.write_raw(b"\x03".to_vec()).unwrap();
-        assert_eq!(writer_rx.recv().unwrap(), b"\x03");
+        assert_eq!(writer_rx.recv().unwrap().data, b"\x03");
         let state = session.state().unwrap();
         assert_eq!(state.phase, SessionPhase::Idle);
         assert_eq!(state.activity, HookActivity::Unknown);
@@ -3542,7 +3551,12 @@ mod tests {
 
         let full = test_session(SessionPhase::Idle);
         let (full_tx, _full_rx) = sync_channel(1);
-        full_tx.try_send(vec![b'x']).unwrap();
+        full_tx
+            .try_send(WriterItem {
+                data: vec![b'x'],
+                budget: 1,
+            })
+            .unwrap();
         *full.writer_tx.lock().unwrap() = Some(full_tx);
         let before = full.state().unwrap();
         let error = full.write_raw(b"\x03".to_vec()).unwrap_err();
