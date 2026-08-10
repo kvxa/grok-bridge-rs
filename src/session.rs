@@ -850,6 +850,17 @@ impl SessionHost {
         ))
     }
 
+    /// Stop every session and reap every owned process scope before the server
+    /// exits. The bounded group close runs first; sessions it could not stop
+    /// (Timeout or Failed) keep their process and PTY ownership, and this exit
+    /// path then force-terminates and reaps each surviving scope within its own
+    /// fresh bounded window. Server exit therefore never orphans a Unix process
+    /// group or a Windows job scope, whether it was triggered by ServerStop or
+    /// by the accept loop ending. A structural group-close failure (broken
+    /// worker channel, poisoned registry) is not fatal to the cleanup: the
+    /// snapshot then retains every session and the final forced pass covers all
+    /// of them, with the structural error merged into the result. Only scopes
+    /// that are *still* alive after their own forced window are reported.
     pub(crate) fn shutdown_all(&self) -> Result<()> {
         let sessions = {
             let mut registry = self
@@ -863,16 +874,61 @@ impl SessionHost {
                 .map(|(handle, session)| (handle.clone(), Arc::clone(session)))
                 .collect::<Vec<_>>()
         };
-        let outcomes =
-            self.run_close_group(sessions, default_group_deadline(), GROUP_CLOSE_WORKERS)?;
-        let (result, _not_closed) = self.apply_close_outcomes(outcomes)?;
+        // Server exit is the last process owner: whichever sessions the bounded
+        // group close could not verify closed (Timeout, Failed, or a structural
+        // error that prevented per-session outcomes) must be force-terminated
+        // here instead of letting the host drop with the scope still running.
+        let (not_closed, close_error) = match self.run_close_group(
+            sessions.clone(),
+            default_group_deadline(),
+            GROUP_CLOSE_WORKERS,
+        ) {
+            Ok(outcomes) => match self.apply_close_outcomes(outcomes) {
+                Ok((_result, leftovers)) => (leftovers, None),
+                Err(error) => {
+                    // The registry lock is poisoned and no outcome was applied:
+                    // every snapshot session still owns its scope.
+                    (sessions, Some(error))
+                }
+            },
+            Err(error) => {
+                // The group close failed structurally without per-session
+                // outcomes; the snapshot still owns every scope.
+                (sessions, Some(error))
+            }
+        };
+        // Each surviving session gets its own forced-termination window so a
+        // slow first scope cannot consume a shared deadline and starve the
+        // remaining ones of their Kill signal.
+        let mut survivors = Vec::new();
+        for (handle, session) in not_closed {
+            let final_deadline =
+                Instant::now() + Duration::from_millis(u64::from(PROCESS_TERMINATE_TIMEOUT_MS));
+            match session.force_terminate_scope(final_deadline) {
+                EscalationResult::Done => {
+                    if session.finalize_now() != CloseOutcome::Closed {
+                        survivors.push(format!(
+                            "{handle}: close could not be finalized after final termination"
+                        ));
+                    }
+                }
+                EscalationResult::Timeout => survivors.push(format!(
+                    "{handle}: process scope survived the final forced termination window"
+                )),
+                EscalationResult::Failed(message) => survivors.push(format!("{handle}: {message}")),
+            }
+        }
         self.notify_revision();
-        if result.timed_out.is_empty() && result.failures.is_empty() {
+        if let Some(error) = close_error {
+            survivors.push(format!("group close failed: {error:#}"));
+        }
+        if survivors.is_empty() {
             Ok(())
         } else {
-            let mut errors = result.timed_out;
-            errors.extend(result.failures);
-            bail!("failed to stop one or more sessions: {}", errors.join("; "))
+            bail!(
+                "failed to stop one or more sessions: {}",
+                survivors.join("; ")
+            )
         }
     }
 
@@ -1790,7 +1846,8 @@ impl Session {
     /// just the root). Escalation milestones honor a minimum grace so a
     /// graceful child is not force-killed prematurely; the highest level
     /// already sent is remembered across attempts on Unix. Windows applies the
-    /// same bounded schedule to the kernel-owned Job scope.
+    /// same bounded schedule to the kernel-owned Job scope, where the HUP and
+    /// TERM phases wait for natural exit and only KILL terminates the job.
     fn escalate_until_done(&self, deadline: Instant) -> EscalationResult {
         let started_at = Instant::now();
         let budget = deadline.saturating_duration_since(started_at);
@@ -1851,6 +1908,54 @@ impl Session {
             // Wait on session changes (reader progress, waiter report) without
             // treating a terminal phase as proof the scope is gone: the liveness
             // probe at the top of the loop remains the authority.
+            let inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(_) => {
+                    return EscalationResult::Failed("session state lock was poisoned".into());
+                }
+            };
+            let _ = self
+                .changed
+                .wait_timeout(inner, wait)
+                .map_err(|_| anyhow::anyhow!("session wait lock was poisoned"));
+        }
+    }
+
+    /// Final forced termination used by `shutdown_all` for sessions the bounded
+    /// group close could not stop. Skips the HUP/TERM ladder and sends KILL
+    /// directly (Unix process-group SIGKILL / Windows `TerminateJobObject`),
+    /// then reaps until the liveness probe verifies the whole scope is gone or
+    /// `deadline` passes. The signal is repeated while the scope stays alive
+    /// because a member can fork into the group concurrently with the first
+    /// signal. Never reports `Done` without the probe certifying the scope
+    /// gone; a transient send failure is remembered and retried.
+    fn force_terminate_scope(&self, deadline: Instant) -> EscalationResult {
+        let stable_scan_at = deadline
+            .checked_sub(Duration::from_millis(STABLE_SCOPE_SCAN_LEAD_MS))
+            .unwrap_or(deadline);
+        let mut last_error: Option<String> = None;
+        loop {
+            let now = Instant::now();
+            if let ScopeAlive::Gone = self.probe_scope(now >= stable_scan_at) {
+                self.record_verified_process_done();
+                return EscalationResult::Done;
+            }
+            if now >= deadline {
+                return match last_error {
+                    Some(message) => EscalationResult::Failed(format!(
+                        "final forced termination could not be verified: {message}"
+                    )),
+                    None => EscalationResult::Timeout,
+                };
+            }
+            if let Err(error) = self.escalate_to(TerminationLevel::Kill) {
+                // Transient failures can clear on the next round; keep sending.
+                last_error = Some(error.to_string());
+            }
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50))
+                .max(Duration::from_millis(1));
             let inner = match self.inner.lock() {
                 Ok(inner) => inner,
                 Err(_) => {
@@ -3065,19 +3170,35 @@ impl WindowsJob {
         }
     }
 
+    /// Apply one termination level to the Job Object scope.
+    ///
+    /// Windows has no job-scoped graceful signal, so the escalation ladder's
+    /// `Hup` and `Term` phases are wait-only: the close loop keeps probing
+    /// `ActiveProcesses` and gives members a chance to exit naturally, and no
+    /// force-kill is issued. Only `Kill` force-terminates every member with
+    /// `TerminateJobObject`. A scope that is already verifiably gone is
+    /// success, mirroring the Unix `ESRCH` semantics.
     fn terminate(&self, level: TerminationLevel) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
-        if level == TerminationLevel::None || self.process_scope_alive() == ScopeAlive::Gone {
-            return Ok(());
-        }
-        if unsafe { TerminateJobObject(self.handle.as_raw_handle() as _, 1) } != 0
-            || self.process_scope_alive() == ScopeAlive::Gone
-        {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
+        match level {
+            TerminationLevel::None => Ok(()),
+            TerminationLevel::Hup | TerminationLevel::Term => {
+                // Wait-only phase: no TerminateJobObject. The escalation loop
+                // owns the bounded wait between milestones; a job whose members
+                // already exited is success.
+                Ok(())
+            }
+            TerminationLevel::Kill => {
+                if unsafe { TerminateJobObject(self.handle.as_raw_handle() as _, 1) } != 0
+                    || self.process_scope_alive() == ScopeAlive::Gone
+                {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            }
         }
     }
 }
@@ -3224,27 +3345,38 @@ fn report_windows_grok_pid(name: &std::ffi::OsStr, pid: u32) -> Result<()> {
     }
 }
 
+/// Apply one termination level to a bare Windows process, used when no Job
+/// Object scope is retained (e.g. tests). Mirrors `WindowsJob::terminate`:
+/// `Hup` and `Term` are wait-only phases and `Kill` force-terminates the
+/// process with `TerminateProcess`; a process already gone is success.
 #[cfg(windows)]
 fn terminate_windows_process(pid: u32, level: TerminationLevel) -> std::io::Result<()> {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
-    if level == TerminationLevel::None {
-        return Ok(());
-    }
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        return if process_alive(pid) == ScopeAlive::Gone {
+    match level {
+        TerminationLevel::None => Ok(()),
+        TerminationLevel::Hup | TerminationLevel::Term => {
+            // Wait-only phase: no force-kill. A process that already exited is
+            // observed by the liveness probe.
             Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        };
-    }
-    let result = unsafe { TerminateProcess(handle, 1) };
-    unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-    if result != 0 || process_alive(pid) == ScopeAlive::Gone {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+        }
+        TerminationLevel::Kill => {
+            let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+            if handle.is_null() {
+                return if process_alive(pid) == ScopeAlive::Gone {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                };
+            }
+            let result = unsafe { TerminateProcess(handle, 1) };
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            if result != 0 || process_alive(pid) == ScopeAlive::Gone {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
     }
 }
 
@@ -3981,6 +4113,74 @@ pub(crate) mod tests {
                     TEST_PROVIDER_SESSION_ID.to_owned(),
                     "gbt-test".to_owned(),
                 )]),
+                clients: HashMap::new(),
+                closed: HashMap::new(),
+            }),
+            next_id: AtomicU64::new(1),
+            orphan_policy: OrphanPolicy {
+                lease_ms: 120_000,
+                grace_ms: 600_000,
+            },
+            revision,
+        }
+    }
+
+    /// Build a host that owns one Running test session whose immutable
+    /// `scope_id` addresses a real Unix process group. Mirrors
+    /// `windows_process_host`: the scope id is set before the session is
+    /// wrapped in an Arc and inserted into the registry.
+    #[cfg(unix)]
+    fn unix_process_host(pgid: u32) -> SessionHost {
+        let revision = Arc::new(HostRevision::new());
+        let mut session = test_session_with_revision(SessionPhase::Running, Arc::clone(&revision));
+        session.scope_id = pgid;
+        session.inner.get_mut().unwrap().process_id = Some(pgid);
+        let session = Arc::new(session);
+        SessionHost {
+            registry: Mutex::new(SessionRegistry {
+                accepting: true,
+                sessions: HashMap::from([("gbt-test".to_owned(), Arc::clone(&session))]),
+                provider_sessions: HashMap::from([(
+                    TEST_PROVIDER_SESSION_ID.to_owned(),
+                    "gbt-test".to_owned(),
+                )]),
+                clients: HashMap::new(),
+                closed: HashMap::new(),
+            }),
+            next_id: AtomicU64::new(1),
+            orphan_policy: OrphanPolicy {
+                lease_ms: 120_000,
+                grace_ms: 600_000,
+            },
+            revision,
+        }
+    }
+
+    /// Like `unix_process_host` but registers one Running session per process
+    /// group, with handles `gbt-1`, `gbt-2`, ... in pgid order.
+    #[cfg(unix)]
+    fn unix_process_hosts(pgids: &[u32]) -> SessionHost {
+        let revision = Arc::new(HostRevision::new());
+        let mut sessions = HashMap::new();
+        for (index, &pgid) in pgids.iter().enumerate() {
+            let handle = format!("gbt-{}", index + 1);
+            let mut session =
+                test_session_with_revision(SessionPhase::Running, Arc::clone(&revision));
+            session.inner.get_mut().unwrap().session = handle.clone();
+            session.scope_id = pgid;
+            session.inner.get_mut().unwrap().process_id = Some(pgid);
+            sessions.insert(handle, Arc::new(session));
+        }
+        let provider_sessions = sessions
+            .keys()
+            .cloned()
+            .map(|handle| (handle.clone(), handle))
+            .collect();
+        SessionHost {
+            registry: Mutex::new(SessionRegistry {
+                accepting: true,
+                sessions,
+                provider_sessions,
                 clients: HashMap::new(),
                 closed: HashMap::new(),
             }),
@@ -5393,6 +5593,118 @@ pub(crate) mod tests {
         cleanup.disarm();
     }
 
+    /// Spawn the wrapper/short-child/grandchild process tree, assign the
+    /// wrapper to a fresh Job Object, and wait until the wrapper and its
+    /// short-lived child have exited so only the long-lived grandchild remains
+    /// in the job. Returns the job, the three pids, and the armed cleanup
+    /// guard.
+    #[cfg(windows)]
+    fn spawn_windows_tree_in_job(label: &str) -> (WindowsJob, [u32; 3], WindowsProcessTreeCleanup) {
+        use std::os::windows::io::AsRawHandle;
+
+        let directory = temporary_test_directory(label);
+        fs::create_dir_all(&directory).unwrap();
+        let gate = WindowsLaunchGate::create().unwrap();
+        let job = WindowsJob::create().unwrap();
+        let root = spawn_windows_process_tree_helper(
+            "wrapper",
+            &directory,
+            0,
+            Some(gate.event_name.as_os_str()),
+        );
+        job.assign_process(root.as_raw_handle()).unwrap();
+        gate.signal().unwrap();
+        let mut cleanup = WindowsProcessTreeCleanup::new(root, directory.clone());
+        let pids = wait_for_windows_process_tree_ready(&directory.join("ready"));
+        cleanup.remember(&pids);
+        wait_for_windows_marker(&directory.join("wrapper-exited"));
+        wait_for_windows_intermediates_exit([pids[0], pids[1]]);
+        (job, pids, cleanup)
+    }
+
+    /// The Windows escalation ladder must match its documented semantics: Hup
+    /// and Term are wait-only phases that never TerminateJobObject, and only
+    /// Kill force-terminates the whole job scope.
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_terminate_waits_on_hup_and_term_until_kill() {
+        let (job, pids, mut cleanup) = spawn_windows_tree_in_job("windows-job-phases");
+        assert_eq!(job.process_scope_alive(), ScopeAlive::Alive);
+
+        job.terminate(TerminationLevel::Hup).unwrap();
+        assert_eq!(
+            job.process_scope_alive(),
+            ScopeAlive::Alive,
+            "Hup is a wait-only phase and must not terminate the job"
+        );
+        job.terminate(TerminationLevel::Term).unwrap();
+        assert_eq!(
+            job.process_scope_alive(),
+            ScopeAlive::Alive,
+            "Term is a wait-only phase and must not terminate the job"
+        );
+
+        job.terminate(TerminationLevel::Kill).unwrap();
+        wait_for_windows_process_tree_exit(pids);
+        assert_eq!(job.process_scope_alive(), ScopeAlive::Gone);
+        cleanup.disarm();
+    }
+
+    /// The bare-process fallback (`terminate_windows_process`) must mirror the
+    /// job semantics: Hup and Term wait, Kill force-terminates.
+    #[cfg(windows)]
+    #[test]
+    fn windows_bare_process_terminate_waits_on_hup_and_term_until_kill() {
+        let directory = temporary_test_directory("windows-bare-process-phases");
+        fs::create_dir_all(&directory).unwrap();
+        let child = spawn_windows_process_tree_helper("grandchild", &directory, 0, None);
+        let pid = child.id();
+        let mut cleanup = WindowsProcessTreeCleanup::new(child, directory.clone());
+
+        terminate_windows_process(pid, TerminationLevel::Hup).unwrap();
+        assert_eq!(
+            process_alive(pid),
+            ScopeAlive::Alive,
+            "Hup is a wait-only phase and must not terminate the process"
+        );
+        terminate_windows_process(pid, TerminationLevel::Term).unwrap();
+        assert_eq!(
+            process_alive(pid),
+            ScopeAlive::Alive,
+            "Term is a wait-only phase and must not terminate the process"
+        );
+
+        terminate_windows_process(pid, TerminationLevel::Kill).unwrap();
+        let deadline = Instant::now() + WINDOWS_PROCESS_TREE_TIMEOUT;
+        while process_alive(pid) != ScopeAlive::Gone {
+            assert!(
+                Instant::now() < deadline,
+                "bare Windows process {pid} survived TerminateProcess"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        cleanup.disarm();
+    }
+
+    /// `shutdown_all` must force-terminate the Job Object scope even when the
+    /// bounded group close times out waiting for the close lock, so server
+    /// exit never leaves a Windows Grok descendant behind.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shutdown_all_force_kills_the_job_scope_after_a_close_timeout() {
+        let (job, pids, mut cleanup) = spawn_windows_tree_in_job("windows-shutdown-all-timeout");
+        let host = windows_process_host(pids[0], job);
+        let session = host.get("gbt-test").unwrap();
+        // Hold the close lock so close_attempt spins until the shared deadline
+        // and reports Timeout; shutdown_all's final forced pass must still
+        // terminate the job scope.
+        let _held = session.test_hold_close_lock();
+
+        host.shutdown_all().unwrap();
+        wait_for_windows_process_tree_exit(pids);
+        cleanup.disarm();
+    }
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn all_zombie_scope_requires_stable_membership() {
@@ -5475,6 +5787,154 @@ pub(crate) mod tests {
             ScopeAlive::Gone,
             "tracked descendant {descendant_pid} remained executable"
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Spawn a setsid'd shell that exits immediately while a descendant keeps
+    /// running in the same process group, ignoring HUP and TERM. Returns the
+    /// group id (the leader pid) and the descendant pid.
+    #[cfg(unix)]
+    fn spawn_unix_process_group_with_descendant(
+        directory: &Path,
+    ) -> (std::process::Child, u32, u32) {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let descendant_pid_path = directory.join("descendant-pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "(trap '' HUP TERM; sleep 30) & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+                "grok-bridge-shutdown-all-test",
+            ])
+            .arg(&descendant_pid_path);
+        // portable-pty uses setsid for the child. Mirror that ownership model
+        // so the root pid is also the process-group id used by the probe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut root = command.spawn().unwrap();
+        let pgid = root.id();
+        root.wait().unwrap();
+        let descendant_pid = fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        (root, pgid, descendant_pid)
+    }
+
+    /// `shutdown_all` must force-kill and reap a surviving process group even
+    /// when the bounded group close fails (poisoned close lock): server exit
+    /// must never orphan a Unix Grok process or its descendants.
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_all_force_kills_the_process_group_after_a_close_failure() {
+        let directory = temporary_test_directory("shutdown-all-failed");
+        fs::create_dir_all(&directory).unwrap();
+        let (mut root, pgid, descendant_pid) = spawn_unix_process_group_with_descendant(&directory);
+
+        let host = unix_process_host(pgid);
+        let session = host.get("gbt-test").unwrap();
+        // Poison the close lock so close_attempt fails fast and deterministically;
+        // shutdown_all must still terminate and reap the whole owned scope.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.test_poison_close_lock();
+        }));
+        assert!(poisoned.is_err());
+
+        host.shutdown_all().unwrap();
+        assert_eq!(
+            process_scope_alive(pgid, true),
+            ScopeAlive::Gone,
+            "shutdown_all must reap the whole process group after a failed close"
+        );
+        assert_eq!(
+            unix_test_process_alive(descendant_pid),
+            ScopeAlive::Gone,
+            "shutdown_all must reap the descendant after a failed close"
+        );
+        let _ = root.kill();
+        let _ = root.wait();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `shutdown_all` must force-kill and reap a surviving process group even
+    /// when the bounded group close times out waiting for the close lock.
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_all_force_kills_the_process_group_after_a_close_timeout() {
+        let directory = temporary_test_directory("shutdown-all-timeout");
+        fs::create_dir_all(&directory).unwrap();
+        let (mut root, pgid, descendant_pid) = spawn_unix_process_group_with_descendant(&directory);
+
+        let host = unix_process_host(pgid);
+        let session = host.get("gbt-test").unwrap();
+        // Hold the close lock so close_attempt spins until the shared deadline
+        // and reports Timeout; the session keeps ownership and shutdown_all's
+        // final forced pass must still terminate and reap the whole group.
+        let _held = session.test_hold_close_lock();
+
+        host.shutdown_all().unwrap();
+        assert_eq!(
+            process_scope_alive(pgid, true),
+            ScopeAlive::Gone,
+            "shutdown_all must reap the whole process group after a close timeout"
+        );
+        assert_eq!(
+            unix_test_process_alive(descendant_pid),
+            ScopeAlive::Gone,
+            "shutdown_all must reap the descendant after a close timeout"
+        );
+        let _ = root.kill();
+        let _ = root.wait();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every surviving session must get its own forced-termination window:
+    /// with two independent process groups whose closes all fail, `shutdown_all`
+    /// must Kill and reap both instead of sharing one deadline that a slow first
+    /// scope could exhaust.
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_all_force_kills_every_group_when_all_closes_fail() {
+        let directory = temporary_test_directory("shutdown-all-multi");
+        fs::create_dir_all(&directory).unwrap();
+        let first_dir = directory.join("first");
+        let second_dir = directory.join("second");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        let (mut root_a, pgid_a, descendant_a) =
+            spawn_unix_process_group_with_descendant(&first_dir);
+        let (mut root_b, pgid_b, descendant_b) =
+            spawn_unix_process_group_with_descendant(&second_dir);
+        assert_ne!(pgid_a, pgid_b);
+        let host = unix_process_hosts(&[pgid_a, pgid_b]);
+        // Fail both close paths fast and deterministically; shutdown_all must
+        // still force-kill and reap both owned scopes.
+        for handle in ["gbt-1", "gbt-2"] {
+            let session = host.get(handle).unwrap();
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.test_poison_close_lock();
+            }));
+            assert!(poisoned.is_err(), "{handle} close lock must be poisoned");
+        }
+
+        host.shutdown_all().unwrap();
+        assert_eq!(process_scope_alive(pgid_a, true), ScopeAlive::Gone);
+        assert_eq!(process_scope_alive(pgid_b, true), ScopeAlive::Gone);
+        assert_eq!(unix_test_process_alive(descendant_a), ScopeAlive::Gone);
+        assert_eq!(unix_test_process_alive(descendant_b), ScopeAlive::Gone);
+        let _ = root_a.kill();
+        let _ = root_a.wait();
+        let _ = root_b.kill();
+        let _ = root_b.wait();
         fs::remove_dir_all(directory).unwrap();
     }
 

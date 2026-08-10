@@ -143,6 +143,7 @@ fn handle_connection(stream: Stream, state: Arc<RuntimeState>) {
     let request_id = envelope.id;
     let client_session_id = envelope.client_session_id;
     let refresh_after_response = !matches!(envelope.request, Request::CloseCodex);
+    let stop_requested = matches!(envelope.request, Request::ServerStop);
     if let Some(client_session_id) = client_session_id.as_deref()
         && let Err(error) = state.host.touch_client(client_session_id)
     {
@@ -156,7 +157,11 @@ fn handle_connection(stream: Stream, state: Arc<RuntimeState>) {
             Ok((result, stop)) => (ResponseEnvelope::success(request_id, result), stop),
             Err(error) => (
                 ResponseEnvelope::failure(request_id, "request_failed", format!("{error:#}")),
-                false,
+                // A ServerStop whose shutdown still failed must wake the accept
+                // loop anyway so the process can exit; otherwise the loop would
+                // wait for a client that never comes while the server holds the
+                // session registry and its process ownership.
+                stop_requested,
             ),
         };
     let wrote_response = write_response(connection.get_mut(), &response).is_ok();
