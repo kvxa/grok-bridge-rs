@@ -1212,6 +1212,9 @@ impl Session {
         if input.is_empty() {
             bail!("input must not be empty");
         }
+        // A lone Ctrl-C interrupts the current turn; enqueue it without
+        // starting a new one, keeping the bytes sent to the PTY unchanged.
+        let starts_turn = !(input.len() == 1 && input.as_bytes()[0] == 0x03);
         let data = if input.len() == 1 && input.as_bytes()[0].is_ascii_control() {
             input.into_bytes()
         } else {
@@ -1221,7 +1224,7 @@ impl Session {
             data.extend_from_slice(b"\x1b[201~\r");
             data
         };
-        self.enqueue_input(data, true)
+        self.enqueue_input(data, starts_turn)
     }
 
     fn write_raw(&self, data: Vec<u8>) -> Result<()> {
@@ -1620,7 +1623,7 @@ impl SessionInner {
             screen_ansi_base64: BASE64.encode(screen.contents_formatted()),
             last_cursor: self.next_cursor,
             last_output_at_ms: self.last_output_at_ms,
-            activity: self.hook.activity,
+            activity: projected_activity(self.phase, self.hook.activity),
             hook_event: self.hook.last_event,
             hook_at_ms: self.hook.last_event_at_ms,
             tool_name: self.hook.tool_name.clone(),
@@ -2293,6 +2296,24 @@ fn phase_is_terminal(phase: SessionPhase) -> bool {
     )
 }
 
+/// Map the raw hook activity to what a client should observe, resolving
+/// phase/hook conflicts by fixed priority: a terminal phase overrides a stale
+/// in-flight hook (the hook stream died with the process), and an idle TUI
+/// resolves a stale working hook to done.
+fn projected_activity(phase: SessionPhase, hook_activity: HookActivity) -> HookActivity {
+    if phase_is_terminal(phase) {
+        if matches!(hook_activity, HookActivity::Working | HookActivity::Waiting) {
+            HookActivity::Unknown
+        } else {
+            hook_activity
+        }
+    } else if phase == SessionPhase::Idle && hook_activity == HookActivity::Working {
+        HookActivity::Done
+    } else {
+        hook_activity
+    }
+}
+
 fn canonical_directory(path: &Path) -> Result<PathBuf> {
     let canonical = normalize_platform_path(
         path.canonicalize()
@@ -2465,8 +2486,7 @@ fn validate_model(model: Option<&str>) -> Result<()> {
 }
 
 fn raw_input_starts_turn(data: &[u8]) -> bool {
-    data.iter()
-        .any(|byte| matches!(*byte, b'\r' | b'\n' | 0x03))
+    data.iter().any(|byte| matches!(*byte, b'\r' | b'\n'))
 }
 
 fn now_millis() -> u64 {
@@ -3206,6 +3226,131 @@ mod tests {
     }
 
     #[test]
+    fn idle_phase_projects_stale_working_activity_as_done() {
+        let session = test_session(SessionPhase::Running);
+        let mut inner = session.inner.lock().unwrap();
+        inner.hook.activity = HookActivity::Working;
+
+        inner.phase = SessionPhase::Running;
+        assert_eq!(inner.to_state(1, false).activity, HookActivity::Working);
+        inner.phase = SessionPhase::Idle;
+        assert_eq!(inner.to_state(1, false).activity, HookActivity::Done);
+
+        inner.phase = SessionPhase::Starting;
+        assert_eq!(inner.to_state(1, false).activity, HookActivity::Working);
+    }
+
+    #[test]
+    fn terminal_phases_override_a_stale_hook_activity() {
+        let session = test_session(SessionPhase::Running);
+        let mut inner = session.inner.lock().unwrap();
+        inner.hook.activity = HookActivity::Working;
+        for phase in [
+            SessionPhase::Failed,
+            SessionPhase::Exited,
+            SessionPhase::Stopped,
+        ] {
+            inner.phase = phase;
+            assert_eq!(inner.to_state(1, false).activity, HookActivity::Unknown);
+        }
+        inner.hook.activity = HookActivity::Waiting;
+        assert_eq!(inner.to_state(1, false).activity, HookActivity::Unknown);
+        inner.hook.activity = HookActivity::Done;
+        assert_eq!(inner.to_state(1, false).activity, HookActivity::Done);
+    }
+
+    #[test]
+    fn ctrl_c_send_preserves_bytes_and_does_not_start_or_finish_a_turn() {
+        let host = test_host(TEST_PROVIDER_SESSION_ID, SessionPhase::Running);
+        let session = host.get("gbt-test").unwrap();
+        let (writer_tx, writer_rx) = sync_channel(1);
+        *session.writer_tx.lock().unwrap() = Some(writer_tx);
+
+        session
+            .apply_hook_event(hook_event(HookEventKind::PreToolUse))
+            .unwrap();
+        session.send("\u{3}".to_owned()).unwrap();
+        assert_eq!(writer_rx.recv().unwrap(), b"\x03");
+        let state = session.state().unwrap();
+        assert_eq!(state.phase, SessionPhase::Running);
+        assert_eq!(state.activity, HookActivity::Working);
+
+        let idle = test_session(SessionPhase::Idle);
+        let (idle_tx, idle_rx) = sync_channel(1);
+        *idle.writer_tx.lock().unwrap() = Some(idle_tx);
+        idle.send("\u{3}".to_owned()).unwrap();
+        assert_eq!(idle_rx.recv().unwrap(), b"\x03");
+        let state = idle.state().unwrap();
+        assert_eq!(state.phase, SessionPhase::Idle);
+        assert_eq!(state.activity, HookActivity::Unknown);
+
+        session.send("next task".to_owned()).unwrap();
+        assert_eq!(writer_rx.recv().unwrap(), b"\x1b[200~next task\x1b[201~\r");
+
+        let full = test_session(SessionPhase::Idle);
+        let (full_tx, _full_rx) = sync_channel(1);
+        full_tx.try_send(vec![b'x']).unwrap();
+        *full.writer_tx.lock().unwrap() = Some(full_tx);
+        let before = full.state().unwrap();
+        let error = full.send("\u{3}".to_owned()).unwrap_err();
+        assert!(error.to_string().contains("input queue is full"));
+        let after = full.state().unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.activity, before.activity);
+
+        let closed = test_session(SessionPhase::Idle);
+        let (closed_tx, closed_rx) = sync_channel(1);
+        drop(closed_rx);
+        *closed.writer_tx.lock().unwrap() = Some(closed_tx);
+        let before = closed.state().unwrap();
+        let error = closed.send("\u{3}".to_owned()).unwrap_err();
+        assert!(error.to_string().contains("input channel is closed"));
+        let after = closed.state().unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.activity, before.activity);
+    }
+
+    #[test]
+    fn raw_write_passes_ctrl_c_through_without_starting_a_turn() {
+        let session = test_session(SessionPhase::Idle);
+        let (writer_tx, writer_rx) = sync_channel(1);
+        *session.writer_tx.lock().unwrap() = Some(writer_tx);
+
+        session.write_raw(b"\x03".to_vec()).unwrap();
+        assert_eq!(writer_rx.recv().unwrap(), b"\x03");
+        let state = session.state().unwrap();
+        assert_eq!(state.phase, SessionPhase::Idle);
+        assert_eq!(state.activity, HookActivity::Unknown);
+
+        assert!(raw_input_starts_turn(b"\r"));
+        assert!(raw_input_starts_turn(b"\n"));
+        assert!(raw_input_starts_turn(b"new task\r"));
+        assert!(!raw_input_starts_turn(b"\x03"));
+
+        let full = test_session(SessionPhase::Idle);
+        let (full_tx, _full_rx) = sync_channel(1);
+        full_tx.try_send(vec![b'x']).unwrap();
+        *full.writer_tx.lock().unwrap() = Some(full_tx);
+        let before = full.state().unwrap();
+        let error = full.write_raw(b"\x03".to_vec()).unwrap_err();
+        assert!(error.to_string().contains("input queue is full"));
+        let after = full.state().unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.activity, before.activity);
+
+        let closed = test_session(SessionPhase::Idle);
+        let (closed_tx, closed_rx) = sync_channel(1);
+        drop(closed_rx);
+        *closed.writer_tx.lock().unwrap() = Some(closed_tx);
+        let before = closed.state().unwrap();
+        let error = closed.write_raw(b"\x03".to_vec()).unwrap_err();
+        assert!(error.to_string().contains("input channel is closed"));
+        let after = closed.state().unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.activity, before.activity);
+    }
+
+    #[test]
     fn late_output_does_not_revive_a_finished_process() {
         assert_eq!(
             phase_after_output(
@@ -3276,7 +3421,7 @@ mod tests {
         assert!(!raw_input_starts_turn(b"hello"));
         assert!(!raw_input_starts_turn(b"\x1b[A"));
         assert!(raw_input_starts_turn(b"hello\r"));
-        assert!(raw_input_starts_turn(&[0x03]));
+        assert!(!raw_input_starts_turn(&[0x03]));
     }
 
     #[test]

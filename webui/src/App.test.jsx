@@ -670,4 +670,170 @@ describe("App", () => {
     expect(container.textContent).toContain("ask_user:confirm_path");
     expect(MockXTerm.instances[0].written).toEqual(terminalTextBefore);
   });
+
+  describe("attention queue", () => {
+    function boardSession(overrides = {}) {
+      return {
+        session: "gbt-x",
+        owner: "Codex X",
+        client_session_id: "client-x",
+        client_state: "connected",
+        phase: "running",
+        title: "Task",
+        cwd: "C:\\work\\x",
+        process_id: 1,
+        updated_at_ms: 1000,
+        activity: "working",
+        hook_event: null,
+        hook_at_ms: null,
+        tool_name: null,
+        waiting_reason: null,
+        rows: 24,
+        cols: 80,
+        ...overrides,
+      };
+    }
+
+    const doneSession = (o = {}) =>
+      boardSession({ phase: "idle", activity: "done", ...o });
+    const groupKeys = () =>
+      [...container.querySelectorAll("details.group")].map(
+        (group) => group.dataset.ownerKey,
+      );
+    const group = (key) =>
+      container.querySelector(`details.group[data-owner-key="${key}"]`);
+    const sessionOf = (id, hookAtMs = 0, extra = {}) =>
+      boardSession({
+        session: `gbt-${id}`,
+        owner: `Codex ${id.toUpperCase()}`,
+        client_session_id: `client-${id}`,
+        hook_at_ms: hookAtMs,
+        ...extra,
+      });
+
+    it("orders attention first, folds clean-done, and keeps terminals mounted", async () => {
+      await renderAppAndConnect([sessionOf("a", 900), doneSession({
+        session: "gbt-d",
+        owner: "Codex D",
+        client_session_id: "client-d",
+        updated_at_ms: 2000,
+      })]);
+      expect(groupKeys()).toEqual(["client:client-a", "client:client-d"]);
+      expect(group("client:client-a").open).toBe(true);
+      expect(group("client:client-d").open).toBe(false);
+      expect(container.querySelectorAll("[data-terminal]")).toHaveLength(2);
+    });
+
+    it("opens only the most recent real supervisor when everything is done", async () => {
+      const recent = doneSession({ session: "gbt-r", owner: "Codex R", client_session_id: "client-r", updated_at_ms: 3000 });
+      const older = doneSession({ session: "gbt-o", owner: "Codex O", client_session_id: "client-o", updated_at_ms: 1000 });
+      const unowned = doneSession({ session: "gbt-u", owner: null, client_session_id: null, updated_at_ms: 4000 });
+      await renderAppAndConnect([recent, older, unowned]);
+      expect(group("client:client-r").open).toBe(true);
+      expect(group("client:client-o").open).toBe(false);
+      expect(group("missing-owner").open).toBe(false);
+    });
+
+    it("keeps waiting, stopped, and failed groups in the attention class", async () => {
+      const waiting = boardSession({ session: "gbt-w", owner: "Codex W", client_session_id: "client-w", activity: "waiting", waiting_reason: "user", hook_at_ms: 2000 });
+      const stopped = boardSession({ session: "gbt-s", owner: "Codex S", client_session_id: "client-s", phase: "exited", hook_at_ms: 1000 });
+      const failed = boardSession({ session: "gbt-f", owner: "Codex F", client_session_id: "client-f", phase: "failed", hook_at_ms: 1500 });
+      const doneG = doneSession({ session: "gbt-d", owner: "Codex D", client_session_id: "client-d", updated_at_ms: 3000 });
+      await renderAppAndConnect([waiting, stopped, failed, doneG]);
+      expect(groupKeys()).toEqual([
+        "client:client-w",
+        "client:client-f",
+        "client:client-s",
+        "client:client-d",
+      ]);
+      expect(group("client:client-w").open).toBe(true);
+      expect(group("client:client-s").open).toBe(true);
+      expect(group("client:client-f").open).toBe(true);
+      expect(group("client:client-d").open).toBe(false);
+    });
+
+    it("reorders on semantic advance but not on lease/resize/updated_at noise", async () => {
+      const ws = await renderAppAndConnect([
+        sessionOf("a", 100, { updated_at_ms: 100 }),
+        sessionOf("b", 200, { updated_at_ms: 200 }),
+      ]);
+      expect(groupKeys()).toEqual(["client:client-b", "client:client-a"]);
+      const noise = (id, hook) =>
+        sessionOf(id, hook, { updated_at_ms: 999999, client_lease_ms: 120000, rows: 40, cols: 120 });
+      await act(async () => pushSessions(ws, [noise("a", 100), noise("b", 200)]));
+      await settle();
+      expect(groupKeys()).toEqual(["client:client-b", "client:client-a"]);
+      await act(async () => pushSessions(ws, [noise("a", 300), noise("b", 200)]));
+      await settle();
+      expect(groupKeys()).toEqual(["client:client-a", "client:client-b"]);
+    });
+
+    it("manual open survives noise but a new cycle restores auto-fold", async () => {
+      const ws = await renderAppAndConnect([sessionOf("a"), doneSession({
+        session: "gbt-d",
+        owner: "Codex D",
+        client_session_id: "client-d",
+      })]);
+      const doneGroup = group("client:client-d");
+      expect(doneGroup.open).toBe(false);
+      await act(async () => doneGroup.querySelector("summary").click());
+      await settle();
+      expect(doneGroup.open).toBe(true);
+      await act(async () => pushSessions(ws, [
+        sessionOf("a", 500),
+        doneSession({ session: "gbt-d", owner: "Codex D", client_session_id: "client-d", updated_at_ms: 12345 }),
+      ]));
+      await settle();
+      expect(doneGroup.open).toBe(true);
+      // d becomes active (new cycle clears manual intent), then completes again
+      await act(async () => pushSessions(ws, [sessionOf("a"), sessionOf("d")]));
+      await settle();
+      await act(async () => pushSessions(ws, [sessionOf("a"), doneSession({
+        session: "gbt-d",
+        owner: "Codex D",
+        client_session_id: "client-d",
+      })]));
+      await settle();
+      expect(doneGroup.open).toBe(false);
+    });
+
+    it("defers the auto-fold while a completing group is focused and folds on blur", async () => {
+      const ws = await renderAppAndConnect([sessionOf("a"), sessionOf("b")]);
+      const groupB = group("client:client-b");
+      const tabB = container.querySelector('[data-session-tab="gbt-b"]');
+      await act(async () =>
+        tabB.dispatchEvent(new FocusEvent("focusin", { bubbles: true, relatedTarget: document.body })),
+      );
+      await act(async () => pushSessions(ws, [sessionOf("a"), doneSession({
+        session: "gbt-b",
+        owner: "Codex B",
+        client_session_id: "client-b",
+      })]));
+      await settle();
+      expect(groupB.open).toBe(true);
+      await act(async () =>
+        tabB.dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: document.body })),
+      );
+      await settle();
+      expect(groupB.open).toBe(false);
+    });
+
+    it("does not auto-fold child sessions and keeps the group open", async () => {
+      const ws = await renderAppAndConnect([
+        sessionOf("a1", 0, { owner: "Codex A", client_session_id: "client-a" }),
+        sessionOf("a2", 0, { owner: "Codex A", client_session_id: "client-a" }),
+      ]);
+      const child = container.querySelector('details.session[data-session="gbt-a2"]');
+      expect(child.open).toBe(true);
+      await act(async () => pushSessions(ws, [
+        sessionOf("a1", 0, { owner: "Codex A", client_session_id: "client-a" }),
+        doneSession({ session: "gbt-a2", owner: "Codex A", client_session_id: "client-a" }),
+      ]));
+      await settle();
+      expect(
+        container.querySelector('details.session[data-session="gbt-a2"]').open,
+      ).toBe(true);
+      expect(group("client:client-a").open).toBe(true);
+    });
+  });
 });

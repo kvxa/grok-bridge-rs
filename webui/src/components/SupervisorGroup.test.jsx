@@ -374,6 +374,18 @@ describe("SupervisorGroup session tabs", () => {
     expect(onToggle).not.toHaveBeenCalledWith(false);
   });
 
+  it("reports only summary activation as manual group intent", async () => {
+    const onToggle = vi.fn();
+    await renderGroup(multiSessions, { onToggle, collapsed: false });
+    await renderGroup(multiSessions, { onToggle, collapsed: true });
+    expect(onToggle).not.toHaveBeenCalled();
+
+    const summary = container.querySelector("details.group summary");
+    await act(async () => summary.click());
+    expect(onToggle).toHaveBeenCalledOnce();
+    expect(onToggle).toHaveBeenCalledWith(true);
+  });
+
   it("syncs terminal height across sessions in the same supervisor group", async () => {
     await renderGroup(multiSessions);
     await act(async () => {
@@ -396,5 +408,36 @@ describe("SupervisorGroup session tabs", () => {
         TERMINAL_HEIGHT_DEFAULT + 24,
       );
     }
+  });
+
+  it("reports focus entering/leaving the group only at its boundary", async () => {
+    const onFocus = vi.fn();
+    const onBlur = vi.fn();
+    await renderGroup(multiSessions, { onFocus, onBlur });
+    const [tab0, tab1] = tabs();
+    const enter = (target, relatedTarget) =>
+      act(async () =>
+        target.dispatchEvent(
+          new FocusEvent("focusin", { bubbles: true, relatedTarget }),
+        ),
+      );
+    const leave = (target, relatedTarget) =>
+      act(async () =>
+        target.dispatchEvent(
+          new FocusEvent("focusout", { bubbles: true, relatedTarget }),
+        ),
+      );
+
+    // Crossing the boundary (or null, i.e. leaving the window) fires once.
+    await enter(tab0, document.body);
+    expect(onFocus).toHaveBeenCalledTimes(1);
+    expect(onBlur).not.toHaveBeenCalled();
+    // Moving between controls inside the group is neither focus nor blur.
+    await enter(tab1, tab0);
+    await leave(tab0, tab1);
+    expect(onFocus).toHaveBeenCalledTimes(1);
+    expect(onBlur).not.toHaveBeenCalled();
+    await leave(tab1, null);
+    expect(onBlur).toHaveBeenCalledTimes(1);
   });
 });
