@@ -15,12 +15,16 @@ use interprocess::local_socket::GenericNamespaced;
 #[cfg(any(unix, test))]
 use interprocess::local_socket::ListenerOptions;
 #[cfg(unix)]
-use interprocess::local_socket::{GenericFilePath, Listener};
+use interprocess::local_socket::{GenericFilePath, GenericNamespaced, Listener};
 use interprocess::local_socket::{Name, Stream, prelude::*};
+#[cfg(unix)]
+use std::ffi::OsStr;
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
@@ -130,9 +134,57 @@ fn client_session_id_from(
     Ok(value)
 }
 
+/// Connect to the Runtime IPC endpoint. On Unix the client tries the current
+/// filesystem endpoint first and, when that fails, probes the legacy
+/// GenericNamespaced endpoint so a Runtime started by an older binary is still
+/// found and used instead of starting a second one. Only when neither endpoint
+/// answers does the caller fall back to auto-starting a new Runtime. A
+/// candidate whose name cannot even be constructed (e.g. a path that would
+/// overflow the socket address) is skipped, never fatal: the legacy endpoint
+/// must still be probed. If every candidate fails to construct, that error is
+/// preserved for diagnosis instead of being replaced by a generic connect
+/// failure.
 fn connect() -> Result<Stream> {
-    let name = runtime_name()?;
-    Stream::connect(name).context("runtime server is not running")
+    #[cfg(unix)]
+    let candidates = [runtime_name(), legacy_runtime_name()];
+    #[cfg(not(unix))]
+    let candidates = [runtime_name()];
+    let mut names = Vec::with_capacity(candidates.len());
+    let mut construction_error = None;
+    for candidate in candidates {
+        match candidate {
+            Ok(name) => names.push(name),
+            Err(error) => {
+                if construction_error.is_none() {
+                    construction_error = Some(error);
+                }
+            }
+        }
+    }
+    connect_first(&names).map_err(|error| match construction_error {
+        Some(name_error) => error.context(format!(
+            "a runtime endpoint name could not be constructed: {name_error:#}"
+        )),
+        None => error,
+    })
+}
+
+/// Try each IPC endpoint in order and return the first live connection.
+/// `candidates` are injected so tests can prove the fallback order against
+/// throwaway names without touching the real runtime endpoints. An empty
+/// candidate list is a diagnosable error, never a panic.
+fn connect_first(candidates: &[Name<'_>]) -> Result<Stream> {
+    let mut last_error = None;
+    for name in candidates {
+        match Stream::connect(name.clone()) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error).context("runtime server is not running"),
+        None => bail!("no runtime IPC endpoint candidates are available"),
+    }
 }
 
 fn call_over_stream(stream: Stream, envelope: &RequestEnvelope) -> Result<ResponseEnvelope> {
@@ -187,6 +239,19 @@ pub(crate) fn runtime_name() -> Result<Name<'static>> {
         .context("failed to construct the runtime socket path")
 }
 
+/// The legacy Runtime IPC name, kept for upgrade compatibility on Unix.
+/// Binaries before the filesystem-socket move bound a GenericNamespaced pipe;
+/// a Runtime still running from an older build answers on this name, so the
+/// client probes it before starting a new Runtime. This preserves access to
+/// existing sessions and avoids a second Runtime contending for the WebUI
+/// port. Windows has no migration: the namespaced pipe never changed.
+#[cfg(unix)]
+pub(crate) fn legacy_runtime_name() -> Result<Name<'static>> {
+    runtime_identity()
+        .to_ns_name::<GenericNamespaced>()
+        .context("failed to construct the legacy runtime pipe name")
+}
+
 #[cfg(not(unix))]
 pub(crate) fn runtime_name() -> Result<Name<'static>> {
     let identity = runtime_identity();
@@ -208,15 +273,59 @@ pub(crate) fn runtime_dir() -> Result<PathBuf> {
     )
 }
 
+/// Conservative cross-platform byte budget for a Unix socket address path,
+/// excluding the NUL terminator. Linux `sockaddr_un.sun_path` holds 108
+/// bytes (107 usable) and macOS holds 104 (103 usable); 100 leaves headroom
+/// on both while keeping the path plus its NUL under every supported limit.
+#[cfg(unix)]
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 100;
+
+/// Raw byte length of a path as it will be stored in a `sockaddr_un.sun_path`.
+#[cfg(unix)]
+fn socket_path_bytes(path: &Path) -> usize {
+    path.as_os_str().as_bytes().len()
+}
+
+/// Whether the runtime socket at `base/identity/runtime.sock` fits the Unix
+/// socket address limit. An arbitrarily deep XDG_RUNTIME_DIR must never push
+/// the socket path past the platform `sockaddr_un` budget, so over-long bases
+/// are skipped in favor of the next trusted base.
+#[cfg(unix)]
+fn socket_path_fits(base: &Path, identity: &OsStr, max_bytes: usize) -> bool {
+    socket_path_bytes(&base.join(identity).join("runtime.sock")) <= max_bytes
+}
+
+/// Select the runtime base directory. Candidates are tried in order (XDG,
+/// temp, `/tmp`); each must pass the existing trust checks and keep the final
+/// socket path within `max_bytes`. `/tmp` is always short enough to fit, so
+/// the fallback chain is deterministic: the same environment always selects
+/// the same base, and per-user isolation (the uid-suffixed identity child),
+/// the 0700 directory tightening, and the allowed-roots trust checks are all
+/// preserved by [`trusted_runtime_base`].
 #[cfg(unix)]
 fn runtime_dir_from(xdg: Option<OsString>, temp: PathBuf, expected_uid: u32) -> Result<PathBuf> {
+    runtime_dir_from_with_limit(xdg, temp, expected_uid, UNIX_SOCKET_PATH_MAX_BYTES)
+}
+
+#[cfg(unix)]
+fn runtime_dir_from_with_limit(
+    xdg: Option<OsString>,
+    temp: PathBuf,
+    expected_uid: u32,
+    max_socket_bytes: usize,
+) -> Result<PathBuf> {
+    let identity = runtime_identity();
+    let fits = |base: &Path| socket_path_fits(base, &identity, max_socket_bytes);
     let base = xdg
         .map(PathBuf::from)
         .and_then(|path| trusted_runtime_base(&path, expected_uid, true))
+        .filter(|base| fits(base))
         .or_else(|| trusted_runtime_base(&temp, expected_uid, false))
+        .filter(|base| fits(base))
         .or_else(|| trusted_runtime_base(Path::new("/tmp"), expected_uid, false))
-        .context("no trusted absolute runtime base is available")?;
-    Ok(base.join(runtime_identity()))
+        .filter(|base| fits(base))
+        .context("no trusted absolute runtime base fits the Unix socket path limit")?;
+    Ok(base.join(identity))
 }
 
 #[cfg(all(unix, test))]
@@ -1042,6 +1151,21 @@ mod tests {
         assert_eq!(client_session_id_from(None, None).unwrap(), None);
         assert!(client_session_id_from(Some("bad\nidentity".to_owned()), None).is_err());
     }
+
+    #[test]
+    fn connect_first_with_no_candidates_is_a_diagnosable_error_not_a_panic() {
+        // Regression: `connect()` filters out candidates whose names fail to
+        // construct, so an empty list must never reach `unwrap()` on the last
+        // connection error.
+        let empty: [Name<'_>; 0] = [];
+        let error = connect_first(&empty).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no runtime IPC endpoint candidates"),
+            "{error:#}"
+        );
+    }
 }
 
 /// Unix-only tests for owner-only Runtime IPC permissions and safe stale-socket
@@ -1141,21 +1265,25 @@ mod unix_ipc_tests {
         let fallback_canonical = std::fs::canonicalize(&fallback).unwrap();
 
         assert!(trusted_xdg_runtime_base(&trusted, current_uid()));
+        // Trust semantics only: an unbounded length budget keeps the socket
+        // path length out of this test (length rules have their own tests).
         assert_eq!(
-            runtime_dir_from(
+            runtime_dir_from_with_limit(
                 Some(trusted.clone().into_os_string()),
                 fallback.clone(),
                 current_uid(),
+                usize::MAX,
             )
             .unwrap(),
             trusted_canonical.join(runtime_identity())
         );
 
         assert_eq!(
-            runtime_dir_from(
+            runtime_dir_from_with_limit(
                 Some(OsString::from("relative/runtime")),
                 fallback.clone(),
                 current_uid(),
+                usize::MAX,
             )
             .unwrap(),
             fallback_canonical.join(runtime_identity())
@@ -1165,10 +1293,11 @@ mod unix_ipc_tests {
         std::fs::set_permissions(&trusted, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(!trusted_xdg_runtime_base(&trusted, current_uid()));
         assert_eq!(
-            runtime_dir_from(
+            runtime_dir_from_with_limit(
                 Some(trusted.into_os_string()),
                 fallback.clone(),
                 current_uid(),
+                usize::MAX,
             )
             .unwrap(),
             fallback_canonical.join(runtime_identity())
@@ -1189,10 +1318,11 @@ mod unix_ipc_tests {
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(!trusted_xdg_runtime_base(&candidate, current_uid()));
         assert_eq!(
-            runtime_dir_from(
+            runtime_dir_from_with_limit(
                 Some(candidate.clone().into_os_string()),
                 fallback.clone(),
                 current_uid(),
+                usize::MAX,
             )
             .unwrap(),
             std::fs::canonicalize(&fallback)
@@ -1203,16 +1333,93 @@ mod unix_ipc_tests {
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
         assert!(trusted_xdg_runtime_base(&candidate, current_uid()));
         assert_eq!(
-            runtime_dir_from(
+            runtime_dir_from_with_limit(
                 Some(candidate.clone().into_os_string()),
                 fallback,
                 current_uid(),
+                usize::MAX,
             )
             .unwrap(),
             std::fs::canonicalize(candidate)
                 .unwrap()
                 .join(runtime_identity())
         );
+    }
+
+    #[test]
+    fn runtime_dir_prefers_a_short_trusted_xdg_base() {
+        // 正常路径：可信且足够短的 XDG 基目录直接被采用，socket 路径保持
+        // 在保守上限内。基目录建在 `/tmp` 的真实路径上（macOS 上 `/tmp`
+        // 是指向 `/private/tmp` 的符号链接，canonicalize 后即真实目录），
+        // 这样跨平台都得到一个短的可信基目录。
+        let base = std::fs::canonicalize("/tmp").unwrap();
+        let xdg = base.join(format!("gbt-xdg-fit-{}", std::process::id()));
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = runtime_dir_from(
+            Some(xdg.clone().into_os_string()),
+            env::temp_dir(),
+            current_uid(),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            std::fs::canonicalize(&xdg)
+                .unwrap()
+                .join(runtime_identity())
+        );
+        assert!(
+            socket_path_bytes(&result.join("runtime.sock")) <= UNIX_SOCKET_PATH_MAX_BYTES,
+            "socket path must stay within the conservative limit"
+        );
+        let _ = std::fs::remove_dir_all(&xdg);
+    }
+
+    #[test]
+    fn runtime_dir_rejects_an_overlong_xdg_base_and_falls_back() {
+        // 长路径：XDG 基目录可信但让 socket 路径超过保守上限时，它必须被
+        // 跳过，回退到下一个可信基目录（temp，必要时 `/tmp`），最终 socket
+        // 路径仍在上限内。确定性 fallback 不引入新目录、不扩大 allowed
+        // roots：结果始终是某个已通过信任检查的基目录。
+        let temp = TempDir::new("xdg-overlong");
+        let long_name = "a".repeat(150);
+        let xdg = temp.path().join(&long_name);
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = runtime_dir_from(
+            Some(xdg.clone().into_os_string()),
+            temp.path().to_path_buf(),
+            current_uid(),
+        )
+        .unwrap();
+        assert!(
+            socket_path_bytes(&result.join("runtime.sock")) <= UNIX_SOCKET_PATH_MAX_BYTES,
+            "fallback socket path must stay within the conservative limit"
+        );
+        // 拒绝的是 XDG 本身，而不是它的某个子路径。
+        assert!(!result.starts_with(std::fs::canonicalize(&xdg).unwrap()));
+    }
+
+    #[test]
+    fn runtime_dir_selection_is_deterministic_for_identical_inputs() {
+        // 稳定性：同一环境两次计算得到完全相同的结果，包括超限回退路径。
+        let temp = TempDir::new("xdg-determinism");
+        let xdg = temp.path().join("short");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let first = runtime_dir_from(
+            Some(xdg.clone().into_os_string()),
+            temp.path().to_path_buf(),
+            current_uid(),
+        )
+        .unwrap();
+        let second = runtime_dir_from(
+            Some(xdg.into_os_string()),
+            temp.path().to_path_buf(),
+            current_uid(),
+        )
+        .unwrap();
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -1328,6 +1535,99 @@ mod unix_ipc_tests {
         assert_eq!(
             runtime_socket_path().unwrap(),
             runtime_dir().unwrap().join("runtime.sock")
+        );
+    }
+
+    /// A throwaway namespaced IPC name, unique per test, never the live
+    /// runtime name: parallel tests must not collide with each other or with a
+    /// real server.
+    fn unique_namespaced_name(label: &str) -> Name<'static> {
+        static NEXT_NAMESPACED_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_NAMESPACED_ID.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "grok-bridge-legacy-test-{label}-{}-{id}",
+            std::process::id()
+        )
+        .to_ns_name::<GenericNamespaced>()
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_runtime_name_matches_the_old_binaries_namespaced_identity() {
+        // Upgrade compatibility: the legacy endpoint must be exactly what an
+        // older binary bound — the same per-user identity through the same
+        // GenericNamespaced conversion. If either changes, clients can no
+        // longer find a Runtime started by the previous version.
+        let legacy = legacy_runtime_name().unwrap();
+        let expected = runtime_identity()
+            .to_ns_name::<GenericNamespaced>()
+            .unwrap();
+        assert_eq!(legacy, expected);
+    }
+
+    #[test]
+    fn legacy_namespaced_runtime_is_selected_when_the_filesystem_endpoint_is_absent() {
+        // Upgrade compatibility: a Runtime still running from an older binary
+        // answers on the legacy GenericNamespaced name. The client must use it
+        // instead of auto-starting a second Runtime (which would strand old
+        // sessions and contend for the WebUI port). The filesystem candidate is
+        // absent; the namespaced one is live, so the first live connection must
+        // come from the legacy endpoint.
+        let legacy = unique_namespaced_name("legacy-selected");
+        let listener = ListenerOptions::new()
+            .name(legacy.clone())
+            .create_sync()
+            .unwrap();
+        let missing_fs = unique_short_socket_path("legacy-fs-absent")
+            .to_fs_name::<GenericFilePath>()
+            .unwrap();
+        let stream = connect_first(&[missing_fs, legacy]).unwrap();
+        drop(listener);
+        drop(stream);
+    }
+
+    /// A unique throwaway filesystem socket path short enough for `sun_path`
+    /// (TempDir lives under a deep macOS `TMPDIR`, which would overflow the
+    /// socket address). Built on the canonical `/tmp` so it is a real, short
+    /// directory on every Unix.
+    fn unique_short_socket_path(label: &str) -> PathBuf {
+        static NEXT_SHORT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_SHORT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        let base = std::fs::canonicalize("/tmp").unwrap();
+        base.join(format!("gbt-{label}-{}-{id}.sock", std::process::id()))
+    }
+
+    #[test]
+    fn legacy_namespaced_runtime_is_not_used_when_the_filesystem_endpoint_is_live() {
+        // The current endpoint wins: a live filesystem socket is preferred over
+        // the legacy name, so after a clean migration the client never talks to
+        // a stale namespaced listener.
+        let legacy = unique_namespaced_name("legacy-second");
+        let _legacy_listener = ListenerOptions::new()
+            .name(legacy.clone())
+            .create_sync()
+            .unwrap();
+        let fs_path = unique_short_socket_path("legacy-fs-live");
+        let fs_listener = bind_listener_at(&fs_path).unwrap();
+        let fs_name = fs_path.to_fs_name::<GenericFilePath>().unwrap();
+        let stream = connect_first(&[fs_name, legacy]).unwrap();
+        drop(fs_listener);
+        drop(stream);
+    }
+
+    #[test]
+    fn connect_first_fails_only_when_every_endpoint_is_unavailable() {
+        // Auto-start must be the last resort: only when both the filesystem
+        // endpoint and the legacy name are dead does the client consider
+        // launching a new Runtime.
+        let missing_fs = unique_short_socket_path("legacy-none")
+            .to_fs_name::<GenericFilePath>()
+            .unwrap();
+        let missing_legacy = unique_namespaced_name("legacy-none");
+        let error = connect_first(&[missing_fs, missing_legacy]).unwrap_err();
+        assert!(
+            error.to_string().contains("runtime server is not running"),
+            "{error:#}"
         );
     }
 }

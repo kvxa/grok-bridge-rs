@@ -91,6 +91,18 @@ pub(crate) fn run() -> Result<()> {
     // is established, and by the OS if a starter crashes.
     #[cfg(unix)]
     let startup_lock = crate::transport::acquire_runtime_startup_lock()?;
+    // Upgrade compatibility: a Runtime started by an older binary still owns
+    // the legacy GenericNamespaced endpoint. Binding the new filesystem socket
+    // would succeed (different name) and create a second Runtime, stranding old
+    // sessions and contending for the WebUI port. Keep the singleton: exit
+    // quietly so clients keep using the legacy Runtime until it stops.
+    #[cfg(unix)]
+    if legacy_runtime_server_is_alive() {
+        eprintln!(
+            "grok-bridge server: an older Runtime is still running on the legacy endpoint; exiting"
+        );
+        return Ok(());
+    }
     let listener = match bind_runtime_listener() {
         Ok(listener) => listener,
         Err(error)
@@ -228,6 +240,20 @@ fn runtime_server_is_alive() -> bool {
             response.ok && matches!(response.result, Some(ResponseResult::ServerInfo(_)))
         })
     }
+}
+
+/// Whether a Runtime started by an older binary still answers on the legacy
+/// GenericNamespaced endpoint (Unix only; other platforms share one endpoint
+/// between old and new binaries, so the normal liveness probe covers them).
+/// The legacy name never collides with the new filesystem socket, so without
+/// this probe a duplicate server could bind the new socket and create a second
+/// Runtime. Same connect-based semantics as [`runtime_server_is_alive_for`]:
+/// a live listener is alive, a missing or refused name is dead.
+#[cfg(unix)]
+fn legacy_runtime_server_is_alive() -> bool {
+    crate::transport::legacy_runtime_name()
+        .map(|name| runtime_server_is_alive_for(&name))
+        .unwrap_or(false)
 }
 
 /// Unix liveness probe for a single name: a live listener accepts connections,
