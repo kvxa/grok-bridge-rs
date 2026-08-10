@@ -97,11 +97,27 @@ pub(crate) fn run() -> Result<()> {
     // sessions and contending for the WebUI port. Keep the singleton: exit
     // quietly so clients keep using the legacy Runtime until it stops.
     #[cfg(unix)]
-    if legacy_runtime_server_is_alive() {
-        eprintln!(
-            "grok-bridge server: an older Runtime is still running on the legacy endpoint; exiting"
-        );
-        return Ok(());
+    match legacy_runtime_server_probe() {
+        LegacyProbe::Active => {
+            eprintln!(
+                "grok-bridge server: an older Runtime is still running on the legacy endpoint \
+                 `{}`; exiting so clients keep using it. Stop that Runtime (close its terminal \
+                 or press Ctrl-C, or kill the grok-bridge process) and start this version again.",
+                crate::transport::runtime_identity().to_string_lossy()
+            );
+            return Ok(());
+        }
+        LegacyProbe::Uncertain(error) => {
+            eprintln!(
+                "grok-bridge server: cannot determine whether an older Runtime still owns the \
+                 legacy endpoint `{}` (probe failed: {error}); exiting rather than risk a second \
+                 Runtime. Stop the older Runtime, or if none is running remove or repair the \
+                 stale legacy endpoint, then start this version again.",
+                crate::transport::runtime_identity().to_string_lossy()
+            );
+            return Ok(());
+        }
+        LegacyProbe::Absent => {}
     }
     let listener = match bind_runtime_listener() {
         Ok(listener) => listener,
@@ -248,29 +264,73 @@ fn runtime_server_is_alive() -> bool {
 /// The legacy name never collides with the new filesystem socket, so without
 /// this probe a duplicate server could bind the new socket and create a second
 /// Runtime. Same connect-based semantics as [`runtime_server_is_alive_for`]:
-/// a live listener is alive, a missing or refused name is dead.
+/// a live listener is active, a missing or refused name is absent, and any
+/// other connect error is surfaced as `Uncertain` so startup can report why it
+/// refused to start rather than mislabeling a live Runtime as a stale socket.
 #[cfg(unix)]
-fn legacy_runtime_server_is_alive() -> bool {
-    crate::transport::legacy_runtime_name()
-        .map(|name| runtime_server_is_alive_for(&name))
-        .unwrap_or(false)
+fn legacy_runtime_server_probe() -> LegacyProbe {
+    match crate::transport::legacy_runtime_name() {
+        Ok(name) => match probe_runtime_name(&name) {
+            ProbeOutcome::Live => LegacyProbe::Active,
+            ProbeOutcome::Dead => LegacyProbe::Absent,
+            ProbeOutcome::Uncertain(error) => LegacyProbe::Uncertain(error),
+        },
+        // An unconstructible legacy name cannot be probed; treat it as absent
+        // so startup proceeds to bind the filesystem socket.
+        Err(_) => LegacyProbe::Absent,
+    }
+}
+
+/// Outcome of probing the legacy endpoint. Mirrors [`runtime_server_is_alive_for`]
+/// except that an inconclusive probe error is retained instead of being
+/// collapsed into a boolean.
+#[cfg(unix)]
+enum LegacyProbe {
+    /// A live listener accepted the connection: an older Runtime is running.
+    Active,
+    /// Definitively no older Runtime (missing or refused endpoint).
+    Absent,
+    /// The probe could not conclude; `error` is the original connect error.
+    Uncertain(io::Error),
 }
 
 /// Unix liveness probe for a single name: a live listener accepts connections,
 /// while a stale socket file refuses them. ENOENT (no socket file) and
 /// ECONNREFUSED (a socket file with nothing listening behind it) are the only
 /// definitive "dead" signals. Any other connect error — EACCES, EMFILE,
-/// transient failures — must not be read as "dead", or a live Runtime's
-/// socket could be removed. Never removes anything.
+/// transient failures — is reported as `Uncertain` with the original error
+/// instead of being collapsed into a boolean. Never removes anything.
+#[cfg(unix)]
+fn probe_runtime_name(name: &Name<'_>) -> ProbeOutcome {
+    match Stream::connect(name.clone()) {
+        Ok(_) => ProbeOutcome::Live,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+            ) =>
+        {
+            ProbeOutcome::Dead
+        }
+        Err(error) => ProbeOutcome::Uncertain(error),
+    }
+}
+
+/// Outcome of a single-name Unix liveness probe.
+#[cfg(unix)]
+#[derive(Debug)]
+enum ProbeOutcome {
+    Live,
+    Dead,
+    Uncertain(io::Error),
+}
+
+/// Conservative bool for the current-endpoint probe: any outcome other than a
+/// definitive "dead" must count as alive, or a live Runtime's socket could be
+/// removed. This is the semantic [`rebind_after_stale_socket`] relies on.
 #[cfg(unix)]
 fn runtime_server_is_alive_for(name: &Name<'_>) -> bool {
-    match Stream::connect(name.clone()) {
-        Ok(_) => true,
-        Err(error) => !matches!(
-            error.kind(),
-            ErrorKind::NotFound | ErrorKind::ConnectionRefused
-        ),
-    }
+    !matches!(probe_runtime_name(name), ProbeOutcome::Dead)
 }
 
 /// The IPC name is held by a process that did not answer the liveness probe.
@@ -2571,54 +2631,28 @@ mod tests {
         )
     }
 
-    /// A unique throwaway temp directory, removed on drop, so the probe test
-    /// never leaves files behind on failure and never touches the real
-    /// runtime path.
-    #[cfg(unix)]
-    struct ProbeTempDir(std::path::PathBuf);
-
-    #[cfg(unix)]
-    impl ProbeTempDir {
-        fn new(label: &str) -> Self {
-            static NEXT_PROBE_ID: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "grok-bridge-probe-test-{label}-{}-{}",
-                std::process::id(),
-                NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for ProbeTempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// The Unix liveness probe must accept a live listener and refuse a stale
     /// socket file, on a throwaway path that never touches the real runtime.
     /// Covered: no socket file (ENOENT), a live listener, and a socket file
-    /// with no listener behind it (ECONNREFUSED).
+    /// with no listener behind it (ECONNREFUSED). The throwaway directory is
+    /// [`crate::transport::ShortTempDir`], a canonical-`/tmp` short path whose
+    /// Drop-based cleanup runs even when an assertion fails.
     #[cfg(unix)]
     #[test]
     fn unix_liveness_probe_distinguishes_live_and_stale_sockets() {
         use std::os::unix::io::IntoRawFd as _;
 
-        let temp = ProbeTempDir::new("probe");
+        let temp = crate::transport::ShortTempDir::new("probe");
 
         // No socket file at the path: definitively not alive.
-        let missing = temp.0.join("missing.sock");
+        let missing = temp.path().join("missing.sock");
         let missing_name = missing
             .to_fs_name::<interprocess::local_socket::GenericFilePath>()
             .unwrap();
         assert!(!runtime_server_is_alive_for(&missing_name));
 
         // A live listener behind the path: must probe as alive.
-        let socket = temp.0.join("probe.sock");
+        let socket = temp.path().join("probe.sock");
         let name = socket
             .to_fs_name::<interprocess::local_socket::GenericFilePath>()
             .unwrap();
@@ -2631,7 +2665,7 @@ mod tests {
 
         // A socket file with no listener behind it (a crashed Runtime's
         // leftover): refuses the probe and must not count as alive.
-        let stale = temp.0.join("stale.sock");
+        let stale = temp.path().join("stale.sock");
         let stale_listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
         let fd = stale_listener.into_raw_fd();
         unsafe {
@@ -2642,5 +2676,47 @@ mod tests {
             .to_fs_name::<interprocess::local_socket::GenericFilePath>()
             .unwrap();
         assert!(!runtime_server_is_alive_for(&stale_name));
+    }
+
+    /// An inconclusive probe (any connect error other than missing/refused)
+    /// must be surfaced as `Uncertain` with the original error retained, and
+    /// the conservative [`runtime_server_is_alive_for`] bool must still read
+    /// it as alive so a live Runtime's socket is never treated as stale.
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_probe_error_is_retained_and_counts_as_alive() {
+        let temp = crate::transport::ShortTempDir::new("probe-uncertain");
+
+        // A path whose parent is a regular file makes connect fail with
+        // ENOTDIR — neither "no socket file" nor "connection refused", so the
+        // probe must stay Uncertain instead of collapsing into a boolean.
+        let blocker = temp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let name = blocker
+            .join("runtime.sock")
+            .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+            .unwrap();
+        match probe_runtime_name(&name) {
+            ProbeOutcome::Uncertain(error) => {
+                assert_eq!(error.kind(), ErrorKind::NotADirectory);
+            }
+            outcome => panic!("expected Uncertain, got {outcome:?}"),
+        }
+        assert!(
+            runtime_server_is_alive_for(&name),
+            "an uncertain probe must still count as alive for the current endpoint"
+        );
+
+        // Missing and refused stay definitively dead, so startup and stale
+        // cleanup treat them as absent.
+        let missing = temp.path().join("missing.sock");
+        let missing_name = missing
+            .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+            .unwrap();
+        assert!(matches!(
+            probe_runtime_name(&missing_name),
+            ProbeOutcome::Dead
+        ));
+        assert!(!runtime_server_is_alive_for(&missing_name));
     }
 }

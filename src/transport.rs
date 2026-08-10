@@ -615,7 +615,7 @@ fn runtime_identity() -> OsString {
 }
 
 #[cfg(unix)]
-fn runtime_identity() -> OsString {
+pub(crate) fn runtime_identity() -> OsString {
     let uid = unsafe { libc::getuid() };
     OsString::from(format!("grok-bridge-runtime-v1-u{uid}"))
 }
@@ -941,6 +941,42 @@ impl Drop for TempDir {
     }
 }
 
+/// A unique throwaway temp directory under the canonical short `/tmp`, removed
+/// on drop (including on assertion failure). Unix socket paths created inside
+/// it stay short enough for `sun_path` on every platform — `TempDir` lives
+/// under a deep macOS `TMPDIR`, which would overflow the socket address.
+#[cfg(all(unix, test))]
+static NEXT_SHORT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(unix, test))]
+pub(crate) struct ShortTempDir(PathBuf);
+
+#[cfg(all(unix, test))]
+impl ShortTempDir {
+    pub(crate) fn new(label: &str) -> Self {
+        let path = std::fs::canonicalize("/tmp")
+            .expect("canonical /tmp must resolve")
+            .join(format!(
+                "gbt-{label}-{}-{}",
+                std::process::id(),
+                NEXT_SHORT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(all(unix, test))]
+impl Drop for ShortTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,7 +1080,7 @@ mod tests {
         // deadline.
         #[cfg(unix)]
         let (name, _dir) = {
-            let dir = TempDir::new("write-deadline");
+            let dir = ShortTempDir::new("write-deadline");
             let name = dir
                 .path()
                 .join("test.sock")
@@ -1351,20 +1387,19 @@ mod unix_ipc_tests {
         // 正常路径：可信且足够短的 XDG 基目录直接被采用，socket 路径保持
         // 在保守上限内。基目录建在 `/tmp` 的真实路径上（macOS 上 `/tmp`
         // 是指向 `/private/tmp` 的符号链接，canonicalize 后即真实目录），
-        // 这样跨平台都得到一个短的可信基目录。
-        let base = std::fs::canonicalize("/tmp").unwrap();
-        let xdg = base.join(format!("gbt-xdg-fit-{}", std::process::id()));
-        std::fs::create_dir_all(&xdg).unwrap();
-        std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // 这样跨平台都得到一个短的可信基目录。`ShortTempDir` 在 drop 时
+        // 清理目录，断言失败也一样。
+        let xdg = ShortTempDir::new("xdg-fit");
+        std::fs::set_permissions(xdg.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let result = runtime_dir_from(
-            Some(xdg.clone().into_os_string()),
+            Some(xdg.path().as_os_str().to_os_string()),
             env::temp_dir(),
             current_uid(),
         )
         .unwrap();
         assert_eq!(
             result,
-            std::fs::canonicalize(&xdg)
+            std::fs::canonicalize(xdg.path())
                 .unwrap()
                 .join(runtime_identity())
         );
@@ -1372,7 +1407,6 @@ mod unix_ipc_tests {
             socket_path_bytes(&result.join("runtime.sock")) <= UNIX_SOCKET_PATH_MAX_BYTES,
             "socket path must stay within the conservative limit"
         );
-        let _ = std::fs::remove_dir_all(&xdg);
     }
 
     #[test]
