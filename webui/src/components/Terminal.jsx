@@ -178,6 +178,10 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
    *  scheduleFit): the timer id plus how many consecutive retries ran. */
   const resizeRetryTimerRef = useRef(0);
   const resizeRetryCountRef = useRef(0);
+  // Negative acks are distinct from immediate send failures. Keep a separate
+  // budget so a server that consistently rejects resizes cannot cause retries
+  // forever while successful WebSocket sends keep resetting the other counter.
+  const resizeNegativeAckCountRef = useRef(0);
   const connectionStateRef = useRef(connectionState);
   // Height is scoped to the Codex supervisor group, not the Grok session.
   const groupHeightKey = heightKey;
@@ -344,6 +348,7 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
         resizeRetryTimerRef.current = 0;
       }
       resizeRetryCountRef.current = 0;
+      resizeNegativeAckCountRef.current = 0;
       if (onDataDisposableRef.current) {
         try {
           onDataDisposableRef.current.dispose();
@@ -415,11 +420,15 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
       const pending = pendingResizeRef.current;
       if (!pending) return;
       if (ackSession !== id || ackId !== pending.id) return;
+      pendingResizeRef.current = null;
       if (ok) {
         lastSentSizeRef.current = { cols: pending.cols, rows: pending.rows };
+        resizeNegativeAckCountRef.current = 0;
+        return;
       }
-      pendingResizeRef.current = null;
-      if (!ok) scheduleFit();
+      if (resizeNegativeAckCountRef.current >= RESIZE_RETRY_MAX) return;
+      resizeNegativeAckCountRef.current += 1;
+      scheduleFit();
     });
     return unsubscribe;
   }, [id, scheduleFit, subscribeResizeAck]);
@@ -434,6 +443,7 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
     if (previous === interactive) return;
     lastSentSizeRef.current = { cols: 0, rows: 0 };
     pendingResizeRef.current = null;
+    resizeNegativeAckCountRef.current = 0;
     if (interactive) scheduleFit();
   }, [interactive, scheduleFit]);
 
@@ -452,9 +462,11 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
         resizeRetryTimerRef.current = 0;
       }
       resizeRetryCountRef.current = 0;
+      resizeNegativeAckCountRef.current = 0;
     }
     if (connectionState === "connected" && previous !== "connected") {
       resizeRetryCountRef.current = 0;
+      resizeNegativeAckCountRef.current = 0;
       scheduleFit();
     }
   }, [connectionState, scheduleFit]);

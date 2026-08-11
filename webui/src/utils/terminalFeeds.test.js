@@ -230,9 +230,11 @@ describe("terminalFeeds", () => {
   });
 
   it("drops stale deltas when the retained buffer exceeds the byte cap", () => {
-    const big = btoa("x".repeat(24 * 1024)); // ~24 KiB base64 payload
+    const big = btoa("x".repeat(24 * 1024)); // 32768-char base64 payload
+    const bigBytes = big.length;
+    const capacity = Math.floor(TERMINAL_BUFFER_MAX_BYTES / bigBytes);
     const entries = [];
-    for (let i = 0; i < Math.ceil(TERMINAL_BUFFER_MAX_BYTES / (24 * 1024)) + 2; i += 1) {
+    for (let i = 0; i < capacity + 2; i += 1) {
       entries.push({
         session: "s1",
         reset: false,
@@ -241,11 +243,10 @@ describe("terminalFeeds", () => {
     }
     pushTerminalEntries(entries);
     const kept = peekTerminalBuffer("s1");
-    expect(kept.length).toBeLessThanOrEqual(
-      Math.ceil(TERMINAL_BUFFER_MAX_BYTES / (24 * 1024)),
+    expect(kept).toHaveLength(capacity);
+    expect(kept.length * bigBytes).toBeLessThanOrEqual(
+      TERMINAL_BUFFER_MAX_BYTES,
     );
-    // At least one entry (the recovery anchor) is always kept.
-    expect(kept.length).toBeGreaterThanOrEqual(1);
   });
 
   it("keeps a fitting reset generation whole and invalidates an over-budget one", () => {

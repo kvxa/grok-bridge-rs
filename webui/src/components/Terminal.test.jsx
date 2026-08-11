@@ -166,6 +166,7 @@ describe("Terminal (xterm read-only)", () => {
     MockFitAddon.reset();
     TestResizeObserver.reset();
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   async function flushRaf() {
@@ -849,6 +850,42 @@ describe("Terminal (xterm read-only)", () => {
     });
     expect(sendResize).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
+  });
+
+  it("bounds retries after persistent negative resize acknowledgments", async () => {
+    vi.useFakeTimers();
+    let sequence = 0;
+    sendResize.mockImplementation(() => ({ ok: true, id: `negative-${++sequence}` }));
+    await renderTerminal({ interactive: true, hostWidth: 900, hostHeight: 400 });
+    sendResize.mockClear();
+    const host = container.querySelector("[data-terminal-host]");
+    sizeElement(host, 720, 340);
+    await act(async () => {
+      for (const observer of TestResizeObserver.instances) observer.trigger();
+    });
+    await flushRaf();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+
+    for (let attempt = 0; attempt < RESIZE_RETRY_MAX; attempt += 1) {
+      const id = sendResize.mock.results.at(-1).value.id;
+      await emitResizeAck("gbt-1", id, false);
+      await flushRaf();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(150);
+      });
+    }
+    expect(sendResize).toHaveBeenCalledTimes(1 + RESIZE_RETRY_MAX);
+
+    // The next negative acknowledgement exhausts the independent negative-ack
+    // budget: it must not schedule another resize forever.
+    const finalId = sendResize.mock.results.at(-1).value.id;
+    await emitResizeAck("gbt-1", finalId, false);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(sendResize).toHaveBeenCalledTimes(1 + RESIZE_RETRY_MAX);
   });
 
   it("clears resize dedupe when Keyboard mode toggles off and on", async () => {

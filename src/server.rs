@@ -37,10 +37,11 @@ const WEB_EVENTS_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const WEB_EVENTS_CLIENT_POLL: Duration = Duration::from_millis(25);
 /// Cap inbound request-id length for WebUI command frames.
 const WEB_EVENTS_MAX_REQUEST_ID_BYTES: usize = 128;
-/// Hard per-connection bound on tracked request ids. When full, the next new
-/// command is rejected with an explicit reconnect result and the connection is
-/// closed. Old ids are never evicted or replayable within one connection.
-const WEB_EVENTS_MAX_TRACKED_REQUEST_IDS: usize = 65536;
+/// Hard per-connection bound on tracked request ids. This keeps request-id
+/// memory within a small per-connection budget; when full, the next new command
+/// is rejected with an explicit reconnect result and the connection is closed.
+/// Old ids are never evicted or replayable within one connection.
+const WEB_EVENTS_MAX_TRACKED_REQUEST_IDS: usize = 8192;
 
 pub(crate) fn run() -> Result<()> {
     let name = runtime_name()?;
