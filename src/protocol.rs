@@ -193,6 +193,11 @@ pub(crate) enum ResponseResult {
 pub(crate) struct CloseGroupResult {
     pub(crate) matched: usize,
     pub(crate) closed: usize,
+    /// Session handles that reached the group close deadline while their owned
+    /// process scope was still live. Each entry is `"<handle>: <reason>"`.
+    pub(crate) timed_out: Vec<String>,
+    /// Session handles that failed with a non-timeout error. Each entry is
+    /// `"<handle>: <reason>"`.
     pub(crate) failures: Vec<String>,
 }
 

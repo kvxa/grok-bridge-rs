@@ -25,7 +25,7 @@ use crate::{
         validate_client_session_id, validate_owner, validate_session_handle,
         validate_terminal_size,
     },
-    session::{OrphanPolicy, SessionHost},
+    session::{CloseError, OrphanPolicy, SessionHost},
     transport::{call_anonymous, read_frame, runtime_name, write_response},
     version_check::{CHECK_INTERVAL, VersionChecker},
 };
@@ -143,6 +143,7 @@ fn handle_connection(stream: Stream, state: Arc<RuntimeState>) {
     let request_id = envelope.id;
     let client_session_id = envelope.client_session_id;
     let refresh_after_response = !matches!(envelope.request, Request::CloseCodex);
+    let stop_requested = matches!(envelope.request, Request::ServerStop);
     if let Some(client_session_id) = client_session_id.as_deref()
         && let Err(error) = state.host.touch_client(client_session_id)
     {
@@ -156,7 +157,11 @@ fn handle_connection(stream: Stream, state: Arc<RuntimeState>) {
             Ok((result, stop)) => (ResponseEnvelope::success(request_id, result), stop),
             Err(error) => (
                 ResponseEnvelope::failure(request_id, "request_failed", format!("{error:#}")),
-                false,
+                // A ServerStop whose shutdown still failed must wake the accept
+                // loop anyway so the process can exit; otherwise the loop would
+                // wait for a client that never comes while the server holds the
+                // session registry and its process ownership.
+                stop_requested,
             ),
         };
     let wrote_response = write_response(connection.get_mut(), &response).is_ok();
@@ -430,8 +435,9 @@ fn handle_web_connection(mut stream: TcpStream, state: Arc<RuntimeState>) {
             }
             match state.host.close_client(&client_session_id) {
                 Ok(result) => {
-                    let body = serde_json::to_string(&result)
-                        .unwrap_or_else(|_| r#"{"matched":0,"closed":0,"failures":[]}"#.to_owned());
+                    let body = serde_json::to_string(&result).unwrap_or_else(|_| {
+                        r#"{"matched":0,"closed":0,"timed_out":[],"failures":[]}"#.to_owned()
+                    });
                     let _ = write_http(&mut stream, "200 OK", "application/json", &body);
                 }
                 Err(error) => {
@@ -489,6 +495,7 @@ fn handle_web_connection(mut stream: TcpStream, state: Arc<RuntimeState>) {
                     let body = serde_json::json!({
                         "matched": result.matched,
                         "closed": result.closed,
+                        "timed_out": result.timed_out,
                         "failures": result.failures,
                     })
                     .to_string();
@@ -531,9 +538,9 @@ fn handle_web_connection(mut stream: TcpStream, state: Arc<RuntimeState>) {
                 Err(error) => {
                     let _ = write_http(
                         &mut stream,
-                        "404 Not Found",
+                        close_error_http_status(&error),
                         "text/plain; charset=utf-8",
-                        &format!("{error:#}"),
+                        &error.to_string(),
                     );
                 }
             }
@@ -546,6 +553,14 @@ fn handle_web_connection(mut stream: TcpStream, state: Arc<RuntimeState>) {
                 "not found",
             );
         }
+    }
+}
+
+fn close_error_http_status(error: &CloseError) -> &'static str {
+    match error {
+        CloseError::NotFound(_) => "404 Not Found",
+        CloseError::Timeout => "504 Gateway Timeout",
+        CloseError::Failed(_) => "500 Internal Server Error",
     }
 }
 
@@ -1274,6 +1289,10 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::SessionPhase;
+    use crate::session::tests::{
+        test_host_with_poisoned_close_lock, with_test_host_holding_close_lock,
+    };
     use std::io::Read as _;
 
     #[test]
@@ -1405,6 +1424,68 @@ mod tests {
         );
         assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
         assert!(response.ends_with(b"missing WebUI request header"));
+    }
+
+    #[test]
+    fn close_api_distinguishes_missing_timeout_and_internal_failures() {
+        // 404: a missing session through the real request path.
+        let response = serve_web_request(
+            b"POST /api/sessions/missing/close HTTP/1.1\r\nHost: localhost\r\nX-Grok-Bridge-WebUI: 1\r\n\r\n",
+        );
+        let (headers, body) = split_http_response(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{headers}"
+        );
+        assert!(
+            std::str::from_utf8(body)
+                .unwrap()
+                .contains("session not found: missing"),
+            "404 body: {body:?}"
+        );
+
+        // 504: the close lock is held past the deadline, so close really times
+        // out and the route maps it to Gateway Timeout with the error body.
+        let response = with_test_host_holding_close_lock(
+            "provider-timeout",
+            SessionPhase::Running,
+            |host| {
+                serve_web_request_with_host(
+                    b"POST /api/sessions/gbt-test/close HTTP/1.1\r\nHost: localhost\r\nX-Grok-Bridge-WebUI: 1\r\n\r\n",
+                    host,
+                )
+            },
+        );
+        let (headers, body) = split_http_response(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 504 Gateway Timeout\r\n"),
+            "{headers}"
+        );
+        assert!(
+            std::str::from_utf8(body)
+                .unwrap()
+                .contains("close timed out"),
+            "504 body: {body:?}"
+        );
+
+        // 500: a poisoned close lock is an internal failure through the real
+        // request path and surfaces as Internal Server Error.
+        let host = test_host_with_poisoned_close_lock("provider-failed", SessionPhase::Running);
+        let response = serve_web_request_with_host(
+            b"POST /api/sessions/gbt-test/close HTTP/1.1\r\nHost: localhost\r\nX-Grok-Bridge-WebUI: 1\r\n\r\n",
+            host,
+        );
+        let (headers, body) = split_http_response(&response);
+        assert!(
+            headers.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "{headers}"
+        );
+        assert!(
+            std::str::from_utf8(body)
+                .unwrap()
+                .contains("session close lock was poisoned"),
+            "500 body: {body:?}"
+        );
     }
 
     #[test]
@@ -1713,11 +1794,21 @@ mod tests {
         assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(body).unwrap(),
-            serde_json::json!({ "matched": 0, "closed": 0, "failures": [] })
+            serde_json::json!({ "matched": 0, "closed": 0, "timed_out": [], "failures": [] })
         );
     }
 
     fn serve_web_request(request: &[u8]) -> Vec<u8> {
+        serve_web_request_with_host(
+            request,
+            SessionHost::new(OrphanPolicy {
+                lease_ms: 120_000,
+                grace_ms: 600_000,
+            }),
+        )
+    }
+
+    fn serve_web_request_with_host(request: &[u8], host: SessionHost) -> Vec<u8> {
         let timeout = Duration::from_secs(10);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -1733,10 +1824,7 @@ mod tests {
             handle_web_connection(
                 server,
                 Arc::new(RuntimeState {
-                    host: SessionHost::new(OrphanPolicy {
-                        lease_ms: 120_000,
-                        grace_ms: 600_000,
-                    }),
+                    host,
                     started_at_ms: 0,
                     stopping: AtomicBool::new(false),
                     web_url: None,

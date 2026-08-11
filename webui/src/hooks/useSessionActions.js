@@ -61,21 +61,26 @@ export function useSessionActions({ loadingRef, setLoading, setNotice }) {
         const result = clientSessionId
           ? await closeClientRequest(clientSessionId)
           : await closeOwnerRequest(owner);
+        const timedOut = result.timed_out || [];
+        const failures = result.failures || [];
         if (result.matched === 0) {
           setNotice({
             tone: "info",
             text: t("action.groupEmpty"),
           });
         } else if (
-          result.failures?.length ||
+          failures.length ||
+          timedOut.length ||
           result.closed !== result.matched
         ) {
+          // Partial group close: surface both timed-out and failed handles so
+          // the operation is never presented as fully successful.
           setNotice({
             tone: "error",
             text: t("action.groupPartial", {
               closed: formatNumber(result.closed),
               matched: formatNumber(result.matched),
-              failures: (result.failures || []).join(t("action.failureJoin")),
+              failures: [...timedOut, ...failures].join(t("action.failureJoin")),
             }),
           });
         } else {

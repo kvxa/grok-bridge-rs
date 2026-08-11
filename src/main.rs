@@ -35,7 +35,10 @@ mod app {
     }
 
     enum Action {
-        Rpc { request: Request, auto_start: bool },
+        Rpc {
+            request: Request,
+            auto_start: bool,
+        },
         Terminal(TerminalOptions),
         Hooks(HooksAction),
         ServerUi,
@@ -44,6 +47,8 @@ mod app {
         Version,
         InternalHook,
         InternalServer,
+        #[cfg(windows)]
+        InternalWindowsJobChild(Vec<OsString>),
     }
 
     enum HooksAction {
@@ -105,6 +110,8 @@ mod app {
                 server::run()?;
                 Ok(0)
             }
+            #[cfg(windows)]
+            Action::InternalWindowsJobChild(arguments) => session::run_windows_job_child(arguments),
         }
     }
 
@@ -120,6 +127,15 @@ mod app {
             "__server" => {
                 ensure_no_arguments(&arguments[1..])?;
                 Ok(Action::InternalServer)
+            }
+            #[cfg(windows)]
+            "__windows-job-child" => {
+                if arguments.len() < 4 {
+                    bail!(
+                        "internal Windows job child requires event, PID report, and program names"
+                    );
+                }
+                Ok(Action::InternalWindowsJobChild(arguments[1..].to_vec()))
             }
             "hooks" => parse_hooks(&arguments[1..]),
             "server" => parse_server(&arguments[1..]),
@@ -622,6 +638,32 @@ mod app {
                 Action::InternalHook
             ));
             assert!(parse_args(vec!["__hook".into(), "extra".into()]).is_err());
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn parses_internal_windows_job_child_without_shell_joining() {
+            let action = parse_args(vec![
+                "__windows-job-child".into(),
+                "Local\\gate".into(),
+                "Local\\pid".into(),
+                "C:\\Program Files\\Grok\\grok.exe".into(),
+                "--model".into(),
+                "deepseek-v4-flash".into(),
+            ])
+            .unwrap();
+            assert!(matches!(
+                action,
+                Action::InternalWindowsJobChild(arguments)
+                    if arguments == [
+                        OsString::from("Local\\gate"),
+                        OsString::from("Local\\pid"),
+                        OsString::from("C:\\Program Files\\Grok\\grok.exe"),
+                        OsString::from("--model"),
+                        OsString::from("deepseek-v4-flash"),
+                    ]
+            ));
+            assert!(parse_args(vec!["__windows-job-child".into()]).is_err());
         }
 
         #[test]

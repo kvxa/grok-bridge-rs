@@ -2,13 +2,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
     ffi::OsString,
+    fmt,
     fs::{self, OpenOptions},
     io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{SyncSender, TrySendError, sync_channel},
+        mpsc::{RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -16,7 +17,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::protocol::{
     ClientLeaseState, CloseGroupResult, HookActivity, HookEvent, HookEventKind, MAX_WRITE_BYTES,
@@ -32,6 +33,30 @@ const MAX_READ_BYTES: usize = 64 * 1024;
 const WRITER_QUEUE_CAPACITY: usize = 64;
 const QUIET_IDLE_MILLISECONDS: u64 = 3_000;
 const PROCESS_TERMINATE_TIMEOUT_MS: u32 = 5_000;
+/// One absolute deadline shared by every session in a group close. The WebUI
+/// request timeout (8 s) exceeds this by a small response margin.
+const GROUP_CLOSE_TIMEOUT_MS: u64 = 6_000;
+/// How long the group close collector may wait for a worker past the shared
+/// deadline before declaring the remaining sessions timed out.
+const GROUP_CLOSE_RESPONSE_MARGIN_MS: u64 = 1_000;
+/// Fixed concurrency bound for group close, independent of group size.
+const GROUP_CLOSE_WORKERS: usize = 4;
+/// Minimum grace between HUP, TERM, and KILL inside one close deadline so a
+/// graceful child is not force-killed prematurely.
+const TERMINATION_GRACE_MIN_MS: u64 = 500;
+/// Lead time before the close deadline during which the Linux liveness probe
+/// runs its stable two-scan verification. Before that window a successful
+/// kill(-pgid, 0) answers `Alive` immediately, so escalation does not walk
+/// /proc (twice) on every round.
+const STABLE_SCOPE_SCAN_LEAD_MS: u64 = 500;
+/// Bounded escalation budget used by reader/writer/waiter error edges that
+/// cannot block the close path.
+const ERROR_ESCALATION_TIMEOUT_MS: u64 = 1_500;
+#[cfg(windows)]
+const WINDOWS_LAUNCH_HANDSHAKE_TIMEOUT_MS: u32 = 10_000;
+/// How long a closed session handle stays in the idempotent re-close tombstone.
+const CLOSED_TOMBSTONE_TTL_MS: u64 = 10 * 60 * 1_000;
+const CLOSED_TOMBSTONE_CAP: usize = 1_024;
 const PROVIDER_SESSION_UUID_BYTES: usize = 16;
 const DEFAULT_CODEX_LEASE_SECONDS: u64 = 120;
 const DEFAULT_ORPHAN_GRACE_SECONDS: u64 = 600;
@@ -131,6 +156,10 @@ struct SessionRegistry {
     sessions: HashMap<String, Arc<Session>>,
     provider_sessions: HashMap<String, String>,
     clients: HashMap<String, Arc<AtomicU64>>,
+    /// Recently closed session handles (handle -> closed_at_ms) kept so a
+    /// repeated single close returns an idempotent already-closed result
+    /// instead of "session not found".
+    closed: HashMap<String, u64>,
 }
 
 impl SessionRegistry {
@@ -156,6 +185,32 @@ impl SessionRegistry {
         }
         true
     }
+
+    fn remember_closed(&mut self, handle: &str) {
+        let now = now_millis();
+        if self.closed.len() >= CLOSED_TOMBSTONE_CAP {
+            // Evict the OLDEST half when the tombstone grows past its cap so the
+            // most recent (and most likely to be re-closed) handles survive.
+            let mut entries = self
+                .closed
+                .drain()
+                .map(|(handle, at)| (at, handle))
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+            entries.truncate(CLOSED_TOMBSTONE_CAP / 2);
+            self.closed = entries
+                .into_iter()
+                .map(|(at, handle)| (handle, at))
+                .collect();
+        }
+        self.closed.insert(handle.to_owned(), now);
+    }
+
+    fn was_closed(&self, handle: &str) -> bool {
+        self.closed
+            .get(handle)
+            .is_some_and(|at| now_millis().saturating_sub(*at) <= CLOSED_TOMBSTONE_TTL_MS)
+    }
 }
 
 impl SessionHost {
@@ -166,6 +221,7 @@ impl SessionHost {
                 sessions: HashMap::new(),
                 provider_sessions: HashMap::new(),
                 clients: HashMap::new(),
+                closed: HashMap::new(),
             }),
             next_id: AtomicU64::new(1),
             orphan_policy,
@@ -512,23 +568,40 @@ impl SessionHost {
         Ok(true)
     }
 
-    pub(crate) fn close(&self, handle: &str) -> Result<bool> {
+    pub(crate) fn close(&self, handle: &str) -> std::result::Result<bool, CloseError> {
         let session = {
             let registry = self
                 .registry
                 .lock()
-                .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
+                .map_err(|_| CloseError::Failed("session registry lock was poisoned".into()))?;
             registry.sessions.get(handle).cloned()
         };
         let Some(session) = session else {
-            bail!("session not found: {handle}");
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| CloseError::Failed("session registry lock was poisoned".into()))?;
+            if registry.was_closed(handle) {
+                // Idempotent re-close after an earlier successful close.
+                return Ok(true);
+            }
+            return Err(CloseError::NotFound(handle.to_owned()));
         };
-        session.shutdown()?;
+        match session.close_attempt(default_close_deadline()) {
+            CloseOutcome::Closed => {}
+            CloseOutcome::Timeout => {
+                // Ownership (killer, PTY master, writer) is retained so a later
+                // close attempt can continue termination from observed state.
+                return Err(CloseError::Timeout);
+            }
+            CloseOutcome::Failed(message) => return Err(CloseError::Failed(message)),
+        }
         let mut registry = self
             .registry
             .lock()
-            .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
+            .map_err(|_| CloseError::Failed("session registry lock was poisoned".into()))?;
         registry.remove_session(handle, &session);
+        registry.remember_closed(handle);
         drop(registry);
         self.notify_revision();
         Ok(true)
@@ -549,31 +622,10 @@ impl SessionHost {
             }
             sessions
         };
-
-        let matched = sessions.len();
-        let mut closed = 0;
-        let mut failures = Vec::new();
-        for (handle, session) in sessions {
-            match session.shutdown() {
-                Ok(()) => {
-                    closed += 1;
-                    let mut registry = self
-                        .registry
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
-                    registry.remove_session(&handle, &session);
-                }
-                Err(error) => failures.push(format!("{handle}: {error:#}")),
-            }
-        }
-        if closed > 0 {
-            self.notify_revision();
-        }
-        Ok(CloseGroupResult {
-            matched,
-            closed,
-            failures,
-        })
+        let outcomes =
+            self.run_close_group(sessions, default_group_deadline(), GROUP_CLOSE_WORKERS)?;
+        let (result, _not_closed) = self.apply_close_outcomes(outcomes)?;
+        Ok(result)
     }
 
     pub(crate) fn close_client(&self, client_session_id: &str) -> Result<CloseGroupResult> {
@@ -591,16 +643,23 @@ impl SessionHost {
             }
             sessions
         };
-        let result = self.close_sessions(sessions)?;
-        if result.failures.is_empty() {
+        let outcomes =
+            self.run_close_group(sessions, default_group_deadline(), GROUP_CLOSE_WORKERS)?;
+        let (result, _not_closed) = self.apply_close_outcomes(outcomes)?;
+        if result.failures.is_empty() && result.timed_out.is_empty() {
             let mut registry = self
                 .registry
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
             registry.clients.remove(client_session_id);
+            drop(registry);
+            // The client lease map changed after apply_close_outcomes already
+            // notified; wake the WebUI again so it observes the removal.
+            self.notify_revision();
+            return Ok(result);
         }
-        // close_sessions already notifies on successful closes; also wake when the
-        // client lease map changes even if no sessions matched.
+        // apply_close_outcomes already notifies when sessions matched; wake
+        // explicitly when nothing matched.
         if result.matched == 0 {
             self.notify_revision();
         }
@@ -645,26 +704,134 @@ impl SessionHost {
             // phase recheck commits cleanup.
             self.notify_revision();
         }
-        self.close_sessions(sessions)
+        let outcomes =
+            self.run_close_group(sessions, default_group_deadline(), GROUP_CLOSE_WORKERS)?;
+        let (result, not_closed) = self.apply_close_outcomes(outcomes)?;
+        // Timed-out or failed orphans stay registered so the next reaper tick
+        // can claim and retry them from observed state.
+        for (_, session) in not_closed {
+            session.reset_orphan_cleanup();
+        }
+        Ok(result)
     }
 
-    fn close_sessions(&self, sessions: Vec<(String, Arc<Session>)>) -> Result<CloseGroupResult> {
+    /// Close a snapshot of sessions with a fixed worker bound and one absolute
+    /// deadline shared by every session, independent of group size.
+    fn run_close_group(
+        &self,
+        sessions: Vec<(String, Arc<Session>)>,
+        deadline: Instant,
+        workers: usize,
+    ) -> Result<Vec<(String, Arc<Session>, CloseOutcome)>> {
         let matched = sessions.len();
-        let mut closed = 0;
-        let mut failures = Vec::new();
+        if matched == 0 {
+            return Ok(Vec::new());
+        }
+        let workers = workers.clamp(1, matched);
+        let (work_tx, work_rx) = channel::<(String, Arc<Session>)>();
+        let (done_tx, done_rx) = channel::<(String, Arc<Session>, CloseOutcome)>();
+        let queue = Arc::new(Mutex::new(work_rx));
+        let mut pool = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let queue = Arc::clone(&queue);
+            let done_tx = done_tx.clone();
+            pool.push(thread::spawn(move || {
+                loop {
+                    let job = match queue.lock() {
+                        Ok(queue) => queue.recv(),
+                        Err(_) => break,
+                    };
+                    let Ok((handle, session)) = job else {
+                        break;
+                    };
+                    let outcome = session.close_attempt(deadline);
+                    if done_tx.send((handle, session, outcome)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        // Track every session whose result is still outstanding so a stalled
+        // worker can be reported as timed out instead of hanging the collector.
+        let mut pending: HashMap<String, Arc<Session>> = sessions
+            .iter()
+            .map(|(handle, session)| (handle.clone(), Arc::clone(session)))
+            .collect();
         for (handle, session) in sessions {
-            match session.shutdown() {
-                Ok(()) => {
+            let _ = work_tx.send((handle, session));
+        }
+        drop(work_tx);
+        drop(done_tx);
+
+        // Workers each honor the shared absolute deadline, but the collector
+        // never waits past it plus a small response margin: close_attempt may
+        // legitimately finish just after the deadline, and a hung worker must
+        // not make the whole group wait forever.
+        let recv_deadline = deadline + Duration::from_millis(GROUP_CLOSE_RESPONSE_MARGIN_MS);
+        let mut outcomes = Vec::with_capacity(matched);
+        while outcomes.len() < matched {
+            let remaining = recv_deadline.saturating_duration_since(Instant::now());
+            match done_rx.recv_timeout(remaining) {
+                Ok((handle, session, outcome)) => {
+                    pending.remove(&handle);
+                    outcomes.push((handle, session, outcome));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Report every still-pending session as timed out; each
+                    // keeps its process ownership so a later close can retry.
+                    for (handle, session) in pending.drain() {
+                        outcomes.push((handle, session, CloseOutcome::Timeout));
+                    }
+                    break;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("a group close worker exited without reporting its result");
+                }
+            }
+        }
+        // Workers exit as soon as their queue recv fails (work_tx was dropped
+        // above). Plain JoinHandle::join is deliberately NOT used: a worker
+        // still inside close_attempt at the response margin could block the
+        // caller forever. close_attempt is strictly bounded by the shared
+        // absolute deadline, so dropping the handles detaches workers that
+        // finish on their own shortly after the collector returns.
+        drop(pool);
+        Ok(outcomes)
+    }
+
+    /// Remove closed sessions from the registry, tombstone their handles, and
+    /// build the truthful per-session group result. `not_closed` carries the
+    /// sessions that timed out or failed so callers can retry or reset state.
+    fn apply_close_outcomes(
+        &self,
+        outcomes: Vec<(String, Arc<Session>, CloseOutcome)>,
+    ) -> Result<(CloseGroupResult, CloseGroupNotClosed)> {
+        let matched = outcomes.len();
+        let mut closed = 0;
+        let mut timed_out = Vec::new();
+        let mut failures = Vec::new();
+        let mut not_closed = Vec::new();
+        for (handle, session, outcome) in outcomes {
+            match outcome {
+                CloseOutcome::Closed => {
                     closed += 1;
                     let mut registry = self
                         .registry
                         .lock()
                         .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
                     registry.remove_session(&handle, &session);
+                    registry.remember_closed(&handle);
                 }
-                Err(error) => {
-                    session.reset_orphan_cleanup();
-                    failures.push(format!("{handle}: {error:#}"));
+                CloseOutcome::Timeout => {
+                    not_closed.push((handle.clone(), session));
+                    timed_out.push(format!(
+                        "{handle}: close timed out after the shared group deadline; \
+                         retry close to continue termination"
+                    ));
+                }
+                CloseOutcome::Failed(message) => {
+                    not_closed.push((handle.clone(), session));
+                    failures.push(format!("{handle}: {message}"));
                 }
             }
         }
@@ -672,13 +839,28 @@ impl SessionHost {
             // Removal and Closing (cleanup_claimed) transitions must wake WebUI.
             self.notify_revision();
         }
-        Ok(CloseGroupResult {
-            matched,
-            closed,
-            failures,
-        })
+        Ok((
+            CloseGroupResult {
+                matched,
+                closed,
+                timed_out,
+                failures,
+            },
+            not_closed,
+        ))
     }
 
+    /// Stop every session and reap every owned process scope before the server
+    /// exits. The bounded group close runs first; sessions it could not stop
+    /// (Timeout or Failed) keep their process and PTY ownership, and this exit
+    /// path then force-terminates and reaps each surviving scope within its own
+    /// fresh bounded window. Server exit therefore never orphans a Unix process
+    /// group or a Windows job scope, whether it was triggered by ServerStop or
+    /// by the accept loop ending. A structural group-close failure (broken
+    /// worker channel, poisoned registry) is not fatal to the cleanup: the
+    /// snapshot then retains every session and the final forced pass covers all
+    /// of them, with the structural error merged into the result. Only scopes
+    /// that are *still* alive after their own forced window are reported.
     pub(crate) fn shutdown_all(&self) -> Result<()> {
         let sessions = {
             let mut registry = self
@@ -692,25 +874,61 @@ impl SessionHost {
                 .map(|(handle, session)| (handle.clone(), Arc::clone(session)))
                 .collect::<Vec<_>>()
         };
-
-        let mut errors = Vec::new();
-        for (handle, session) in sessions {
-            match session.shutdown() {
-                Ok(()) => {
-                    let mut registry = self
-                        .registry
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("session registry lock was poisoned"))?;
-                    registry.remove_session(&handle, &session);
+        // Server exit is the last process owner: whichever sessions the bounded
+        // group close could not verify closed (Timeout, Failed, or a structural
+        // error that prevented per-session outcomes) must be force-terminated
+        // here instead of letting the host drop with the scope still running.
+        let (not_closed, close_error) = match self.run_close_group(
+            sessions.clone(),
+            default_group_deadline(),
+            GROUP_CLOSE_WORKERS,
+        ) {
+            Ok(outcomes) => match self.apply_close_outcomes(outcomes) {
+                Ok((_result, leftovers)) => (leftovers, None),
+                Err(error) => {
+                    // The registry lock is poisoned and no outcome was applied:
+                    // every snapshot session still owns its scope.
+                    (sessions, Some(error))
                 }
-                Err(error) => errors.push(format!("{handle}: {error:#}")),
+            },
+            Err(error) => {
+                // The group close failed structurally without per-session
+                // outcomes; the snapshot still owns every scope.
+                (sessions, Some(error))
+            }
+        };
+        // Each surviving session gets its own forced-termination window so a
+        // slow first scope cannot consume a shared deadline and starve the
+        // remaining ones of their Kill signal.
+        let mut survivors = Vec::new();
+        for (handle, session) in not_closed {
+            let final_deadline =
+                Instant::now() + Duration::from_millis(u64::from(PROCESS_TERMINATE_TIMEOUT_MS));
+            match session.force_terminate_scope(final_deadline) {
+                EscalationResult::Done => {
+                    if session.finalize_now() != CloseOutcome::Closed {
+                        survivors.push(format!(
+                            "{handle}: close could not be finalized after final termination"
+                        ));
+                    }
+                }
+                EscalationResult::Timeout => survivors.push(format!(
+                    "{handle}: process scope survived the final forced termination window"
+                )),
+                EscalationResult::Failed(message) => survivors.push(format!("{handle}: {message}")),
             }
         }
         self.notify_revision();
-        if errors.is_empty() {
+        if let Some(error) = close_error {
+            survivors.push(format!("group close failed: {error:#}"));
+        }
+        if survivors.is_empty() {
             Ok(())
         } else {
-            bail!("failed to stop one or more sessions: {}", errors.join("; "))
+            bail!(
+                "failed to stop one or more sessions: {}",
+                survivors.join("; ")
+            )
         }
     }
 
@@ -759,11 +977,133 @@ struct Session {
     host_revision: Arc<HostRevision>,
     writer_tx: Mutex<Option<SyncSender<Vec<u8>>>>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
-    killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
+    /// Immutable identifier of the owned process scope, captured at spawn: on
+    /// Unix the process-group id (the session leader pid from portable-pty's
+    /// setsid), on Windows the root child pid. Every close liveness probe and
+    /// termination signal addresses the whole scope through this id. It is
+    /// deliberately independent of the externally visible
+    /// `SessionState::process_id`, which is cleared as soon as the root exits,
+    /// so a naturally exited root can never mask a surviving descendant.
+    scope_id: u32,
+    /// Monotonic escalation level already sent to the owned process scope.
+    /// Persists across close attempts so a retry continues from observed state
+    /// instead of restarting the HUP/TERM/KILL ladder from the beginning.
+    /// This state is Unix-only; Windows targets the Job Object instead.
+    #[cfg(unix)]
+    termination: Mutex<TerminationLevel>,
+    /// Serializes termination escalation across explicit close, orphan reaping,
+    /// and I/O-error cleanup for one session.
+    close_lock: Mutex<()>,
+    /// Job Object containing the gated launcher and every Grok descendant.
+    /// The launcher is assigned before Grok is allowed to start, so membership
+    /// does not depend on recovering a complete parent chain from snapshots.
+    #[cfg(windows)]
+    scope_job: Option<WindowsJob>,
     shutdown: AtomicBool,
-    terminating: AtomicBool,
     cleanup_claimed: AtomicBool,
     cleanup_committed: AtomicBool,
+}
+
+/// Outcome of one close attempt. `Timeout` and `Failed` retain process and PTY
+/// ownership so a later attempt can continue termination.
+#[derive(Debug, Eq, PartialEq)]
+enum CloseOutcome {
+    /// The owned process scope is verified terminated and the session is
+    /// finalized (or was already complete).
+    Closed,
+    /// The attempt reached its deadline with the process scope still live.
+    Timeout,
+    /// Termination failed with a non-timeout error.
+    Failed(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CloseError {
+    NotFound(String),
+    Timeout,
+    Failed(String),
+}
+
+impl fmt::Display for CloseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(handle) => write!(formatter, "session not found: {handle}"),
+            Self::Timeout => write!(
+                formatter,
+                "close timed out after {PROCESS_TERMINATE_TIMEOUT_MS} ms; \
+                 the Grok process is still running; retry close to continue termination"
+            ),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CloseError {}
+
+type CloseGroupNotClosed = Vec<(String, Arc<Session>)>;
+
+/// Highest Unix process-group signal already sent for this session.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+enum TerminationLevel {
+    #[default]
+    None,
+    Hup,
+    Term,
+    Kill,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct WindowsJob {
+    handle: Arc<std::os::windows::io::OwnedHandle>,
+}
+
+#[cfg(windows)]
+struct WindowsLaunchGate {
+    event_name: OsString,
+    event: std::os::windows::io::OwnedHandle,
+    pid_report_name: OsString,
+    pid_report: std::os::windows::io::OwnedHandle,
+}
+
+/// Result of a liveness probe of the owned process scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeAlive {
+    /// The whole owned process scope is verifiably gone.
+    Gone,
+    /// The owned process scope is still alive.
+    Alive,
+    /// Liveness could not be verified (lock poisoned, or Windows could not
+    /// open the process). Never treated as `Gone`.
+    Unknown,
+}
+
+/// Session-level classification of the owned process scope for escalation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeState {
+    /// Session terminal or the whole owned scope verifiably gone.
+    Gone,
+    /// The owned scope is still alive.
+    Alive,
+    /// Cannot verify (probe inconclusive or no retained pid).
+    Unknown,
+}
+
+enum EscalationResult {
+    /// The process is verified terminated (waiter observed its exit).
+    Done,
+    /// The absolute deadline passed with the process still live.
+    Timeout,
+    /// Sending the termination signal failed.
+    Failed(String),
+}
+
+fn default_close_deadline() -> Instant {
+    Instant::now() + Duration::from_millis(u64::from(PROCESS_TERMINATE_TIMEOUT_MS))
+}
+
+fn default_group_deadline() -> Instant {
+    Instant::now() + Duration::from_millis(GROUP_CLOSE_TIMEOUT_MS)
 }
 
 struct SessionInner {
@@ -914,16 +1254,50 @@ impl Session {
             .master
             .take_writer()
             .context("failed to take the PTY writer")?;
+        #[cfg(not(windows))]
         let command = build_grok_command(&config, provider_session_id, grok_state_dir.as_deref());
+        #[cfg(windows)]
+        let (command, launch_gate, scope_job) = build_windows_grok_launcher_command(
+            &config,
+            provider_session_id,
+            grok_state_dir.as_deref(),
+        )?;
         let child = pair
             .slave
             .spawn_command(command)
             .context("failed to start interactive Grok Build")?;
         drop(pair.slave);
-        let killer = child.clone_killer();
-        let process_id = child
+        let launcher_process_id = child
             .process_id()
-            .context("Grok did not report a process ID")?;
+            .context("the PTY child did not report a process ID")?;
+        #[cfg(not(windows))]
+        let process_id = launcher_process_id;
+        #[cfg(windows)]
+        let (process_id, child) = {
+            let mut child = child;
+            let launch = child
+                .as_raw_handle()
+                .context("portable-pty did not expose the Windows launcher handle")
+                .and_then(|handle| {
+                    scope_job
+                        .assign_process(handle)
+                        .context("failed to assign the Windows launcher to its Job Object")?;
+                    launch_gate
+                        .signal()
+                        .context("failed to release the Windows Grok launch gate")?;
+                    launch_gate
+                        .wait_for_grok_pid(WINDOWS_LAUNCH_HANDSHAKE_TIMEOUT_MS)
+                        .context("the Windows Grok launcher did not report its process ID")
+                });
+            let process_id = match launch {
+                Ok(process_id) => process_id,
+                Err(error) => {
+                    let _ = child.kill();
+                    return Err(error);
+                }
+            };
+            (process_id, child)
+        };
         let (writer_tx, writer_rx) = sync_channel(WRITER_QUEUE_CAPACITY);
         let now = now_millis();
         let session = Arc::new(Self {
@@ -962,9 +1336,13 @@ impl Session {
             host_revision,
             writer_tx: Mutex::new(Some(writer_tx)),
             master: Mutex::new(Some(pair.master)),
-            killer: Mutex::new(Some(killer)),
+            scope_id: launcher_process_id,
+            #[cfg(unix)]
+            termination: Mutex::new(TerminationLevel::default()),
+            close_lock: Mutex::new(()),
+            #[cfg(windows)]
+            scope_job: Some(scope_job),
             shutdown: AtomicBool::new(false),
-            terminating: AtomicBool::new(false),
             cleanup_claimed: AtomicBool::new(false),
             cleanup_committed: AtomicBool::new(false),
         });
@@ -1363,33 +1741,312 @@ impl Session {
         }
     }
 
-    fn shutdown(&self) -> Result<()> {
+    /// One bounded close attempt. Marks the session as shutdown-requested,
+    /// escalates termination of the owned process scope within `deadline`, and
+    /// finalizes once termination is verified. On `Timeout`/`Failed` the
+    /// process and PTY ownership is retained so a later attempt can continue
+    /// from observed state (see `TerminationLevel`).
+    fn close_attempt(&self, deadline: Instant) -> CloseOutcome {
+        let _close_guard = match self.try_acquire_close_lock(deadline) {
+            Ok(guard) => guard,
+            Err(outcome) => return outcome,
+        };
         self.shutdown.store(true, Ordering::Release);
-        self.request_termination()
-            .context("failed to terminate Grok")?;
-        self.close_writer();
-        self.release_master();
+        if self.process_is_done_or_terminal() {
+            return self.finalize_now();
+        }
+        match self.escalate_until_done(deadline) {
+            EscalationResult::Done => self.finalize_now(),
+            EscalationResult::Timeout => CloseOutcome::Timeout,
+            EscalationResult::Failed(message) => CloseOutcome::Failed(message),
+        }
+    }
 
-        let deadline = Instant::now() + Duration::from_millis(PROCESS_TERMINATE_TIMEOUT_MS.into());
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session state lock was poisoned"))?;
-        while !phase_is_terminal(inner.phase) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!("Grok stopped but its PTY output did not close within five seconds");
-            }
-            let waited = self
-                .changed
-                .wait_timeout(inner, remaining)
-                .map_err(|_| anyhow::anyhow!("session wait lock was poisoned"))?;
-            inner = waited.0;
-            if waited.1.timed_out() && !phase_is_terminal(inner.phase) {
-                bail!("Grok stopped but its PTY output did not close within five seconds");
+    fn try_acquire_close_lock(
+        &self,
+        deadline: Instant,
+    ) -> std::result::Result<MutexGuard<'_, ()>, CloseOutcome> {
+        loop {
+            match self.close_lock.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(CloseOutcome::Failed(
+                        "session close lock was poisoned".to_owned(),
+                    ));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(CloseOutcome::Timeout);
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
             }
         }
-        Ok(())
+    }
+
+    /// True only when the owned process scope is *verified* gone. A terminal
+    /// phase alone is not proof: on Unix the waiter observing the root exit
+    /// does not prove that a descendant inside the same process group
+    /// disappeared, and on Windows the root exit does not prove the descendant
+    /// tree is gone. The immutable `scope_id` drives the liveness probe; a
+    /// probe failure is never treated as done. Always asks for the stable
+    /// verification because this decision finalizes the record.
+    fn process_is_done_or_terminal(&self) -> bool {
+        matches!(self.probe_scope(true), ScopeAlive::Gone)
+    }
+
+    /// Probe the owned process scope. Unix uses the immutable process-group id;
+    /// Windows queries the Job Object that contains the gated launcher and all
+    /// of its descendants. `stable_verification` is passed through to the Unix
+    /// probe so the escalation loop can skip the expensive all-zombie scan
+    /// until its final confirmation window.
+    fn probe_scope(&self, stable_verification: bool) -> ScopeAlive {
+        #[cfg(unix)]
+        {
+            process_scope_alive(self.scope_id, stable_verification)
+        }
+        #[cfg(windows)]
+        {
+            let _ = stable_verification;
+            self.scope_job.as_ref().map_or_else(
+                || process_alive(self.scope_id),
+                WindowsJob::process_scope_alive,
+            )
+        }
+    }
+
+    /// Classify the owned process scope from the immutable `scope_id` and the
+    /// platform liveness probe. `Gone` requires the probe to verify the whole
+    /// scope is gone; the waiter observing the root exit alone is never
+    /// treated as the whole scope being gone.
+    fn scope_state(&self, stable_verification: bool) -> ScopeState {
+        match self.probe_scope(stable_verification) {
+            ScopeAlive::Gone => ScopeState::Gone,
+            ScopeAlive::Alive => ScopeState::Alive,
+            ScopeAlive::Unknown => ScopeState::Unknown,
+        }
+    }
+
+    /// Record that the owned process scope has been verified gone. The waiter
+    /// waits only on the root process, so the liveness probe is the authority
+    /// for the whole group; the exit code stays unknown when the waiter never
+    /// reported one.
+    fn record_verified_process_done(&self) {
+        if let Ok(mut inner) = self.inner.lock()
+            && !inner.process_done
+        {
+            inner.process_done = true;
+            inner.updated_at_ms = now_millis();
+        }
+    }
+
+    /// Send HUP, then TERM, then KILL to the owned process scope within one
+    /// monotonic absolute deadline, verifying the whole scope is gone (not
+    /// just the root). Escalation milestones honor a minimum grace so a
+    /// graceful child is not force-killed prematurely; the highest level
+    /// already sent is remembered across attempts on Unix. Windows applies the
+    /// same bounded schedule to the kernel-owned Job scope, where the HUP and
+    /// TERM phases wait for natural exit and only KILL terminates the job.
+    fn escalate_until_done(&self, deadline: Instant) -> EscalationResult {
+        let started_at = Instant::now();
+        let budget = deadline.saturating_duration_since(started_at);
+        if budget.is_zero() {
+            return EscalationResult::Timeout;
+        }
+        let term_after = escalation_milestone(budget, 1, 3);
+        let kill_after = escalation_milestone(budget, 2, 3)
+            .max(term_after + Duration::from_millis(TERMINATION_GRACE_MIN_MS));
+        let term_at = started_at + term_after;
+        let kill_at = started_at + kill_after;
+        let stable_scan_at = deadline
+            .checked_sub(Duration::from_millis(STABLE_SCOPE_SCAN_LEAD_MS))
+            .unwrap_or(deadline);
+        let mut last_target = TerminationLevel::None;
+        loop {
+            let now = Instant::now();
+            // Outside the final confirmation window a successful kill(0) probe
+            // answers Alive immediately; only near the deadline do we walk
+            // /proc (twice) to distinguish a living member from an all-zombie
+            // group, so each round costs one syscall instead of two scans.
+            match self.scope_state(now >= stable_scan_at) {
+                ScopeState::Gone => {
+                    self.record_verified_process_done();
+                    return EscalationResult::Done;
+                }
+                ScopeState::Alive | ScopeState::Unknown => {}
+            }
+            if now >= deadline {
+                return EscalationResult::Timeout;
+            }
+            let target = if now < term_at {
+                TerminationLevel::Hup
+            } else if now < kill_at {
+                TerminationLevel::Term
+            } else {
+                TerminationLevel::Kill
+            };
+            let repeat_final_signal = cfg!(unix) && target == TerminationLevel::Kill;
+            if target != last_target || repeat_final_signal {
+                if let Err(error) = self.escalate_to(target) {
+                    return EscalationResult::Failed(format!(
+                        "failed to terminate Grok process scope: {error}"
+                    ));
+                }
+                last_target = target;
+            }
+            let next_milestone = match target {
+                TerminationLevel::Hup => term_at,
+                TerminationLevel::Term => kill_at,
+                TerminationLevel::Kill | TerminationLevel::None => deadline,
+            };
+            let wait = next_milestone
+                .min(deadline)
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50))
+                .max(Duration::from_millis(1));
+            // Wait on session changes (reader progress, waiter report) without
+            // treating a terminal phase as proof the scope is gone: the liveness
+            // probe at the top of the loop remains the authority.
+            let inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(_) => {
+                    return EscalationResult::Failed("session state lock was poisoned".into());
+                }
+            };
+            let _ = self
+                .changed
+                .wait_timeout(inner, wait)
+                .map_err(|_| anyhow::anyhow!("session wait lock was poisoned"));
+        }
+    }
+
+    /// Final forced termination used by `shutdown_all` for sessions the bounded
+    /// group close could not stop. Skips the HUP/TERM ladder and sends KILL
+    /// directly (Unix process-group SIGKILL / Windows `TerminateJobObject`),
+    /// then reaps until the liveness probe verifies the whole scope is gone or
+    /// `deadline` passes. The signal is repeated while the scope stays alive
+    /// because a member can fork into the group concurrently with the first
+    /// signal. Never reports `Done` without the probe certifying the scope
+    /// gone; a transient send failure is remembered and retried.
+    fn force_terminate_scope(&self, deadline: Instant) -> EscalationResult {
+        let stable_scan_at = deadline
+            .checked_sub(Duration::from_millis(STABLE_SCOPE_SCAN_LEAD_MS))
+            .unwrap_or(deadline);
+        let mut last_error: Option<String> = None;
+        loop {
+            let now = Instant::now();
+            if let ScopeAlive::Gone = self.probe_scope(now >= stable_scan_at) {
+                self.record_verified_process_done();
+                return EscalationResult::Done;
+            }
+            if now >= deadline {
+                return match last_error {
+                    Some(message) => EscalationResult::Failed(format!(
+                        "final forced termination could not be verified: {message}"
+                    )),
+                    None => EscalationResult::Timeout,
+                };
+            }
+            if let Err(error) = self.escalate_to(TerminationLevel::Kill) {
+                // Transient failures can clear on the next round; keep sending.
+                last_error = Some(error.to_string());
+            }
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50))
+                .max(Duration::from_millis(1));
+            let inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(_) => {
+                    return EscalationResult::Failed("session state lock was poisoned".into());
+                }
+            };
+            let _ = self
+                .changed
+                .wait_timeout(inner, wait)
+                .map_err(|_| anyhow::anyhow!("session wait lock was poisoned"));
+        }
+    }
+
+    /// Send the next escalation level once; a level already sent is not sent
+    /// again unless a later attempt asks for a stronger one. `SIGKILL` is the
+    /// exception on Unix: repeat it while the group remains alive because a
+    /// member can fork into the group concurrently with the first signal.
+    /// Windows termination targets the Job Object, whose membership is fixed
+    /// by the launch gate.
+    fn escalate_to(&self, target: TerminationLevel) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let mut state = match self.termination.lock() {
+                Ok(state) => state,
+                Err(_) => {
+                    return Err(std::io::Error::other("termination state lock was poisoned"));
+                }
+            };
+            if target < *state || (target == *state && target != TerminationLevel::Kill) {
+                return Ok(());
+            }
+            send_termination_signal(self.scope_id, target)?;
+            if target > *state {
+                *state = target;
+            }
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            match self.scope_job.as_ref() {
+                Some(job) => job.terminate(target),
+                None => terminate_windows_process(self.scope_id, target),
+            }
+        }
+    }
+
+    /// Finalize a session whose process scope is *verified* terminated. The
+    /// caller (`close_attempt`) reaches this only after the liveness probe
+    /// reported the whole scope gone (or a previously verified close cleared
+    /// the retained scope id). Idempotent and safe on already-complete
+    /// sessions; always releases the PTY master and writer so a blocked reader
+    /// edge unblocks. Returns `Failed` instead of claiming `Closed` when
+    /// finalization could not be completed (e.g. the state lock is poisoned).
+    fn finalize_now(&self) -> CloseOutcome {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => {
+                return CloseOutcome::Failed(
+                    "session could not be finalized: state lock was poisoned".to_owned(),
+                );
+            }
+        };
+        let already_terminal = phase_is_terminal(inner.phase);
+        if !inner.process_done && !already_terminal {
+            // The liveness probe verified the whole scope is gone but the
+            // waiter has not reported yet; the probe is the authority for the
+            // entire process scope.
+            inner.process_done = true;
+            inner.updated_at_ms = now_millis();
+        }
+        let finalized = finalize_session(&mut inner, true) || already_terminal;
+        if finalized {
+            // The record is fully closed: never expose a pid for a finalized
+            // session. finalize_session clears it on the transition; this also
+            // covers the already-terminal path. The immutable scope_id remains
+            // available on Session for any later verification.
+            inner.process_id = None;
+            inner.updated_at_ms = now_millis();
+        }
+        drop(inner);
+        if finalized {
+            self.close_writer();
+            self.release_master();
+            self.signal_changed();
+            CloseOutcome::Closed
+        } else {
+            CloseOutcome::Failed(
+                "session could not be finalized: the process scope was not verifiably terminated"
+                    .to_owned(),
+            )
+        }
     }
 
     fn append_output(&self, data: Vec<u8>) {
@@ -1440,7 +2097,13 @@ impl Session {
         match result {
             Some(Ok(())) => {}
             Some(Err(TrySendError::Full(_))) => {
-                self.mark_writer_error("terminal response queue is full".to_owned());
+                // Queue full is transient backpressure, not a fatal writer
+                // failure: record the error for observers but never escalate
+                // the owned process scope, matching enqueue_input semantics.
+                self.mark_writer_error_with_escalation(
+                    "terminal response queue is full".to_owned(),
+                    false,
+                );
             }
             Some(Err(TrySendError::Disconnected(_))) | None => {
                 if !self.shutdown.load(Ordering::Acquire) {
@@ -1462,27 +2125,39 @@ impl Session {
     }
 
     fn mark_reader_error(&self, message: String) {
-        if let Ok(mut inner) = self.inner.lock() {
+        let finalized = if let Ok(mut inner) = self.inner.lock() {
             inner.reader_done = true;
             record_error(&mut inner, message);
-        }
-        self.signal_changed();
-        if let Err(error) = self.request_termination() {
-            self.record_secondary_error(format!(
-                "failed to terminate Grok after reader error: {error}"
-            ));
+            finalize_session(&mut inner, self.shutdown.load(Ordering::Acquire))
+        } else {
+            false
+        };
+        self.finish_transition(finalized);
+        // The stream is gone; terminate the owned process scope within a bounded
+        // escalation so the session converges instead of waiting forever.
+        if !self.process_is_done_or_terminal() {
+            self.run_error_edge_escalation();
         }
     }
 
     fn mark_writer_error(&self, message: String) {
-        if let Ok(mut inner) = self.inner.lock() {
+        self.mark_writer_error_with_escalation(message, true);
+    }
+
+    /// Record a writer failure and optionally escalate the owned process scope.
+    /// `escalate` must be false for recoverable backpressure (a full queue):
+    /// the stream is still usable and the scope must survive; escalation is
+    /// reserved for unrecoverable failures like a closed channel.
+    fn mark_writer_error_with_escalation(&self, message: String, escalate: bool) {
+        let finalized = if let Ok(mut inner) = self.inner.lock() {
             record_error(&mut inner, message);
-        }
-        self.signal_changed();
-        if let Err(error) = self.request_termination() {
-            self.record_secondary_error(format!(
-                "failed to terminate Grok after writer error: {error}"
-            ));
+            finalize_session(&mut inner, self.shutdown.load(Ordering::Acquire))
+        } else {
+            false
+        };
+        self.finish_transition(finalized);
+        if escalate && !self.process_is_done_or_terminal() {
+            self.run_error_edge_escalation();
         }
     }
 
@@ -1491,10 +2166,40 @@ impl Session {
             record_error(&mut inner, message);
         }
         self.signal_changed();
-        if let Err(error) = self.request_termination() {
-            self.record_secondary_error(format!(
-                "failed to terminate Grok after wait error: {error}"
-            ));
+        // The waiter can no longer observe the root process, so verify the
+        // whole owned scope directly (Unix process-group probe or Windows Job
+        // Object). Never set process_done
+        // without verification: an unverifiable failure keeps the real state
+        // and ownership so a later close can retry termination.
+        self.run_error_edge_escalation();
+    }
+
+    /// Bounded best-effort escalation used by reader/writer/waiter error edges.
+    /// Converges finalization only when the scope is verified gone; timeout and
+    /// failure keep ownership and state so a later close can retry.
+    fn run_error_edge_escalation(&self) {
+        let deadline = Instant::now() + Duration::from_millis(ERROR_ESCALATION_TIMEOUT_MS);
+        let Ok(_close_guard) = self.try_acquire_close_lock(deadline) else {
+            return;
+        };
+        match self.escalate_until_done(deadline) {
+            EscalationResult::Done => {
+                let shutdown = self.shutdown.load(Ordering::Acquire);
+                let finalized = if let Ok(mut inner) = self.inner.lock() {
+                    finalize_session(&mut inner, shutdown)
+                } else {
+                    false
+                };
+                self.finish_transition(finalized);
+            }
+            EscalationResult::Timeout => {
+                // Scope still live or unverifiable: keep ownership and state.
+            }
+            EscalationResult::Failed(error) => {
+                self.record_secondary_error(format!(
+                    "failed to terminate Grok after an I/O edge failed: {error}"
+                ));
+            }
         }
     }
 
@@ -1503,6 +2208,10 @@ impl Session {
             if !inner.process_done {
                 inner.process_done = true;
                 inner.exit_code = Some(exit_code);
+                // The root exited: the externally visible process id is stale
+                // now (baseline semantics; a natural exit must never expose a
+                // dead pid). The immutable Session::scope_id still identifies
+                // the whole owned scope for close liveness and termination.
                 inner.process_id = None;
             }
             inner.updated_at_ms = now_millis();
@@ -1511,50 +2220,6 @@ impl Session {
             false
         };
         self.finish_transition(finalized);
-    }
-
-    fn request_termination(&self) -> Result<()> {
-        if self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session state lock was poisoned"))?
-            .process_done
-        {
-            return Ok(());
-        }
-        if self
-            .terminating
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(());
-        }
-        let result = self
-            .killer
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Grok process killer lock was poisoned"))?
-            .as_mut()
-            .context("Grok process killer is unavailable")?
-            .kill();
-        #[cfg(windows)]
-        {
-            // portable-pty 0.9 inverts the TerminateProcess result in its
-            // cloned Windows killer: success is returned as a stale OS error,
-            // while failure is returned as Ok. The waiter remains the source
-            // of truth for the actual process exit.
-            let _ = result;
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        {
-            match result {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    self.terminating.store(false, Ordering::Release);
-                    Err(error).context("failed to terminate Grok")
-                }
-            }
-        }
     }
 
     fn record_secondary_error(&self, message: String) {
@@ -1582,6 +2247,17 @@ impl Session {
             self.release_master();
         }
         self.signal_changed();
+    }
+
+    #[cfg(test)]
+    fn test_hold_close_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.close_lock.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    fn test_poison_close_lock(&self) {
+        let _guard = self.close_lock.lock().unwrap();
+        panic!("test poisons the session close lock");
     }
 }
 
@@ -2098,6 +2774,50 @@ fn build_grok_command(
     command
 }
 
+#[cfg(windows)]
+fn build_windows_grok_launcher_command(
+    config: &LaunchConfig,
+    provider_session_id: &str,
+    grok_state_dir: Option<&Path>,
+) -> Result<(CommandBuilder, WindowsLaunchGate, WindowsJob)> {
+    let grok = build_grok_command(config, provider_session_id, grok_state_dir);
+    let gate = WindowsLaunchGate::create()?;
+    let job = WindowsJob::create().context("failed to create the Windows Grok Job Object")?;
+    let executable = env::current_exe().context("failed to locate the grok-bridge executable")?;
+    let mut launcher = CommandBuilder::new(executable);
+    launcher.cwd(config.cwd.as_os_str());
+    launcher.env("TERM", "xterm-256color");
+    launcher.env("COLORTERM", "truecolor");
+    if let Some(grok_state_dir) = grok_state_dir {
+        launcher.env("GROK_HOME", grok_state_dir.as_os_str());
+    }
+    launcher.arg("__windows-job-child");
+    launcher.arg(&gate.event_name);
+    launcher.arg(&gate.pid_report_name);
+    launcher.args(grok.get_argv());
+    Ok((launcher, gate, job))
+}
+
+#[cfg(windows)]
+pub(crate) fn run_windows_job_child(mut arguments: Vec<OsString>) -> Result<i32> {
+    if arguments.len() < 3 {
+        bail!("internal Windows job child requires event, PID report, and program names");
+    }
+    let gate_name = arguments.remove(0);
+    let pid_report_name = arguments.remove(0);
+    let program = arguments.remove(0);
+    wait_for_windows_launch_gate(&gate_name, WINDOWS_LAUNCH_HANDSHAKE_TIMEOUT_MS)?;
+    let mut child = std::process::Command::new(&program)
+        .args(arguments)
+        .spawn()
+        .with_context(|| format!("failed to start gated Grok process {program:?}"))?;
+    report_windows_grok_pid(&pid_report_name, child.id())?;
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for gated Grok process {program:?}"))?;
+    Ok(status.code().unwrap_or(1))
+}
+
 fn spawn_reader(session: Arc<Session>, mut reader: Box<dyn Read + Send>) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 16 * 1024];
@@ -2148,6 +2868,547 @@ fn spawn_waiter(session: Arc<Session>, mut child: Box<dyn portable_pty::Child + 
     });
 }
 
+/// Escalation milestone inside a close budget: `fraction` of the budget, but
+/// never sooner than the minimum grace so a graceful child is not
+/// force-killed prematurely.
+fn escalation_milestone(
+    budget: Duration,
+    fraction_numerator: u64,
+    fraction_denominator: u64,
+) -> Duration {
+    budget
+        .mul_f64(fraction_numerator as f64 / fraction_denominator as f64)
+        .max(Duration::from_millis(TERMINATION_GRACE_MIN_MS))
+}
+
+/// Send the requested termination to the process scope owned by the Session.
+///
+/// Unix: portable-pty spawns the PTY child as a session leader (`setsid`), so
+/// the process group id equals the child's pid; signal the whole group so every
+/// current member — including descendants that share the PTY — receives the
+/// escalation. `ESRCH` means the group is already gone and is treated as
+/// success; the liveness probe (see `process_scope_alive`) verifies the scope.
+///
+/// Windows: a gated launcher is assigned to a Job Object before Grok starts.
+/// Every descendant therefore enters the same kernel-owned scope, even when an
+/// intermediate process exits before close begins.
+#[cfg(unix)]
+fn send_termination_signal(pid: u32, level: TerminationLevel) -> std::io::Result<()> {
+    let signal = match level {
+        TerminationLevel::Hup => libc::SIGHUP,
+        TerminationLevel::Term => libc::SIGTERM,
+        TerminationLevel::Kill => libc::SIGKILL,
+        TerminationLevel::None => return Ok(()),
+    };
+    // SAFETY: `kill` with a process group id derived from the session leader's
+    // pid touches only that group; the child owns it because it called setsid.
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        // The process group is already gone; the liveness probe observes it.
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+/// Probe whether the Unix process group owned by the Session is still alive.
+/// The group id equals the session leader pid (`setsid` in portable-pty), and
+/// the group persists as long as any member — including a descendant that
+/// retained the PTY after the root exited — remains. Only `ESRCH` proves the
+/// whole scope is gone; `EPERM` means it exists but is not signalable (still
+/// alive), and any other error leaves the answer unknown.
+///
+/// `stable_verification` enables the all-zombie distinction on Linux: an
+/// all-zombie group can still answer kill(-pgid, 0) with success (EPERM on
+/// macOS), so a successful existence probe alone cannot certify `Gone`; the
+/// stable two-scan view is required. Escalation asks for that only in its
+/// final confirmation window (`STABLE_SCOPE_SCAN_LEAD_MS`); outside it a
+/// successful existence probe answers `Alive` without walking /proc.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn process_scope_alive(pid: u32, stable_verification: bool) -> ScopeAlive {
+    // SAFETY: signal 0 only probes existence; `-pid` addresses the group owned
+    // by the session leader that called setsid, so no unrelated group is hit.
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+    if result == 0 {
+        #[cfg(target_os = "macos")]
+        return macos_process_group_alive(pid);
+        #[cfg(target_os = "linux")]
+        return linux_process_group_alive(pid, stable_verification);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        return ScopeAlive::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => ScopeAlive::Gone,
+        Some(libc::EPERM) => ScopeAlive::Alive,
+        _ => ScopeAlive::Unknown,
+    }
+}
+
+/// `kill(-pgid, 0)` also succeeds when a group contains only zombies. Require
+/// two all-zombie views with identical membership before treating the group as
+/// terminated: enumeration and per-PID inspection are not one atomic snapshot.
+#[cfg(target_os = "macos")]
+fn macos_process_group_alive(pgid: u32) -> ScopeAlive {
+    stable_process_group_scan_result(
+        macos_process_group_scan(pgid),
+        macos_process_group_scan(pgid),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_group_scan(pgid: u32) -> (ScopeAlive, Vec<u32>) {
+    const MAX_GROUP_MEMBERS: usize = 4096;
+    let mut pids = vec![0_i32; MAX_GROUP_MEMBERS];
+    let buffer_bytes = pids.len() * std::mem::size_of::<libc::pid_t>();
+    let returned = unsafe {
+        libc::proc_listpgrppids(
+            pgid as libc::pid_t,
+            pids.as_mut_ptr().cast(),
+            buffer_bytes as libc::c_int,
+        )
+    };
+    if returned < 0 || returned as usize >= pids.len() {
+        return (ScopeAlive::Unknown, Vec::new());
+    }
+    let count = returned as usize;
+    let mut members = pids
+        .into_iter()
+        .take(count)
+        .filter(|pid| *pid > 0)
+        .map(|pid| pid as u32)
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    members.dedup();
+    let mut verdict = ScopeAlive::Gone;
+    for &process_id in &members {
+        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+        let read = unsafe {
+            libc::proc_pidinfo(
+                process_id as libc::pid_t,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of_val(&info) as libc::c_int,
+            )
+        };
+        if read != std::mem::size_of_val(&info) as libc::c_int {
+            verdict = ScopeAlive::Unknown;
+            continue;
+        }
+        if info.pbi_pgid != pgid {
+            verdict = ScopeAlive::Unknown;
+            continue;
+        }
+        if info.pbi_status != libc::SZOMB {
+            return (ScopeAlive::Alive, members);
+        }
+    }
+    (verdict, members)
+}
+
+/// Linux exposes process-group and state fields in `/proc/<pid>/stat`. When
+/// `stable_verification` is set, scan twice and require stable membership
+/// before certifying an all-zombie group; otherwise a successful kill(0) probe
+/// already proved the group exists and a living member answers `Alive`
+/// immediately, skipping the /proc traversal.
+#[cfg(target_os = "linux")]
+fn linux_process_group_alive(pgid: u32, stable_verification: bool) -> ScopeAlive {
+    if !stable_verification {
+        return ScopeAlive::Alive;
+    }
+    stable_process_group_scan_result(
+        linux_process_group_scan(pgid),
+        linux_process_group_scan(pgid),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_scan(pgid: u32) -> (ScopeAlive, Vec<u32>) {
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return (ScopeAlive::Unknown, Vec::new()),
+    };
+    let mut members = Vec::new();
+    let mut verdict = ScopeAlive::Gone;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            verdict = ScopeAlive::Unknown;
+            continue;
+        };
+        let Some(process_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(_) => {
+                verdict = ScopeAlive::Unknown;
+                continue;
+            }
+        };
+        let Some(after_name) = stat.rsplit_once(") ").map(|(_, fields)| fields) else {
+            verdict = ScopeAlive::Unknown;
+            continue;
+        };
+        let mut fields = after_name.split_whitespace();
+        let state = fields.next();
+        let _parent_pid = fields.next();
+        let process_group = fields.next().and_then(|field| field.parse::<u32>().ok());
+        if process_group != Some(pgid) {
+            continue;
+        }
+        members.push(process_id);
+        match state {
+            Some("Z" | "X") => {}
+            Some(_) => {
+                members.sort_unstable();
+                return (ScopeAlive::Alive, members);
+            }
+            None => verdict = ScopeAlive::Unknown,
+        }
+    }
+    members.sort_unstable();
+    members.dedup();
+    (verdict, members)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stable_process_group_scan_result(
+    first: (ScopeAlive, Vec<u32>),
+    second: (ScopeAlive, Vec<u32>),
+) -> ScopeAlive {
+    if first.0 != ScopeAlive::Gone {
+        return first.0;
+    }
+    if second.0 != ScopeAlive::Gone {
+        return second.0;
+    }
+    if first.1 == second.1 {
+        ScopeAlive::Gone
+    } else {
+        ScopeAlive::Unknown
+    }
+}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn create() -> std::io::Result<Self> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                raw,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            handle: Arc::new(handle),
+        })
+    }
+
+    fn assign_process(&self, process: std::os::windows::io::RawHandle) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        if unsafe { AssignProcessToJobObject(self.handle.as_raw_handle() as _, process as _) } == 0
+        {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn process_scope_alive(&self) -> ScopeAlive {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        if unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle() as _,
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of_val(&info) as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            ScopeAlive::Unknown
+        } else if info.ActiveProcesses == 0 {
+            ScopeAlive::Gone
+        } else {
+            ScopeAlive::Alive
+        }
+    }
+
+    /// Apply one termination level to the Job Object scope.
+    ///
+    /// Windows has no job-scoped graceful signal, so the escalation ladder's
+    /// `Hup` and `Term` phases are wait-only: the close loop keeps probing
+    /// `ActiveProcesses` and gives members a chance to exit naturally, and no
+    /// force-kill is issued. Only `Kill` force-terminates every member with
+    /// `TerminateJobObject`. A scope that is already verifiably gone is
+    /// success, mirroring the Unix `ESRCH` semantics.
+    fn terminate(&self, level: TerminationLevel) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        match level {
+            TerminationLevel::None => Ok(()),
+            TerminationLevel::Hup | TerminationLevel::Term => {
+                // Wait-only phase: no TerminateJobObject. The escalation loop
+                // owns the bounded wait between milestones; a job whose members
+                // already exited is success.
+                Ok(())
+            }
+            TerminationLevel::Kill => {
+                if unsafe { TerminateJobObject(self.handle.as_raw_handle() as _, 1) } != 0
+                    || self.process_scope_alive() == ScopeAlive::Gone
+                {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl WindowsLaunchGate {
+    fn create() -> Result<Self> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Threading::{CreateEventW, CreateSemaphoreW};
+
+        let id = generate_provider_session_id()?;
+        let event_name = OsString::from(format!("Local\\grok-bridge-launch-{id}"));
+        let pid_report_name = OsString::from(format!("Local\\grok-bridge-pid-{id}"));
+        let wide_event_name = windows_wide_null(&event_name);
+        let raw_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, wide_event_name.as_ptr()) };
+        if raw_event.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to create the Windows Grok launch event");
+        }
+        let event = unsafe { OwnedHandle::from_raw_handle(raw_event as _) };
+        let wide_pid_report_name = windows_wide_null(&pid_report_name);
+        let raw_pid_report = unsafe {
+            CreateSemaphoreW(std::ptr::null(), 0, i32::MAX, wide_pid_report_name.as_ptr())
+        };
+        if raw_pid_report.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to create the Windows Grok PID report semaphore");
+        }
+        Ok(Self {
+            event_name,
+            event,
+            pid_report_name,
+            pid_report: unsafe { OwnedHandle::from_raw_handle(raw_pid_report as _) },
+        })
+    }
+
+    fn signal(&self) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::SetEvent;
+
+        if unsafe { SetEvent(self.event.as_raw_handle() as _) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_grok_pid(&self, timeout_ms: u32) -> Result<u32> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{ReleaseSemaphore, WaitForSingleObject},
+        };
+
+        let handle = self.pid_report.as_raw_handle() as _;
+        match unsafe { WaitForSingleObject(handle, timeout_ms) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => {
+                bail!("timed out after {timeout_ms} ms waiting for the Windows Grok process ID")
+            }
+            WAIT_FAILED => {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed while waiting for the Windows Grok process ID");
+            }
+            status => bail!("unexpected Windows Grok PID wait status: {status}"),
+        }
+        let mut previous = 0_i32;
+        if unsafe { ReleaseSemaphore(handle, 1, &mut previous) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to read the Windows Grok process ID");
+        }
+        u32::try_from(previous)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .filter(|pid| *pid != 0)
+            .context("the Windows Grok launcher reported an invalid process ID")
+    }
+}
+
+#[cfg(windows)]
+fn windows_wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn wait_for_windows_launch_gate(name: &std::ffi::OsStr, timeout_ms: u32) -> Result<()> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject},
+    };
+
+    let wide_name = windows_wide_null(name);
+    let raw = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide_name.as_ptr()) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open the Windows Grok launch event");
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+    match unsafe {
+        WaitForSingleObject(
+            std::os::windows::io::AsRawHandle::as_raw_handle(&handle) as _,
+            timeout_ms,
+        )
+    } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => {
+            bail!("timed out after {timeout_ms} ms waiting for the Windows Grok launch gate")
+        }
+        WAIT_FAILED => Err(std::io::Error::last_os_error())
+            .context("failed while waiting for the Windows Grok launch event"),
+        status => bail!("unexpected Windows Grok launch wait status: {status}"),
+    }
+}
+
+#[cfg(windows)]
+fn report_windows_grok_pid(name: &std::ffi::OsStr, pid: u32) -> Result<()> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Threading::{
+        OpenSemaphoreW, ReleaseSemaphore, SEMAPHORE_MODIFY_STATE,
+    };
+
+    let pid = i32::try_from(pid).context("the Windows Grok process ID exceeds i32::MAX")?;
+    let wide_name = windows_wide_null(name);
+    let raw = unsafe { OpenSemaphoreW(SEMAPHORE_MODIFY_STATE, 0, wide_name.as_ptr()) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open the Windows Grok PID report semaphore");
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+    if unsafe {
+        ReleaseSemaphore(
+            std::os::windows::io::AsRawHandle::as_raw_handle(&handle) as _,
+            pid,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error()).context("failed to report the Windows Grok process ID")
+    } else {
+        Ok(())
+    }
+}
+
+/// Apply one termination level to a bare Windows process, used when no Job
+/// Object scope is retained (e.g. tests). Mirrors `WindowsJob::terminate`:
+/// `Hup` and `Term` are wait-only phases and `Kill` force-terminates the
+/// process with `TerminateProcess`; a process already gone is success.
+#[cfg(windows)]
+fn terminate_windows_process(pid: u32, level: TerminationLevel) -> std::io::Result<()> {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    match level {
+        TerminationLevel::None => Ok(()),
+        TerminationLevel::Hup | TerminationLevel::Term => {
+            // Wait-only phase: no force-kill. A process that already exited is
+            // observed by the liveness probe.
+            Ok(())
+        }
+        TerminationLevel::Kill => {
+            let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+            if handle.is_null() {
+                return if process_alive(pid) == ScopeAlive::Gone {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                };
+            }
+            let result = unsafe { TerminateProcess(handle, 1) };
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            if result != 0 || process_alive(pid) == ScopeAlive::Gone {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> ScopeAlive {
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return if std::io::Error::last_os_error().raw_os_error()
+            == Some(ERROR_INVALID_PARAMETER as i32)
+        {
+            ScopeAlive::Gone
+        } else {
+            ScopeAlive::Unknown
+        };
+    }
+    let status = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe { CloseHandle(handle) };
+    match status {
+        WAIT_OBJECT_0 => ScopeAlive::Gone,
+        WAIT_TIMEOUT => ScopeAlive::Alive,
+        WAIT_FAILED => ScopeAlive::Unknown,
+        _ => ScopeAlive::Unknown,
+    }
+}
+
 fn finalize_session(inner: &mut SessionInner, shutdown: bool) -> bool {
     let Some(phase) = completed_phase(
         inner.phase,
@@ -2161,6 +3422,10 @@ fn finalize_session(inner: &mut SessionInner, shutdown: bool) -> bool {
     };
     let now = now_millis();
     set_phase(inner, phase, now);
+    // The record is fully closed: clear the externally visible process id so a
+    // naturally exited session never exposes a stale pid. The immutable
+    // Session::scope_id keeps addressing the owned scope if a later close
+    // still needs to verify or terminate it.
     inner.process_id = None;
     inner.updated_at_ms = now;
     true
@@ -2174,16 +3439,24 @@ fn completed_phase(
     failed: bool,
     exit_code: Option<u32>,
 ) -> Option<SessionPhase> {
-    if phase_is_terminal(current) || !process_done || !reader_done {
+    if phase_is_terminal(current) {
         return None;
     }
-    Some(if shutdown {
-        SessionPhase::Stopped
+    if !process_done {
+        return None;
+    }
+    if shutdown {
+        // An explicit close marks the scope terminated once the process is
+        // verified gone; the PTY master is released right after so the reader
+        // edge unblocks. Missing reader EOF does not keep the record half-open.
+        Some(SessionPhase::Stopped)
+    } else if !reader_done {
+        None
     } else if failed || exit_code != Some(0) {
-        SessionPhase::Failed
+        Some(SessionPhase::Failed)
     } else {
-        SessionPhase::Exited
-    })
+        Some(SessionPhase::Exited)
+    }
 }
 
 fn phase_after_output(
@@ -2498,10 +3771,196 @@ fn now_millis() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const TEST_PROVIDER_SESSION_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+
+    #[cfg(windows)]
+    const WINDOWS_PROCESS_TREE_ROLE_ENV: &str = "GROK_BRIDGE_TEST_PROCESS_TREE_ROLE";
+    #[cfg(windows)]
+    const WINDOWS_PROCESS_TREE_DIR_ENV: &str = "GROK_BRIDGE_TEST_PROCESS_TREE_DIR";
+    #[cfg(windows)]
+    const WINDOWS_PROCESS_TREE_ROOT_ENV: &str = "GROK_BRIDGE_TEST_PROCESS_TREE_ROOT";
+    #[cfg(windows)]
+    const WINDOWS_PROCESS_TREE_GATE_ENV: &str = "GROK_BRIDGE_TEST_PROCESS_TREE_GATE";
+    #[cfg(windows)]
+    const WINDOWS_PROCESS_TREE_HELPER_TEST: &str = "session::tests::windows_process_tree_helper";
+    #[cfg(windows)]
+    const WINDOWS_PROCESS_TREE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[cfg(windows)]
+    struct WindowsProcessTreeCleanup {
+        root: Option<std::process::Child>,
+        directory: PathBuf,
+        pids: Vec<u32>,
+        armed: bool,
+    }
+
+    #[cfg(windows)]
+    impl WindowsProcessTreeCleanup {
+        fn new(root: std::process::Child, directory: PathBuf) -> Self {
+            let root_pid = root.id();
+            Self {
+                root: Some(root),
+                directory,
+                pids: vec![root_pid],
+                armed: true,
+            }
+        }
+
+        fn remember(&mut self, pids: &[u32]) {
+            self.pids.extend_from_slice(pids);
+            self.pids.sort_unstable();
+            self.pids.dedup();
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+            self.root.take();
+            self.pids.clear();
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsProcessTreeCleanup {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            for name in ["child.pid", "grandchild.pid"] {
+                if let Ok(value) = fs::read_to_string(self.directory.join(name))
+                    && let Ok(pid) = value.trim().parse::<u32>()
+                {
+                    self.pids.push(pid);
+                }
+            }
+            self.pids.sort_unstable();
+            self.pids.dedup();
+            for &pid in self.pids.iter().rev() {
+                terminate_windows_test_process(pid);
+            }
+            if let Some(root) = self.root.as_mut() {
+                let _ = root.kill();
+            }
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[cfg(windows)]
+    fn terminate_windows_test_process(pid: u32) {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
+        };
+
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if !handle.is_null() {
+            unsafe {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn spawn_windows_process_tree_helper(
+        role: &str,
+        directory: &Path,
+        root_pid: u32,
+        gate_name: Option<&std::ffi::OsStr>,
+    ) -> std::process::Child {
+        use std::process::{Command, Stdio};
+
+        let mut command =
+            Command::new(env::current_exe().expect("test executable must be discoverable"));
+        command
+            .args(["--exact", WINDOWS_PROCESS_TREE_HELPER_TEST, "--nocapture"])
+            .env(WINDOWS_PROCESS_TREE_ROLE_ENV, role)
+            .env(WINDOWS_PROCESS_TREE_DIR_ENV, directory)
+            .env(WINDOWS_PROCESS_TREE_ROOT_ENV, root_pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(gate_name) = gate_name {
+            command.env(WINDOWS_PROCESS_TREE_GATE_ENV, gate_name);
+        }
+        command
+            .spawn()
+            .expect("Windows process-tree helper must start")
+    }
+
+    #[cfg(windows)]
+    fn wait_for_windows_process_tree_ready(path: &Path) -> [u32; 3] {
+        let deadline = Instant::now() + WINDOWS_PROCESS_TREE_TIMEOUT;
+        let mut last_contents = String::new();
+        loop {
+            if let Ok(contents) = fs::read_to_string(path) {
+                last_contents = contents;
+                let pids = last_contents
+                    .split_whitespace()
+                    .filter_map(|value| value.parse::<u32>().ok())
+                    .collect::<Vec<_>>();
+                if let [root, child, grandchild] = pids.as_slice()
+                    && *root != 0
+                    && *child != 0
+                    && *grandchild != 0
+                {
+                    return [*root, *child, *grandchild];
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Windows process tree did not become ready within {WINDOWS_PROCESS_TREE_TIMEOUT:?}; last ready contents: {last_contents:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_windows_process_tree_exit(pids: [u32; 3]) {
+        let deadline = Instant::now() + WINDOWS_PROCESS_TREE_TIMEOUT;
+        loop {
+            let states = pids.map(process_alive);
+            if states.iter().all(|state| *state == ScopeAlive::Gone) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Windows process tree did not exit within {WINDOWS_PROCESS_TREE_TIMEOUT:?}: pids={pids:?}, states={states:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_windows_intermediates_exit(pids: [u32; 2]) {
+        let deadline = Instant::now() + WINDOWS_PROCESS_TREE_TIMEOUT;
+        loop {
+            let states = pids.map(process_alive);
+            if states.iter().all(|state| *state == ScopeAlive::Gone) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "wrapper and short-lived child did not exit within {WINDOWS_PROCESS_TREE_TIMEOUT:?}: pids={pids:?}, states={states:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_windows_marker(path: &Path) {
+        let deadline = Instant::now() + WINDOWS_PROCESS_TREE_TIMEOUT;
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "Windows process-tree marker did not appear within {WINDOWS_PROCESS_TREE_TIMEOUT:?}: {path:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     fn temporary_test_directory(label: &str) -> PathBuf {
         env::temp_dir().join(format!(
@@ -2534,6 +3993,7 @@ mod tests {
         let (writer_tx, _writer_rx) = sync_channel(1);
         let terminal = phase_is_terminal(phase);
         Session {
+            scope_id: 42,
             inner: Mutex::new(SessionInner {
                 session: "gbt-test".to_owned(),
                 owner: Some("test-owner".to_owned()),
@@ -2572,24 +4032,157 @@ mod tests {
             host_revision,
             writer_tx: Mutex::new(Some(writer_tx)),
             master: Mutex::new(None),
-            killer: Mutex::new(None),
+            #[cfg(unix)]
+            termination: Mutex::new(TerminationLevel::default()),
+            #[cfg(windows)]
+            scope_job: None,
+            close_lock: Mutex::new(()),
             shutdown: AtomicBool::new(false),
-            terminating: AtomicBool::new(false),
             cleanup_claimed: AtomicBool::new(false),
             cleanup_committed: AtomicBool::new(false),
         }
     }
 
     fn test_host(provider_session_id: &str, phase: SessionPhase) -> SessionHost {
+        test_host_with_session(provider_session_id, phase).0
+    }
+
+    /// Build a host that owns one test session plus the session itself, so
+    /// tests can drive host APIs and manipulate the session (e.g. its close
+    /// lock) from outside the session module.
+    fn test_host_with_session(
+        provider_session_id: &str,
+        phase: SessionPhase,
+    ) -> (SessionHost, Arc<Session>) {
         let revision = Arc::new(HostRevision::new());
         let session = Arc::new(test_session_with_revision(phase, Arc::clone(&revision)));
         let handle = session.state().unwrap().session;
+        let host = SessionHost {
+            registry: Mutex::new(SessionRegistry {
+                accepting: true,
+                sessions: HashMap::from([(handle.clone(), Arc::clone(&session))]),
+                provider_sessions: HashMap::from([(provider_session_id.to_owned(), handle)]),
+                clients: HashMap::new(),
+                closed: HashMap::new(),
+            }),
+            next_id: AtomicU64::new(1),
+            orphan_policy: OrphanPolicy {
+                lease_ms: 120_000,
+                grace_ms: 600_000,
+            },
+            revision,
+        };
+        (host, session)
+    }
+
+    pub(crate) fn with_test_host_holding_close_lock<R>(
+        provider_session_id: &str,
+        phase: SessionPhase,
+        run: impl FnOnce(SessionHost) -> R,
+    ) -> R {
+        let (host, session) = test_host_with_session(provider_session_id, phase);
+        let _held = session.test_hold_close_lock();
+        run(host)
+    }
+
+    pub(crate) fn test_host_with_poisoned_close_lock(
+        provider_session_id: &str,
+        phase: SessionPhase,
+    ) -> SessionHost {
+        let (host, session) = test_host_with_session(provider_session_id, phase);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.test_poison_close_lock();
+        }));
+        assert!(poisoned.is_err());
+        host
+    }
+
+    #[cfg(windows)]
+    fn windows_process_host(root_pid: u32, job: WindowsJob) -> SessionHost {
+        let revision = Arc::new(HostRevision::new());
+        let mut session = test_session_with_revision(SessionPhase::Running, Arc::clone(&revision));
+        session.scope_id = root_pid;
+        session.scope_job = Some(job);
+        session.inner.get_mut().unwrap().process_id = Some(root_pid);
+        let session = Arc::new(session);
         SessionHost {
             registry: Mutex::new(SessionRegistry {
                 accepting: true,
-                sessions: HashMap::from([(handle.clone(), session)]),
-                provider_sessions: HashMap::from([(provider_session_id.to_owned(), handle)]),
+                sessions: HashMap::from([("gbt-test".to_owned(), Arc::clone(&session))]),
+                provider_sessions: HashMap::from([(
+                    TEST_PROVIDER_SESSION_ID.to_owned(),
+                    "gbt-test".to_owned(),
+                )]),
                 clients: HashMap::new(),
+                closed: HashMap::new(),
+            }),
+            next_id: AtomicU64::new(1),
+            orphan_policy: OrphanPolicy {
+                lease_ms: 120_000,
+                grace_ms: 600_000,
+            },
+            revision,
+        }
+    }
+
+    /// Build a host that owns one Running test session whose immutable
+    /// `scope_id` addresses a real Unix process group. Mirrors
+    /// `windows_process_host`: the scope id is set before the session is
+    /// wrapped in an Arc and inserted into the registry.
+    #[cfg(unix)]
+    fn unix_process_host(pgid: u32) -> SessionHost {
+        let revision = Arc::new(HostRevision::new());
+        let mut session = test_session_with_revision(SessionPhase::Running, Arc::clone(&revision));
+        session.scope_id = pgid;
+        session.inner.get_mut().unwrap().process_id = Some(pgid);
+        let session = Arc::new(session);
+        SessionHost {
+            registry: Mutex::new(SessionRegistry {
+                accepting: true,
+                sessions: HashMap::from([("gbt-test".to_owned(), Arc::clone(&session))]),
+                provider_sessions: HashMap::from([(
+                    TEST_PROVIDER_SESSION_ID.to_owned(),
+                    "gbt-test".to_owned(),
+                )]),
+                clients: HashMap::new(),
+                closed: HashMap::new(),
+            }),
+            next_id: AtomicU64::new(1),
+            orphan_policy: OrphanPolicy {
+                lease_ms: 120_000,
+                grace_ms: 600_000,
+            },
+            revision,
+        }
+    }
+
+    /// Like `unix_process_host` but registers one Running session per process
+    /// group, with handles `gbt-1`, `gbt-2`, ... in pgid order.
+    #[cfg(unix)]
+    fn unix_process_hosts(pgids: &[u32]) -> SessionHost {
+        let revision = Arc::new(HostRevision::new());
+        let mut sessions = HashMap::new();
+        for (index, &pgid) in pgids.iter().enumerate() {
+            let handle = format!("gbt-{}", index + 1);
+            let mut session =
+                test_session_with_revision(SessionPhase::Running, Arc::clone(&revision));
+            session.inner.get_mut().unwrap().session = handle.clone();
+            session.scope_id = pgid;
+            session.inner.get_mut().unwrap().process_id = Some(pgid);
+            sessions.insert(handle, Arc::new(session));
+        }
+        let provider_sessions = sessions
+            .keys()
+            .cloned()
+            .map(|handle| (handle.clone(), handle))
+            .collect();
+        SessionHost {
+            registry: Mutex::new(SessionRegistry {
+                accepting: true,
+                sessions,
+                provider_sessions,
+                clients: HashMap::new(),
+                closed: HashMap::new(),
             }),
             next_id: AtomicU64::new(1),
             orphan_policy: OrphanPolicy {
@@ -2747,6 +4340,62 @@ mod tests {
         assert!(!argv.iter().any(|value| value == "--output-format"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn builds_gated_windows_launcher_before_the_grok_command() {
+        let config = LaunchConfig {
+            grok_bin: OsString::from(r"C:\Program Files\Grok\grok.exe"),
+            cwd: PathBuf::from(r"C:\repo"),
+            prompt: Some("fix it".to_owned()),
+            model: Some("grok-4".to_owned()),
+            owner: None,
+            always_approve: false,
+            client_session_id: None,
+            client_lease: None,
+            orphan_policy: OrphanPolicy {
+                lease_ms: 120_000,
+                grace_ms: 600_000,
+            },
+        };
+        let grok_home = PathBuf::from(r"C:\repo\.grok-state");
+        let (command, gate, job) = build_windows_grok_launcher_command(
+            &config,
+            TEST_PROVIDER_SESSION_ID,
+            Some(&grok_home),
+        )
+        .unwrap();
+        let argv = command.get_argv();
+        assert_eq!(PathBuf::from(&argv[0]), env::current_exe().unwrap());
+        assert_eq!(argv[1], OsString::from("__windows-job-child"));
+        assert_eq!(argv[2], gate.event_name);
+        assert_eq!(argv[3], gate.pid_report_name);
+        assert_eq!(argv[4], OsString::from(r"C:\Program Files\Grok\grok.exe"));
+        assert_eq!(argv[5], OsString::from("--session-id"));
+        assert_eq!(argv[6], OsString::from(TEST_PROVIDER_SESSION_ID));
+        assert_eq!(
+            command.get_cwd().map(OsString::as_os_str),
+            Some(config.cwd.as_os_str())
+        );
+        assert_eq!(command.get_env("GROK_HOME"), Some(grok_home.as_os_str()));
+        assert_eq!(job.process_scope_alive(), ScopeAlive::Gone);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_gate_reports_the_real_grok_pid_without_a_file_or_shell() {
+        let gate = WindowsLaunchGate::create().unwrap();
+        report_windows_grok_pid(&gate.pid_report_name, 1234).unwrap();
+        assert_eq!(gate.wait_for_grok_pid(100).unwrap(), 1234);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unassigned_windows_launcher_gate_has_a_bounded_wait() {
+        let gate = WindowsLaunchGate::create().unwrap();
+        let error = wait_for_windows_launch_gate(&gate.event_name, 1).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+    }
+
     #[test]
     fn publishes_terminal_phase_only_after_process_and_reader_finish() {
         assert_eq!(
@@ -2760,6 +4409,17 @@ mod tests {
         assert_eq!(
             completed_phase(SessionPhase::Running, true, true, true, false, Some(1)),
             Some(SessionPhase::Stopped)
+        );
+        // An explicit close finalizes as soon as the process scope is verified
+        // gone; a missing reader EOF must not keep the record half-open.
+        assert_eq!(
+            completed_phase(SessionPhase::Running, true, false, true, false, None),
+            Some(SessionPhase::Stopped)
+        );
+        // Without an explicit close, reader EOF is still required.
+        assert_eq!(
+            completed_phase(SessionPhase::Running, true, false, false, true, None),
+            None
         );
     }
 
@@ -3155,6 +4815,70 @@ mod tests {
         let registry = host.registry.lock().unwrap();
         assert!(registry.sessions.is_empty());
         assert!(registry.provider_sessions.is_empty());
+    }
+
+    #[test]
+    fn close_client_removes_the_lease_and_publishes_a_revision() {
+        let host = test_host(TEST_PROVIDER_SESSION_ID, SessionPhase::Exited);
+        let lease = Arc::new(AtomicU64::new(1_000));
+        {
+            let session = host.get("gbt-test").unwrap();
+            let mut inner = session.inner.lock().unwrap();
+            inner.client_session_id = Some("codex-close".to_owned());
+            inner.client_lease = Some(Arc::clone(&lease));
+        }
+        host.registry
+            .lock()
+            .unwrap()
+            .clients
+            .insert("codex-close".to_owned(), lease);
+        let seen = host.revision();
+        let result = host.close_client("codex-close").unwrap();
+        assert_eq!(result.closed, 1);
+        assert!(
+            host.registry.lock().unwrap().clients.is_empty(),
+            "the client lease must be removed after a fully successful close"
+        );
+        // A WebUI waiter must observe a revision published after the lease
+        // removal, not only the one apply_close_outcomes emitted before it.
+        let advanced = host.wait_revision(seen, Duration::from_millis(50));
+        assert_ne!(advanced, seen);
+        assert_ne!(host.revision(), seen);
+    }
+
+    #[test]
+    fn close_client_keeps_the_lease_when_the_close_fails() {
+        let host = test_host(TEST_PROVIDER_SESSION_ID, SessionPhase::Running);
+        let lease = Arc::new(AtomicU64::new(1_000));
+        {
+            let session = host.get("gbt-test").unwrap();
+            let mut inner = session.inner.lock().unwrap();
+            inner.client_session_id = Some("codex-fail".to_owned());
+            inner.client_lease = Some(Arc::clone(&lease));
+        }
+        host.registry
+            .lock()
+            .unwrap()
+            .clients
+            .insert("codex-fail".to_owned(), lease);
+        // Poison the close lock so the group close fails fast and
+        // deterministically instead of terminating a real process scope.
+        let session = host.get("gbt-test").unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.test_poison_close_lock();
+        }));
+        assert!(poisoned.is_err());
+        let result = host.close_client("codex-fail").unwrap();
+        assert_eq!(result.closed, 0);
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            host.registry
+                .lock()
+                .unwrap()
+                .clients
+                .contains_key("codex-fail"),
+            "a failed close must retain the client lease for a later retry"
+        );
     }
 
     #[test]
@@ -3769,5 +5493,680 @@ mod tests {
             .0;
         assert_eq!(due_state, ClientLeaseState::Orphaned);
         assert_eq!(session.next_lifecycle_deadline_ms(due_now).unwrap(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_tree_helper() {
+        let Some(role) = env::var_os(WINDOWS_PROCESS_TREE_ROLE_ENV) else {
+            return;
+        };
+        let directory = PathBuf::from(
+            env::var_os(WINDOWS_PROCESS_TREE_DIR_ENV)
+                .expect("process-tree helper directory must be provided"),
+        );
+        let role = role.to_string_lossy();
+        match role.as_ref() {
+            "wrapper" => {
+                let gate_name = env::var_os(WINDOWS_PROCESS_TREE_GATE_ENV)
+                    .expect("wrapper launch gate must be provided");
+                wait_for_windows_launch_gate(&gate_name, WINDOWS_LAUNCH_HANDSHAKE_TIMEOUT_MS)
+                    .expect("wrapper launch gate must open");
+                let mut child = spawn_windows_process_tree_helper(
+                    "short-child",
+                    &directory,
+                    std::process::id(),
+                    None,
+                );
+                child.wait().expect("short-lived child must exit");
+                fs::write(directory.join("wrapper-exited"), b"ready")
+                    .expect("wrapper exit marker must be written");
+            }
+            "short-child" => {
+                let root_pid = env::var(WINDOWS_PROCESS_TREE_ROOT_ENV)
+                    .expect("root pid must be provided")
+                    .parse::<u32>()
+                    .expect("root pid must be numeric");
+                let grandchild =
+                    spawn_windows_process_tree_helper("grandchild", &directory, root_pid, None);
+                fs::write(directory.join("child.pid"), std::process::id().to_string())
+                    .expect("child pid marker must be written");
+                fs::write(
+                    directory.join("grandchild.pid"),
+                    grandchild.id().to_string(),
+                )
+                .expect("grandchild pid marker must be written");
+                fs::write(
+                    directory.join("ready"),
+                    format!("{root_pid} {} {}\n", std::process::id(), grandchild.id()),
+                )
+                .expect("ready marker must be written");
+                drop(grandchild);
+            }
+            "grandchild" => thread::sleep(WINDOWS_PROCESS_TREE_TIMEOUT),
+            unexpected => panic!("unexpected Windows process-tree helper role: {unexpected}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_close_contains_descendant_after_intermediates_exit() {
+        use std::os::windows::io::AsRawHandle;
+
+        let directory = temporary_test_directory("windows-job-tree");
+        fs::create_dir_all(&directory).unwrap();
+        let gate = WindowsLaunchGate::create().unwrap();
+        let job = WindowsJob::create().unwrap();
+        let root = spawn_windows_process_tree_helper(
+            "wrapper",
+            &directory,
+            0,
+            Some(gate.event_name.as_os_str()),
+        );
+        let root_pid = root.id();
+        job.assign_process(root.as_raw_handle()).unwrap();
+        gate.signal().unwrap();
+        let mut cleanup = WindowsProcessTreeCleanup::new(root, directory.clone());
+
+        let pids = wait_for_windows_process_tree_ready(&directory.join("ready"));
+        cleanup.remember(&pids);
+        assert_eq!(pids[0], root_pid, "ready marker reported another root");
+        assert_ne!(pids[0], pids[1]);
+        assert_ne!(pids[1], pids[2]);
+        wait_for_windows_marker(&directory.join("wrapper-exited"));
+        // The marker only proves the wrapper wrote it; the wrapper and
+        // short-lived child processes may still be tearing down. Wait for
+        // both to actually exit before asserting Gone, while the grandchild
+        // and the job must remain alive.
+        wait_for_windows_intermediates_exit([pids[0], pids[1]]);
+        assert_eq!(process_alive(pids[2]), ScopeAlive::Alive);
+        assert_eq!(job.process_scope_alive(), ScopeAlive::Alive);
+
+        let host = windows_process_host(root_pid, job);
+        assert!(host.close("gbt-test").unwrap());
+        wait_for_windows_process_tree_exit(pids);
+        assert!(host.show("gbt-test").is_err());
+        assert!(
+            host.close("gbt-test").unwrap(),
+            "tombstone re-close must succeed"
+        );
+        cleanup.disarm();
+    }
+
+    /// Spawn the wrapper/short-child/grandchild process tree, assign the
+    /// wrapper to a fresh Job Object, and wait until the wrapper and its
+    /// short-lived child have exited so only the long-lived grandchild remains
+    /// in the job. Returns the job, the three pids, and the armed cleanup
+    /// guard.
+    #[cfg(windows)]
+    fn spawn_windows_tree_in_job(label: &str) -> (WindowsJob, [u32; 3], WindowsProcessTreeCleanup) {
+        use std::os::windows::io::AsRawHandle;
+
+        let directory = temporary_test_directory(label);
+        fs::create_dir_all(&directory).unwrap();
+        let gate = WindowsLaunchGate::create().unwrap();
+        let job = WindowsJob::create().unwrap();
+        let root = spawn_windows_process_tree_helper(
+            "wrapper",
+            &directory,
+            0,
+            Some(gate.event_name.as_os_str()),
+        );
+        job.assign_process(root.as_raw_handle()).unwrap();
+        gate.signal().unwrap();
+        let mut cleanup = WindowsProcessTreeCleanup::new(root, directory.clone());
+        let pids = wait_for_windows_process_tree_ready(&directory.join("ready"));
+        cleanup.remember(&pids);
+        wait_for_windows_marker(&directory.join("wrapper-exited"));
+        wait_for_windows_intermediates_exit([pids[0], pids[1]]);
+        (job, pids, cleanup)
+    }
+
+    /// The Windows escalation ladder must match its documented semantics: Hup
+    /// and Term are wait-only phases that never TerminateJobObject, and only
+    /// Kill force-terminates the whole job scope.
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_terminate_waits_on_hup_and_term_until_kill() {
+        let (job, pids, mut cleanup) = spawn_windows_tree_in_job("windows-job-phases");
+        assert_eq!(job.process_scope_alive(), ScopeAlive::Alive);
+
+        job.terminate(TerminationLevel::Hup).unwrap();
+        assert_eq!(
+            job.process_scope_alive(),
+            ScopeAlive::Alive,
+            "Hup is a wait-only phase and must not terminate the job"
+        );
+        job.terminate(TerminationLevel::Term).unwrap();
+        assert_eq!(
+            job.process_scope_alive(),
+            ScopeAlive::Alive,
+            "Term is a wait-only phase and must not terminate the job"
+        );
+
+        job.terminate(TerminationLevel::Kill).unwrap();
+        wait_for_windows_process_tree_exit(pids);
+        assert_eq!(job.process_scope_alive(), ScopeAlive::Gone);
+        cleanup.disarm();
+    }
+
+    /// The bare-process fallback (`terminate_windows_process`) must mirror the
+    /// job semantics: Hup and Term wait, Kill force-terminates.
+    #[cfg(windows)]
+    #[test]
+    fn windows_bare_process_terminate_waits_on_hup_and_term_until_kill() {
+        let directory = temporary_test_directory("windows-bare-process-phases");
+        fs::create_dir_all(&directory).unwrap();
+        let child = spawn_windows_process_tree_helper("grandchild", &directory, 0, None);
+        let pid = child.id();
+        let mut cleanup = WindowsProcessTreeCleanup::new(child, directory.clone());
+
+        terminate_windows_process(pid, TerminationLevel::Hup).unwrap();
+        assert_eq!(
+            process_alive(pid),
+            ScopeAlive::Alive,
+            "Hup is a wait-only phase and must not terminate the process"
+        );
+        terminate_windows_process(pid, TerminationLevel::Term).unwrap();
+        assert_eq!(
+            process_alive(pid),
+            ScopeAlive::Alive,
+            "Term is a wait-only phase and must not terminate the process"
+        );
+
+        terminate_windows_process(pid, TerminationLevel::Kill).unwrap();
+        let deadline = Instant::now() + WINDOWS_PROCESS_TREE_TIMEOUT;
+        while process_alive(pid) != ScopeAlive::Gone {
+            assert!(
+                Instant::now() < deadline,
+                "bare Windows process {pid} survived TerminateProcess"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        cleanup.disarm();
+    }
+
+    /// `shutdown_all` must force-terminate the Job Object scope even when the
+    /// bounded group close times out waiting for the close lock, so server
+    /// exit never leaves a Windows Grok descendant behind.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shutdown_all_force_kills_the_job_scope_after_a_close_timeout() {
+        let (job, pids, mut cleanup) = spawn_windows_tree_in_job("windows-shutdown-all-timeout");
+        let host = windows_process_host(pids[0], job);
+        let session = host.get("gbt-test").unwrap();
+        // Hold the close lock so close_attempt spins until the shared deadline
+        // and reports Timeout; shutdown_all's final forced pass must still
+        // terminate the job scope.
+        let _held = session.test_hold_close_lock();
+
+        host.shutdown_all().unwrap();
+        wait_for_windows_process_tree_exit(pids);
+        cleanup.disarm();
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn all_zombie_scope_requires_stable_membership() {
+        assert_eq!(
+            stable_process_group_scan_result(
+                (ScopeAlive::Gone, vec![41]),
+                (ScopeAlive::Gone, vec![41]),
+            ),
+            ScopeAlive::Gone
+        );
+        assert_eq!(
+            stable_process_group_scan_result(
+                (ScopeAlive::Gone, vec![41]),
+                (ScopeAlive::Gone, vec![41, 42]),
+            ),
+            ScopeAlive::Unknown
+        );
+        assert_eq!(
+            stable_process_group_scan_result(
+                (ScopeAlive::Gone, vec![41]),
+                (ScopeAlive::Alive, vec![41, 42]),
+            ),
+            ScopeAlive::Alive
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_scope_probe_tracks_descendant_until_group_kill() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let directory = temporary_test_directory("unix-process-group");
+        fs::create_dir_all(&directory).unwrap();
+        let descendant_pid_path = directory.join("descendant-pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "(trap '' HUP TERM; sleep 30) & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+                "grok-bridge-unix-process-group-test",
+            ])
+            .arg(&descendant_pid_path);
+        // portable-pty uses setsid for the child. Mirror that ownership model
+        // so the root pid is also the process-group id used by the probe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut root = command.spawn().unwrap();
+        let pgid = root.id();
+        root.wait().unwrap();
+        let descendant_pid = fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+
+        assert_eq!(process_scope_alive(pgid, true), ScopeAlive::Alive);
+        let deadline = default_close_deadline();
+        let mut scope_gone = false;
+        while Instant::now() < deadline {
+            if process_scope_alive(pgid, true) == ScopeAlive::Gone {
+                scope_gone = true;
+                break;
+            }
+            send_termination_signal(pgid, TerminationLevel::Kill).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            scope_gone,
+            "process group {pgid} remained live after repeated SIGKILL"
+        );
+        assert_eq!(
+            unix_test_process_alive(descendant_pid),
+            ScopeAlive::Gone,
+            "tracked descendant {descendant_pid} remained executable"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Spawn a setsid'd shell that exits immediately while a descendant keeps
+    /// running in the same process group, ignoring HUP and TERM. Returns the
+    /// group id (the leader pid) and the descendant pid.
+    #[cfg(unix)]
+    fn spawn_unix_process_group_with_descendant(
+        directory: &Path,
+    ) -> (std::process::Child, u32, u32) {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let descendant_pid_path = directory.join("descendant-pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "(trap '' HUP TERM; sleep 30) & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+                "grok-bridge-shutdown-all-test",
+            ])
+            .arg(&descendant_pid_path);
+        // portable-pty uses setsid for the child. Mirror that ownership model
+        // so the root pid is also the process-group id used by the probe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut root = command.spawn().unwrap();
+        let pgid = root.id();
+        root.wait().unwrap();
+        let descendant_pid = fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        (root, pgid, descendant_pid)
+    }
+
+    /// `shutdown_all` must force-kill and reap a surviving process group even
+    /// when the bounded group close fails (poisoned close lock): server exit
+    /// must never orphan a Unix Grok process or its descendants.
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_all_force_kills_the_process_group_after_a_close_failure() {
+        let directory = temporary_test_directory("shutdown-all-failed");
+        fs::create_dir_all(&directory).unwrap();
+        let (mut root, pgid, descendant_pid) = spawn_unix_process_group_with_descendant(&directory);
+
+        let host = unix_process_host(pgid);
+        let session = host.get("gbt-test").unwrap();
+        // Poison the close lock so close_attempt fails fast and deterministically;
+        // shutdown_all must still terminate and reap the whole owned scope.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.test_poison_close_lock();
+        }));
+        assert!(poisoned.is_err());
+
+        host.shutdown_all().unwrap();
+        assert_eq!(
+            process_scope_alive(pgid, true),
+            ScopeAlive::Gone,
+            "shutdown_all must reap the whole process group after a failed close"
+        );
+        assert_eq!(
+            unix_test_process_alive(descendant_pid),
+            ScopeAlive::Gone,
+            "shutdown_all must reap the descendant after a failed close"
+        );
+        let _ = root.kill();
+        let _ = root.wait();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// `shutdown_all` must force-kill and reap a surviving process group even
+    /// when the bounded group close times out waiting for the close lock.
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_all_force_kills_the_process_group_after_a_close_timeout() {
+        let directory = temporary_test_directory("shutdown-all-timeout");
+        fs::create_dir_all(&directory).unwrap();
+        let (mut root, pgid, descendant_pid) = spawn_unix_process_group_with_descendant(&directory);
+
+        let host = unix_process_host(pgid);
+        let session = host.get("gbt-test").unwrap();
+        // Hold the close lock so close_attempt spins until the shared deadline
+        // and reports Timeout; the session keeps ownership and shutdown_all's
+        // final forced pass must still terminate and reap the whole group.
+        let _held = session.test_hold_close_lock();
+
+        host.shutdown_all().unwrap();
+        assert_eq!(
+            process_scope_alive(pgid, true),
+            ScopeAlive::Gone,
+            "shutdown_all must reap the whole process group after a close timeout"
+        );
+        assert_eq!(
+            unix_test_process_alive(descendant_pid),
+            ScopeAlive::Gone,
+            "shutdown_all must reap the descendant after a close timeout"
+        );
+        let _ = root.kill();
+        let _ = root.wait();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every surviving session must get its own forced-termination window:
+    /// with two independent process groups whose closes all fail, `shutdown_all`
+    /// must Kill and reap both instead of sharing one deadline that a slow first
+    /// scope could exhaust.
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_all_force_kills_every_group_when_all_closes_fail() {
+        let directory = temporary_test_directory("shutdown-all-multi");
+        fs::create_dir_all(&directory).unwrap();
+        let first_dir = directory.join("first");
+        let second_dir = directory.join("second");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        let (mut root_a, pgid_a, descendant_a) =
+            spawn_unix_process_group_with_descendant(&first_dir);
+        let (mut root_b, pgid_b, descendant_b) =
+            spawn_unix_process_group_with_descendant(&second_dir);
+        assert_ne!(pgid_a, pgid_b);
+        let host = unix_process_hosts(&[pgid_a, pgid_b]);
+        // Fail both close paths fast and deterministically; shutdown_all must
+        // still force-kill and reap both owned scopes.
+        for handle in ["gbt-1", "gbt-2"] {
+            let session = host.get(handle).unwrap();
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.test_poison_close_lock();
+            }));
+            assert!(poisoned.is_err(), "{handle} close lock must be poisoned");
+        }
+
+        host.shutdown_all().unwrap();
+        assert_eq!(process_scope_alive(pgid_a, true), ScopeAlive::Gone);
+        assert_eq!(process_scope_alive(pgid_b, true), ScopeAlive::Gone);
+        assert_eq!(unix_test_process_alive(descendant_a), ScopeAlive::Gone);
+        assert_eq!(unix_test_process_alive(descendant_b), ScopeAlive::Gone);
+        let _ = root_a.kill();
+        let _ = root_a.wait();
+        let _ = root_b.kill();
+        let _ = root_b.wait();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// True once `pid` has exited but is still an unreaped zombie held by this
+    /// test process. Linux reads the state field from /proc; macOS reports no
+    /// process info for an exited-but-unreaped child (proc_pidinfo returns 0).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn test_unreaped_zombie(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, fields)| fields.split_whitespace().next() == Some("Z")),
+                Err(_) => false,
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid as libc::pid_t,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    std::ptr::from_mut(&mut info).cast(),
+                    std::mem::size_of_val(&info) as libc::c_int,
+                )
+            };
+            read == 0
+        }
+    }
+
+    /// A full terminal-response queue is transient backpressure: the error is
+    /// recorded, but the owned process scope must never be escalated.
+    #[test]
+    #[cfg(unix)]
+    fn full_terminal_response_queue_does_not_terminate_the_process_scope() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let mut root = Command::new("/bin/sh");
+        root.args(["-c", "exec sleep 60", "grok-bridge-queue-backpressure-test"]);
+        unsafe {
+            root.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut root = root.spawn().unwrap();
+        let pgid = root.id();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process_scope_alive(pgid, true) != ScopeAlive::Alive {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(process_scope_alive(pgid, true), ScopeAlive::Alive);
+
+        // A zero-capacity writer queue makes the next enqueue report Full.
+        let mut session = test_session(SessionPhase::Running);
+        session.scope_id = pgid;
+        let (writer_tx, _writer_rx) = sync_channel(0);
+        *session.writer_tx.lock().unwrap() = Some(writer_tx);
+
+        session.queue_terminal_response(vec![0x1b; 64]);
+        assert!(
+            session
+                .inner
+                .lock()
+                .unwrap()
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("queue is full")),
+            "queue backpressure must be recorded for observers"
+        );
+        assert_eq!(session.state().unwrap().phase, SessionPhase::Running);
+        assert_eq!(
+            process_scope_alive(pgid, true),
+            ScopeAlive::Alive,
+            "queue backpressure must not escalate the owned process scope"
+        );
+
+        // Cleanup: the scope is killed only by an explicit termination signal,
+        // then reaped so the probe can observe the group empty.
+        send_termination_signal(pgid, TerminationLevel::Kill).unwrap();
+        let _ = root.wait();
+        let deadline = default_close_deadline();
+        let mut scope_gone = false;
+        while Instant::now() < deadline {
+            if process_scope_alive(pgid, true) == ScopeAlive::Gone {
+                scope_gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(scope_gone, "process group {pgid} survived cleanup SIGKILL");
+    }
+
+    /// The Linux fast kill(0) probe must answer Alive without the /proc scan,
+    /// while the stable probe still distinguishes an all-zombie group; macOS
+    /// keeps its existing always-scan behavior (an unreaped zombie answers
+    /// kill(0) with EPERM, mapped to Alive as before).
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fast_scope_probe_skips_the_scan_outside_the_stable_confirmation_window() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let mut child = Command::new("/bin/sh");
+        child.args(["-c", "exec sleep 60", "grok-bridge-fast-probe-test"]);
+        unsafe {
+            child.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = child.spawn().unwrap();
+        let pgid = child.id();
+
+        // Live group: both probe modes agree the scope is alive.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process_scope_alive(pgid, true) != ScopeAlive::Alive {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(process_scope_alive(pgid, true), ScopeAlive::Alive);
+        assert_eq!(process_scope_alive(pgid, false), ScopeAlive::Alive);
+
+        // SIGKILL leaves the child as an unreaped zombie held by this test.
+        send_termination_signal(pgid, TerminationLevel::Kill).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !test_unreaped_zombie(pgid) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            test_unreaped_zombie(pgid),
+            "process {pgid} never became a zombie"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            // The fast probe answers from kill(0) alone: Alive when the
+            // zombie group still answers the existence probe, Gone when it
+            // no longer does — never a /proc walk.
+            let fast = process_scope_alive(pgid, false);
+            let kill0_succeeds = unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == 0;
+            assert_eq!(
+                fast == ScopeAlive::Alive,
+                kill0_succeeds,
+                "fast probe must mirror the kill(0) result"
+            );
+            // The stable probe certifies the all-zombie group as gone.
+            assert_eq!(process_scope_alive(pgid, true), ScopeAlive::Gone);
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            process_scope_alive(pgid, true),
+            ScopeAlive::Alive,
+            "macOS keeps mapping an unreaped zombie to Alive"
+        );
+
+        // Reaping the zombie empties the group: both probes now report Gone.
+        child.wait().unwrap();
+        assert_eq!(process_scope_alive(pgid, true), ScopeAlive::Gone);
+        assert_eq!(process_scope_alive(pgid, false), ScopeAlive::Gone);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn unix_test_process_alive(pid: u32) -> ScopeAlive {
+        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::pid_t,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of_val(&info) as libc::c_int,
+            )
+        };
+        if read == std::mem::size_of_val(&info) as libc::c_int {
+            if info.pbi_status == libc::SZOMB {
+                ScopeAlive::Gone
+            } else {
+                ScopeAlive::Alive
+            }
+        } else if unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            ScopeAlive::Gone
+        } else {
+            ScopeAlive::Unknown
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unix_test_process_alive(pid: u32) -> ScopeAlive {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => match stat
+                .rsplit_once(") ")
+                .and_then(|(_, fields)| fields.split_whitespace().next())
+            {
+                Some("Z" | "X") => ScopeAlive::Gone,
+                Some(_) => ScopeAlive::Alive,
+                None => ScopeAlive::Unknown,
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => ScopeAlive::Gone,
+            Err(_) => ScopeAlive::Unknown,
+        }
+    }
+
+    #[test]
+    fn tombstone_eviction_keeps_recent_handles() {
+        let mut registry = SessionRegistry {
+            accepting: true,
+            sessions: HashMap::new(),
+            provider_sessions: HashMap::new(),
+            clients: HashMap::new(),
+            closed: HashMap::new(),
+        };
+        let now = now_millis();
+        for index in 0..CLOSED_TOMBSTONE_CAP {
+            registry.closed.insert(
+                format!("old-{index}"),
+                now.saturating_sub(CLOSED_TOMBSTONE_TTL_MS + 1),
+            );
+        }
+        registry.closed.insert("recent".to_owned(), now);
+        registry.remember_closed("newest");
+        assert!(registry.was_closed("recent"));
+        assert!(registry.was_closed("newest"));
+        assert!(!registry.was_closed("old-0"));
     }
 }
