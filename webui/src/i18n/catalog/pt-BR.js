@@ -175,6 +175,14 @@ export default {
   "interactive.error": "Falha na entrada do terminal: {detail}",
   "interactive.unavailable": "Entrada do terminal indisponível",
   "interactive.unavailableShort": "entrada offline",
+  "interactive.tooLarge":
+    "A entrada excede o limite de 64 KiB; toda a entrada foi rejeitada e nada foi enviado.",
+  "interactive.queueFull":
+    "A fila de comandos está cheia; toda a entrada foi rejeitada.",
+  "interactive.indeterminate":
+    "Não foi possível confirmar a entrega da entrada; ela não foi reenviada automaticamente.",
+  "interactive.dismiss": "Dispensar",
+  "interactive.dismissAria": "Dispensar aviso de entrada não confirmada",
 
   "action.confirmCloseSession":
     "Fechar {id} e seu processo Grok?",

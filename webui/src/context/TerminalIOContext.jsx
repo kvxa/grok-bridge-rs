@@ -8,6 +8,7 @@ export const TerminalIOContext = createContext({
   interactive: false,
   setInteractive: () => {},
   connectionState: "initial",
+  subscribeResizeAck: () => () => {},
   sendTerminalInput: () => ({ ok: false, error: "send_failed" }),
   sendTerminalResize: () => ({ ok: false, error: "send_failed" }),
 });

@@ -5,7 +5,14 @@ import {
 } from "../api.js";
 import { useI18n } from "../i18n/index.js";
 import { sessionsSignature } from "../sessions.js";
-import { WS_BACKOFF_MS } from "../utils/constants.js";
+import { decodeBase64ToUint8Array } from "../utils/base64.js";
+import {
+  MAX_INPUT_BASE64_LENGTH,
+  MAX_INPUT_RAW_BYTES,
+  PENDING_COMMANDS_MAX,
+  PENDING_COMMANDS_MAX_BYTES,
+  WS_BACKOFF_MS,
+} from "../utils/constants.js";
 import { errorMessage } from "../utils/errors.js";
 import {
   pushTerminalEntries,
@@ -19,20 +26,23 @@ export const CLIENT_IO_ERROR = Object.freeze({
   DISCONNECTED: "disconnected",
   INVALID_PAYLOAD: "invalid_payload",
   SEND_FAILED: "send_failed",
+  TOO_LARGE: "too_large",
+  QUEUE_FULL: "queue_full",
 });
 
 const CLIENT_IO_ERROR_KEYS = Object.freeze({
   [CLIENT_IO_ERROR.DISCONNECTED]: "interactive.disconnected",
   [CLIENT_IO_ERROR.INVALID_PAYLOAD]: "interactive.invalidPayload",
   [CLIENT_IO_ERROR.SEND_FAILED]: "interactive.sendFailed",
+  [CLIENT_IO_ERROR.TOO_LARGE]: "interactive.tooLarge",
+  [CLIENT_IO_ERROR.QUEUE_FULL]: "interactive.queueFull",
 });
 
-let requestSeq = 0;
-
-function nextRequestId() {
-  requestSeq += 1;
-  return `webui-${requestSeq}`;
-}
+/**
+ * In-flight command bookkeeping. `bytes` is the base64 payload length, so the
+ * pending window is bounded by both entry count and bytes.
+ * @typedef {{ kind: "input" | "resize", session: string, bytes: number }} PendingEntry
+ */
 
 export function useSessionStream({ setNotice } = {}) {
   const { t } = useI18n();
@@ -45,12 +55,26 @@ export function useSessionStream({ setNotice } = {}) {
     /** @type {ConnectionState} */ ("initial"),
   );
   const [lastUpdated, setLastUpdated] = useState(null);
+  /** Inputs whose single result was lost (disconnect): delivery is unknown and
+   *  they are never replayed. Exposed so the UI can show a global alert. */
+  const [unconfirmedInputs, setUnconfirmedInputs] = useState(0);
+  const unconfirmedInputsRef = useRef(0);
   const signatureRef = useRef(null);
   const loadingRef = useRef(false);
   const mountedRef = useRef(true);
   const reconnectRef = useRef(() => {});
+  /** Request ids are unique within the current connection; reset on connect. */
+  const requestSeqRef = useRef(0);
+  /** @type {import('react').MutableRefObject<Map<string, PendingEntry>>} */
+  const pendingRef = useRef(new Map());
+  const pendingBytesRef = useRef(0);
   /** @type {import('react').MutableRefObject<WebSocket | null>} */
   const socketRef = useRef(null);
+
+  function nextRequestId() {
+    requestSeqRef.current += 1;
+    return `webui-${requestSeqRef.current}`;
+  }
 
   const clearStreamError = useCallback(() => {
     if (!setNotice) return;
@@ -111,7 +135,11 @@ export function useSessionStream({ setNotice } = {}) {
 
   /**
    * Send a JSON command on the live events socket.
-   * Never buffers: if the socket is not OPEN, fails immediately.
+   * Never buffers: if the socket is not OPEN, fails immediately. Every
+   * terminal_input / terminal_resize gets a fresh connection-unique request id
+   * and is tracked as pending until its single result arrives. Admission is
+   * bounded by both entry count and bytes; when the window is full the whole
+   * command is rejected (never partially queued).
    * @returns {{ ok: true, id: string } | { ok: false, error: string }}
    *   `error` is a stable CLIENT_IO_ERROR code, never a free-form English string.
    */
@@ -120,13 +148,86 @@ export function useSessionStream({ setNotice } = {}) {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return { ok: false, error: CLIENT_IO_ERROR.DISCONNECTED };
     }
-    const id = message.id || nextRequestId();
+    const id = nextRequestId();
     const payload = { ...message, id };
+    const kind = payload.type === "terminal_input" ? "input" : "resize";
+    const bytes =
+      typeof payload.data_base64 === "string" ? payload.data_base64.length : 0;
+    if (
+      pendingRef.current.size >= PENDING_COMMANDS_MAX ||
+      pendingBytesRef.current + bytes > PENDING_COMMANDS_MAX_BYTES
+    ) {
+      return { ok: false, error: CLIENT_IO_ERROR.QUEUE_FULL };
+    }
+    // Admit before send so a synchronous result (or a close race) can settle
+    // the command without observing a missing pending entry.
+    pendingRef.current.set(id, { kind, session: payload.session, bytes });
+    pendingBytesRef.current += bytes;
     try {
       ws.send(JSON.stringify(payload));
-      return { ok: true, id };
     } catch {
+      pendingRef.current.delete(id);
+      pendingBytesRef.current = Math.max(0, pendingBytesRef.current - bytes);
       return { ok: false, error: CLIENT_IO_ERROR.SEND_FAILED };
+    }
+    return { ok: true, id };
+  }, []);
+
+  const settlePending = useCallback((id, resultType, session) => {
+    const entry = pendingRef.current.get(id);
+    if (!entry) return null;
+    // A result with a known request id consumes that one pending command even
+    // if its metadata is malformed. Keeping it admitted would leak both an
+    // entry slot and its byte budget forever; only the return value remains
+    // gated by the expected result type and session.
+    pendingRef.current.delete(id);
+    pendingBytesRef.current = Math.max(0, pendingBytesRef.current - entry.bytes);
+    const expectedType =
+      entry.kind === "input" ? "input_result" : "resize_result";
+    if (resultType !== expectedType || entry.session !== session) return null;
+    return entry;
+  }, []);
+
+  /** Resize ack listeners keyed by (session, request id) so terminals can
+   *  commit their resize dedupe only after the server confirms the apply. */
+  const resizeAckListenersRef = useRef(new Set());
+  const subscribeResizeAck = useCallback((listener) => {
+    resizeAckListenersRef.current.add(listener);
+    return () => {
+      resizeAckListenersRef.current.delete(listener);
+    };
+  }, []);
+
+  /**
+   * A lost connection can never confirm non-idempotent input. Pending inputs
+   * become indeterminate (delivery unknown, never replayed); pending resizes
+   * are idempotent and are simply dropped — the Terminal clears its dedupe on
+   * disconnect and re-publishes the visible size after reconnect.
+   */
+  const abandonPending = useCallback(() => {
+    let lost = 0;
+    for (const entry of pendingRef.current.values()) {
+      if (entry.kind === "input") lost += 1;
+    }
+    pendingRef.current.clear();
+    pendingBytesRef.current = 0;
+    if (lost > 0) {
+      unconfirmedInputsRef.current += lost;
+      if (mountedRef.current) {
+        setUnconfirmedInputs(unconfirmedInputsRef.current);
+      }
+    }
+  }, []);
+
+  /**
+   * Dismiss the current unconfirmed-input alert. Result acknowledgements never
+   * mutate this counter; only a later disconnect that abandons fresh input can
+   * make the alert visible again.
+   */
+  const clearUnconfirmedInputs = useCallback(() => {
+    unconfirmedInputsRef.current = 0;
+    if (mountedRef.current) {
+      setUnconfirmedInputs(0);
     }
   }, []);
 
@@ -135,6 +236,19 @@ export function useSessionStream({ setNotice } = {}) {
       if (!session || !dataBase64) {
         reportClientIoError(CLIENT_IO_ERROR.INVALID_PAYLOAD);
         return { ok: false, error: CLIENT_IO_ERROR.INVALID_PAYLOAD };
+      }
+      // Reject an oversized input/paste as a whole BEFORE any byte is sent,
+      // so nothing can partially enter the runtime writer. The base64-length
+      // fast path catches anything clearly over 64 KiB; the decode then makes
+      // the boundary exact (base64 length alone cannot separate 65536/65537/
+      // 65538 raw bytes, which all encode to the same 87384 characters).
+      if (dataBase64.length > MAX_INPUT_BASE64_LENGTH) {
+        reportClientIoError(CLIENT_IO_ERROR.TOO_LARGE);
+        return { ok: false, error: CLIENT_IO_ERROR.TOO_LARGE };
+      }
+      if (decodeBase64ToUint8Array(dataBase64).length > MAX_INPUT_RAW_BYTES) {
+        reportClientIoError(CLIENT_IO_ERROR.TOO_LARGE);
+        return { ok: false, error: CLIENT_IO_ERROR.TOO_LARGE };
       }
       const result = sendClientCommand({
         type: "terminal_input",
@@ -216,6 +330,29 @@ export function useSessionStream({ setNotice } = {}) {
         typeof parsed === "object" &&
         (parsed.type === "input_result" || parsed.type === "resize_result")
       ) {
+        // Exactly one result per command: settle only a matching pending
+        // entry. Stale, cross-kind, and cross-session results are ignored.
+        const entry =
+          typeof parsed.id === "string"
+            ? settlePending(parsed.id, parsed.type, parsed.session)
+            : null;
+        if (!entry) return;
+        if (entry.kind === "resize") {
+          // Both positive and negative resize results resolve the in-flight
+          // dedupe state; the terminal decides whether to commit or retry.
+          for (const listener of resizeAckListenersRef.current) {
+            listener(parsed.session, parsed.id, parsed.ok === true);
+          }
+        }
+        if (parsed.reconnect === true) {
+          // The server rejected this command before applying it because this
+          // connection exhausted its bounded request-id set. Rotate only after
+          // settling the explicit result; pending input on the old connection
+          // remains indeterminate and is never replayed.
+          reportClientIoError(CLIENT_IO_ERROR.DISCONNECTED);
+          reconnectRef.current();
+          return;
+        }
         if (parsed.ok === false) {
           reportBackendIoError(
             typeof parsed.error === "string" ? parsed.error : null,
@@ -245,6 +382,10 @@ export function useSessionStream({ setNotice } = {}) {
       clearRetry();
 
       if (socket) {
+        // Explicit reconnect detaches the old socket's onclose handler below;
+        // abandon its pending commands first so input delivery is not silently
+        // forgotten and is never replayed on the replacement connection.
+        abandonPending();
         try {
           socket.onopen = null;
           socket.onmessage = null;
@@ -277,6 +418,9 @@ export function useSessionStream({ setNotice } = {}) {
       }
       socket = ws;
       socketRef.current = ws;
+      // Request ids are scoped to the current connection; the server rejects
+      // duplicates within one connection, so a fresh connection restarts them.
+      requestSeqRef.current = 0;
 
       ws.onopen = () => {
         if (cancelled || socket !== ws) return;
@@ -305,6 +449,9 @@ export function useSessionStream({ setNotice } = {}) {
         if (cancelled || socket !== ws) return;
         socket = null;
         if (socketRef.current === ws) socketRef.current = null;
+        // Ack for in-flight commands is lost: inputs become indeterminate and
+        // are never replayed; idempotent resizes are dropped for re-publish.
+        abandonPending();
         if (mountedRef.current) {
           setConnectionState("disconnected");
         }
@@ -343,7 +490,14 @@ export function useSessionStream({ setNotice } = {}) {
         socket = null;
       }
     };
-  }, [clearStreamError, reportBackendIoError, reportStreamError]);
+  }, [
+    clearStreamError,
+    reportClientIoError,
+    reportBackendIoError,
+    reportStreamError,
+    settlePending,
+    abandonPending,
+  ]);
 
   const reconnect = useCallback(() => {
     reconnectRef.current();
@@ -360,5 +514,8 @@ export function useSessionStream({ setNotice } = {}) {
     setLoading,
     sendTerminalInput,
     sendTerminalResize,
+    subscribeResizeAck,
+    unconfirmedInputs,
+    clearUnconfirmedInputs,
   };
 }

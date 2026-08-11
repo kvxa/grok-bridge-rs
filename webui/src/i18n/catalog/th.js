@@ -159,6 +159,11 @@ export default {
   "interactive.error": "การป้อนเทอร์มินัลล้มเหลว: {detail}",
   "interactive.unavailable": "การป้อนเทอร์มินัลใช้ไม่ได้",
   "interactive.unavailableShort": "อินพุตออฟไลน์",
+  "interactive.tooLarge": "อินพุตเกินขีดจำกัด 64 KiB ระบบปฏิเสธอินพุตทั้งหมดและไม่ได้ส่งข้อมูลใด ๆ",
+  "interactive.queueFull": "คิวคำสั่งเต็ม ระบบปฏิเสธอินพุตทั้งหมด",
+  "interactive.indeterminate": "ไม่สามารถยืนยันได้ว่าอินพุตถูกส่งถึงแล้ว จึงไม่มีการส่งซ้ำอัตโนมัติ",
+  "interactive.dismiss": "ปิด",
+  "interactive.dismissAria": "ปิดการแจ้งเตือนอินพุตที่ไม่ได้รับการยืนยัน",
 
   "action.confirmCloseSession": "ปิด {id} และโปรเซส Grok ของมันหรือไม่?",
   "action.closedSession":

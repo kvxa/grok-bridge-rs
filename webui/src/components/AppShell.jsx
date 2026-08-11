@@ -43,6 +43,9 @@ export function AppShell() {
     setLoading,
     sendTerminalInput,
     sendTerminalResize,
+    subscribeResizeAck,
+    unconfirmedInputs,
+    clearUnconfirmedInputs,
   } = useSessionStream({ setNotice });
   const { version, visibleUpdate, dismissUpdate } = useVersionPolling();
   const {
@@ -90,6 +93,7 @@ export function AppShell() {
       interactive,
       setInteractive,
       connectionState,
+      subscribeResizeAck,
       sendTerminalInput,
       sendTerminalResize,
     }),
@@ -97,6 +101,7 @@ export function AppShell() {
       interactive,
       setInteractive,
       connectionState,
+      subscribeResizeAck,
       sendTerminalInput,
       sendTerminalResize,
     ],
@@ -151,6 +156,27 @@ export function AppShell() {
                   data-interactive-warning="true"
                 >
                   {t("interactive.warning")}
+                </div>
+              ) : null}
+
+              {unconfirmedInputs > 0 ? (
+                <div
+                  className="alert alert-danger"
+                  role="alert"
+                  data-input-indeterminate="true"
+                >
+                  <div className="d-flex align-items-center justify-content-between gap-2">
+                    <span>{t("interactive.indeterminate")}</span>
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-outline-danger"
+                      onClick={clearUnconfirmedInputs}
+                      aria-label={t("interactive.dismissAria")}
+                      data-input-indeterminate-dismiss="true"
+                    >
+                      {t("interactive.dismiss")}
+                    </button>
+                  </div>
                 </div>
               ) : null}
 
