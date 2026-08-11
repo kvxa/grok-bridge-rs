@@ -4,8 +4,8 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { useTerminalIO } from "../context/TerminalIOContext.jsx";
 import { useI18n } from "../i18n/index.js";
 import {
-  chunkUtf8ToBase64,
   decodeBase64ToUint8Array,
+  encodeUtf8ToBase64,
 } from "../utils/base64.js";
 import { subscribeTerminal } from "../utils/terminalFeeds.js";
 import { clampTerminalGrid } from "../utils/terminalGrid.js";
@@ -28,6 +28,13 @@ const DEFAULT_ROWS = 24;
 const DEFAULT_COLS = 80;
 const RESIZE_STEP_PX = 24;
 const RESIZE_DEBOUNCE_MS = 120;
+/** Bounded delay before one automatic resize retry after an immediate send
+ *  failure, routed through the existing scheduleFit flow. */
+export const RESIZE_RETRY_MS = 300;
+/** Cap on consecutive automatic resize retries: after this many failures the
+ *  terminal stops retrying on its own and waits for the next natural trigger
+ *  (user resize, reconnect, negative ack). */
+export const RESIZE_RETRY_MAX = 3;
 
 function safeRows(rows) {
   const value = Number(rows);
@@ -138,8 +145,10 @@ export function fitTerminalHost(fitAddon, host) {
 
 /**
  * xterm.js terminal driven by the WebSocket feed.
- * terminal_resize follows visible fit always (viewport sync).
- * terminal_input is gated strictly by the global interactive switch.
+ * terminal_resize follows the visible fit always (viewport sync): read-only
+ * terminals still publish their grid so the server-side PTY/vt100 screen stays
+ * in step with the local viewport. terminal_input is gated strictly by the
+ * global interactive switch.
  */
 export function Terminal({ id, heightKey, rows, cols, label }) {
   const { t } = useI18n();
@@ -148,6 +157,7 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
     sendTerminalInput,
     sendTerminalResize,
     connectionState,
+    subscribeResizeAck,
   } = useTerminalIO();
 
   const hostRef = useRef(null);
@@ -161,13 +171,21 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
   const sendResizeRef = useRef(sendTerminalResize);
   const onDataDisposableRef = useRef(null);
   const lastSentSizeRef = useRef({ cols: 0, rows: 0 });
+  /** In-flight resize awaiting its single result: dedupe commits only on ack. */
+  const pendingResizeRef = useRef(null);
   const resizeTimerRef = useRef(0);
+  /** Bounded auto-retry after an immediate resize send failure (see
+   *  scheduleFit): the timer id plus how many consecutive retries ran. */
+  const resizeRetryTimerRef = useRef(0);
+  const resizeRetryCountRef = useRef(0);
+  const connectionStateRef = useRef(connectionState);
   // Height is scoped to the Codex supervisor group, not the Grok session.
   const groupHeightKey = heightKey;
 
   interactiveRef.current = interactive;
   sendInputRef.current = sendTerminalInput;
   sendResizeRef.current = sendTerminalResize;
+  connectionStateRef.current = connectionState;
 
   const [height, setHeight] = useState(() =>
     readTerminalHeight(groupHeightKey),
@@ -182,13 +200,44 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
     );
     const last = lastSentSizeRef.current;
     if (last.cols === nextCols && last.rows === nextRows) return;
+    const pending = pendingResizeRef.current;
+    if (pending?.cols === nextCols && pending?.rows === nextRows) return;
     const result = sendResizeRef.current(id, nextCols, nextRows);
-    // Only commit dedupe state after a successful send so failures stay retryable.
-    if (result?.ok) {
-      lastSentSizeRef.current = { cols: nextCols, rows: nextRows };
+    // Dedupe commits only when the server acks this exact id
+    // (subscribeResizeAck), never on send success, so a lost ack keeps the
+    // size retryable after failure or reconnect.
+    if (result?.ok && typeof result.id === "string") {
+      pendingResizeRef.current = {
+        id: result.id,
+        cols: nextCols,
+        rows: nextRows,
+      };
+      if (resizeRetryTimerRef.current) {
+        window.clearTimeout(resizeRetryTimerRef.current);
+        resizeRetryTimerRef.current = 0;
+      }
+      resizeRetryCountRef.current = 0;
+      return;
+    }
+    // Immediate send failed (offline / queue full / send threw). Retry once
+    // through the existing scheduleFit flow after a bounded delay, but only
+    // while connected (a disconnect clears the dedupe and re-publishes on
+    // reconnect) and never more than RESIZE_RETRY_MAX times in a row, so a
+    // persistent failure cannot turn into a timer storm.
+    if (
+      connectionStateRef.current === "connected" &&
+      resizeRetryCountRef.current < RESIZE_RETRY_MAX &&
+      !resizeRetryTimerRef.current
+    ) {
+      resizeRetryCountRef.current += 1;
+      resizeRetryTimerRef.current = window.setTimeout(() => {
+        resizeRetryTimerRef.current = 0;
+        scheduleFitRef.current();
+      }, RESIZE_RETRY_MS);
     }
   }, [id]);
 
+  const scheduleFitRef = useRef(() => {});
   const scheduleFit = useCallback(() => {
     if (fitRafRef.current) {
       cancelAnimationFrame(fitRafRef.current);
@@ -208,6 +257,7 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
       }, RESIZE_DEBOUNCE_MS);
     });
   }, [maybeSendResize]);
+  scheduleFitRef.current = scheduleFit;
 
   const applyHeight = useCallback(
     (next) => {
@@ -289,6 +339,11 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
         window.clearTimeout(resizeTimerRef.current);
         resizeTimerRef.current = 0;
       }
+      if (resizeRetryTimerRef.current) {
+        window.clearTimeout(resizeRetryTimerRef.current);
+        resizeRetryTimerRef.current = 0;
+      }
+      resizeRetryCountRef.current = 0;
       if (onDataDisposableRef.current) {
         try {
           onDataDisposableRef.current.dispose();
@@ -333,11 +388,11 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
     const disposable = term.onData((data) => {
       // Never buffer: if mode flipped off mid-event, drop immediately.
       if (!interactiveRef.current) return;
-      const chunks = chunkUtf8ToBase64(data);
-      for (const dataBase64 of chunks) {
-        if (!interactiveRef.current) return;
-        sendInputRef.current(id, dataBase64);
-      }
+      // One terminal_input per event/paste (no chunking): an oversized input
+      // is rejected whole by sendTerminalInput before any byte is sent.
+      const dataBase64 = encodeUtf8ToBase64(data);
+      if (!dataBase64) return;
+      sendInputRef.current(id, dataBase64);
     });
     onDataDisposableRef.current = disposable;
 
@@ -352,6 +407,57 @@ export function Terminal({ id, heightKey, rows, cols, label }) {
       }
     };
   }, [id, interactive]);
+
+  // Commit resize dedupe only when the server acks this terminal's exact
+  // pending resize id; a lost ack (disconnect) leaves it retryable.
+  useEffect(() => {
+    const unsubscribe = subscribeResizeAck((ackSession, ackId, ok) => {
+      const pending = pendingResizeRef.current;
+      if (!pending) return;
+      if (ackSession !== id || ackId !== pending.id) return;
+      if (ok) {
+        lastSentSizeRef.current = { cols: pending.cols, rows: pending.rows };
+      }
+      pendingResizeRef.current = null;
+      if (!ok) scheduleFit();
+    });
+    return unsubscribe;
+  }, [id, scheduleFit, subscribeResizeAck]);
+
+  // Any Keyboard mode transition invalidates the previous PTY-size claim.
+  // Turning the mode back on schedules a fresh idempotent resize; turning it
+  // off just clears the claim — the next fit still re-publishes the size.
+  const previousInteractiveRef = useRef(interactive);
+  useEffect(() => {
+    const previous = previousInteractiveRef.current;
+    previousInteractiveRef.current = interactive;
+    if (previous === interactive) return;
+    lastSentSizeRef.current = { cols: 0, rows: 0 };
+    pendingResizeRef.current = null;
+    if (interactive) scheduleFit();
+  }, [interactive, scheduleFit]);
+
+  // Resize is idempotent: after failure or disconnect the dedupe is cleared so
+  // the visible size is re-published after reconnect. Input is never replayed.
+  const previousConnectionRef = useRef(connectionState);
+  useEffect(() => {
+    const previous = previousConnectionRef.current;
+    previousConnectionRef.current = connectionState;
+    if (previous === "connected" && connectionState !== "connected") {
+      lastSentSizeRef.current = { cols: 0, rows: 0 };
+      pendingResizeRef.current = null;
+      // Stop any in-flight auto-retry; the reconnect path re-publishes.
+      if (resizeRetryTimerRef.current) {
+        window.clearTimeout(resizeRetryTimerRef.current);
+        resizeRetryTimerRef.current = 0;
+      }
+      resizeRetryCountRef.current = 0;
+    }
+    if (connectionState === "connected" && previous !== "connected") {
+      resizeRetryCountRef.current = 0;
+      scheduleFit();
+    }
+  }, [connectionState, scheduleFit]);
 
   useEffect(() => {
     scheduleFit();

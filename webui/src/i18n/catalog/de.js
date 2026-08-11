@@ -165,6 +165,11 @@ export default {
   "interactive.error": "Terminaleingabe fehlgeschlagen: {detail}",
   "interactive.unavailable": "Terminaleingabe nicht verfügbar",
   "interactive.unavailableShort": "Eingabe getrennt",
+  "interactive.tooLarge": "Die Eingabe überschreitet das Limit von 64 KiB; sie wurde vollständig abgelehnt und nichts wurde gesendet.",
+  "interactive.queueFull": "Die Befehlswarteschlange ist voll; die Eingabe wurde vollständig abgelehnt.",
+  "interactive.indeterminate": "Die Zustellung der Eingabe konnte nicht bestätigt werden; sie wurde nicht erneut gesendet.",
+  "interactive.dismiss": "Ausblenden",
+  "interactive.dismissAria": "Hinweis zu unbestätigten Eingaben ausblenden",
 
   "action.confirmCloseSession": "{id} und seinen Grok-Prozess schließen?",
   "action.closedSession":

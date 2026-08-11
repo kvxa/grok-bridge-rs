@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel},
     },
     thread,
@@ -31,6 +31,10 @@ const SCROLLBACK_ROWS: usize = 5_000;
 const MAX_TRANSCRIPT_BYTES: usize = 512 * 1024;
 const MAX_READ_BYTES: usize = 64 * 1024;
 const WRITER_QUEUE_CAPACITY: usize = 64;
+/// Total pending writer bytes budget (≈ four maximum-size writes). Admission is
+/// bounded by both entry count and bytes so a full queue always rejects the
+/// whole input instead of accepting a partial write.
+const WRITER_QUEUE_MAX_BYTES: usize = 4 * MAX_WRITE_BYTES;
 const QUIET_IDLE_MILLISECONDS: u64 = 3_000;
 const PROCESS_TERMINATE_TIMEOUT_MS: u32 = 5_000;
 /// One absolute deadline shared by every session in a group close. The WebUI
@@ -286,8 +290,12 @@ impl SessionHost {
         Ok(())
     }
 
-    /// Keep every managed session represented by the WebUI's global event
-    /// stream leased while at least one WebSocket client remains attached.
+    /// Refresh every managed session's client lease in response to an inbound
+    /// WebUI command. The WebUI's global event stream itself never refreshes
+    /// leases — only inbound terminal commands (and Codex keepalives via
+    /// touch_client) prove the client is attached right now, so each inbound
+    /// command cancels any provisional orphan cleanup before the PTY is
+    /// touched.
     pub(crate) fn touch_web_clients(&self) -> Result<usize> {
         self.touch_web_clients_at(now_millis())
     }
@@ -971,11 +979,24 @@ struct LaunchConfig {
     orphan_policy: OrphanPolicy,
 }
 
+/// One item handed to the writer thread. `budget` is the number of admission
+/// bytes this item holds: input enqueues carry their exact payload length,
+/// while terminal response frames (never admitted, sent directly) carry zero.
+/// The writer releases exactly `budget` bytes after writing, so the byte
+/// counter can never go negative for a response that was never counted.
+#[derive(Debug, PartialEq)]
+struct WriterItem {
+    data: Vec<u8>,
+    budget: usize,
+}
+
 struct Session {
     inner: Mutex<SessionInner>,
     changed: Condvar,
     host_revision: Arc<HostRevision>,
-    writer_tx: Mutex<Option<SyncSender<Vec<u8>>>>,
+    writer_tx: Mutex<Option<SyncSender<WriterItem>>>,
+    /// Raw bytes currently queued to the writer channel (admission budget).
+    pending_writer_bytes: AtomicUsize,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     /// Immutable identifier of the owned process scope, captured at spawn: on
     /// Unix the process-group id (the session leader pid from portable-pty's
@@ -1335,6 +1356,7 @@ impl Session {
             changed: Condvar::new(),
             host_revision,
             writer_tx: Mutex::new(Some(writer_tx)),
+            pending_writer_bytes: AtomicUsize::new(0),
             master: Mutex::new(Some(pair.master)),
             scope_id: launcher_process_id,
             #[cfg(unix)]
@@ -1401,7 +1423,9 @@ impl Session {
 
     /// Recheck the lease and phase immediately before cleanup becomes
     /// irreversible. The caller holds the host registry lock, serializing this
-    /// commit with every Codex/WebUI lease refresh.
+    /// commit with every lease refresh — Codex keepalives and inbound WebUI
+    /// terminal commands alike — so a refresh that lands first cancels the
+    /// provisional claim.
     fn commit_orphan_cleanup(&self, now: u64) -> Result<bool> {
         if !self.cleanup_claimed.load(Ordering::Acquire)
             || self.cleanup_committed.load(Ordering::Acquire)
@@ -1639,7 +1663,34 @@ impl Session {
         let Some(writer) = writer_guard.as_ref() else {
             bail!("session input channel is closed");
         };
-        match writer.try_send(data) {
+        // Byte budget is checked before any byte is queued; queue-full rejection
+        // is always whole-input (never a partial write).
+        let data_len = data.len();
+        if self
+            .pending_writer_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(data_len)
+            > WRITER_QUEUE_MAX_BYTES
+        {
+            bail!("session input queue is full");
+        }
+        // Count the bytes BEFORE the item becomes visible to the writer thread.
+        // The writer only ever subtracts for items it received, and an item only
+        // becomes receivable after a successful try_send that follows this
+        // increment, so the counter can never underflow and the writer can never
+        // subtract before the matching add. On Full/Disconnected the increment
+        // is rolled back under the same lock. Ordering: Release on the add
+        // pairs with the writer's Acquire release of the same item, but the
+        // counter's ordering is not what makes admission correct — the channel
+        // itself synchronizes the item — so the plain Acquire on the release
+        // path is the minimal sufficient read side (Relaxed would also be
+        // sound); no AcqRel is required for count correctness.
+        self.pending_writer_bytes
+            .fetch_add(data_len, Ordering::Release);
+        match writer.try_send(WriterItem {
+            data,
+            budget: data_len,
+        }) {
             Ok(()) => {
                 let now = now_millis();
                 if starts_turn {
@@ -1655,8 +1706,16 @@ impl Session {
                 self.signal_changed();
                 Ok(())
             }
-            Err(TrySendError::Full(_)) => bail!("session input queue is full"),
-            Err(TrySendError::Disconnected(_)) => bail!("session input channel is closed"),
+            Err(TrySendError::Full(_)) => {
+                self.pending_writer_bytes
+                    .fetch_sub(data_len, Ordering::Acquire);
+                bail!("session input queue is full");
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.pending_writer_bytes
+                    .fetch_sub(data_len, Ordering::Acquire);
+                bail!("session input channel is closed");
+            }
         }
     }
 
@@ -2089,11 +2148,17 @@ impl Session {
     }
 
     fn queue_terminal_response(&self, response: Vec<u8>) {
-        let result = self
-            .writer_tx
-            .lock()
-            .ok()
-            .and_then(|writer| writer.as_ref().map(|writer| writer.try_send(response)));
+        // Terminal response frames bypass admission: they carry budget 0 so the
+        // writer's release never underflows the byte counter for bytes that
+        // were never counted.
+        let result = self.writer_tx.lock().ok().and_then(|writer| {
+            writer.as_ref().map(|writer| {
+                writer.try_send(WriterItem {
+                    data: response,
+                    budget: 0,
+                })
+            })
+        });
         match result {
             Some(Ok(())) => {}
             Some(Err(TrySendError::Full(_))) => {
@@ -2849,14 +2914,27 @@ fn spawn_reader(session: Arc<Session>, mut reader: Box<dyn Read + Send>) {
 fn spawn_writer(
     session: Arc<Session>,
     mut writer: Box<dyn Write + Send>,
-    writer_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    writer_rx: std::sync::mpsc::Receiver<WriterItem>,
 ) {
     thread::spawn(move || {
-        while let Ok(data) = writer_rx.recv() {
-            if let Err(error) = writer.write_all(&data).and_then(|()| writer.flush()) {
+        while let Ok(item) = writer_rx.recv() {
+            // Only the item's admitted budget is released: inputs release their
+            // payload bytes, terminal responses release nothing, so the counter
+            // tracks exactly the queued input bytes and can never underflow.
+            if let Err(error) = writer.write_all(&item.data).and_then(|()| writer.flush()) {
+                // The item left the queue, so release its budget too. Any items
+                // still queued when the channel later closes are dropped without
+                // release, but the session is terminating at that point and no
+                // further admission happens.
+                session
+                    .pending_writer_bytes
+                    .fetch_sub(item.budget, Ordering::Acquire);
                 session.mark_writer_error(format!("failed to write Grok input: {error}"));
                 return;
             }
+            session
+                .pending_writer_bytes
+                .fetch_sub(item.budget, Ordering::Acquire);
         }
     });
 }
@@ -4031,6 +4109,7 @@ pub(crate) mod tests {
             changed: Condvar::new(),
             host_revision,
             writer_tx: Mutex::new(Some(writer_tx)),
+            pending_writer_bytes: AtomicUsize::new(0),
             master: Mutex::new(None),
             #[cfg(unix)]
             termination: Mutex::new(TerminationLevel::default()),
@@ -4643,8 +4722,143 @@ pub(crate) mod tests {
         host.touch_client_at("codex-resume", 1_300).unwrap();
         assert!(!session.cleanup_claimed.load(Ordering::Acquire));
         session.write_raw(b"resume\r".to_vec()).unwrap();
-        assert_eq!(writer_rx.recv().unwrap(), b"resume\r");
+        let item = writer_rx.recv().unwrap();
+        assert_eq!(item.data, b"resume\r");
+        assert_eq!(item.budget, b"resume\r".len());
         assert_eq!(session.state().unwrap().phase, SessionPhase::Running);
+    }
+
+    #[test]
+    fn writer_admission_rejects_whole_input_once_byte_budget_is_full() {
+        let session = test_session(SessionPhase::Idle);
+        let (writer_tx, writer_rx) = sync_channel(64);
+        *session.writer_tx.lock().unwrap() = Some(writer_tx);
+
+        let payload = vec![0x61; crate::protocol::MAX_WRITE_BYTES];
+        for _ in 0..4 {
+            session.write_raw(payload.clone()).unwrap();
+        }
+        assert_eq!(
+            session.pending_writer_bytes.load(Ordering::Acquire),
+            4 * crate::protocol::MAX_WRITE_BYTES
+        );
+
+        // A fifth maximum-size write would exceed the byte budget: the whole
+        // input is rejected and no bytes enter the queue.
+        let error = session.write_raw(payload.clone()).unwrap_err();
+        assert!(format!("{error:#}").contains("queue is full"));
+        assert_eq!(
+            session.pending_writer_bytes.load(Ordering::Acquire),
+            4 * crate::protocol::MAX_WRITE_BYTES
+        );
+        // Exactly the four accepted writes are queued; nothing partial.
+        let queued = drain_writer(&writer_rx);
+        assert_eq!(queued.len(), 4);
+        assert!(queued.iter().all(|item| item.data == payload));
+        assert!(
+            queued
+                .iter()
+                .all(|item| item.budget == crate::protocol::MAX_WRITE_BYTES)
+        );
+        // Entry-count admission is still enforced for small payloads.
+        let (tiny_tx, tiny_rx) = sync_channel(1);
+        *session.writer_tx.lock().unwrap() = Some(tiny_tx);
+        session.pending_writer_bytes.store(0, Ordering::Release);
+        assert!(session.write_raw(b"a".to_vec()).is_ok());
+        assert!(
+            format!("{:#}", session.write_raw(b"b".to_vec()).unwrap_err())
+                .contains("queue is full")
+        );
+        drop(tiny_rx);
+    }
+
+    #[test]
+    fn writer_byte_budget_is_released_after_bytes_are_written() {
+        let session = Arc::new(test_session(SessionPhase::Idle));
+        let (writer_tx, writer_rx) = sync_channel(8);
+        *session.writer_tx.lock().unwrap() = Some(writer_tx);
+
+        spawn_writer(Arc::clone(&session), Box::new(std::io::sink()), writer_rx);
+        session.write_raw(vec![0x62; 4096]).unwrap();
+        session.write_raw(vec![0x63; 8192]).unwrap();
+        // The writer thread drains concurrently; the budget must never exceed
+        // the sum and must settle back to zero once everything is written.
+        let initial = session.pending_writer_bytes.load(Ordering::Acquire);
+        assert!(initial <= 4096 + 8192);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while session.pending_writer_bytes.load(Ordering::Acquire) != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer never drained");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Channel closed: the writer loop exits; budget stays released.
+        session.close_writer();
+    }
+
+    #[test]
+    fn terminal_responses_never_count_toward_the_writer_byte_budget() {
+        let session = test_session(SessionPhase::Idle);
+        let (writer_tx, writer_rx) = sync_channel(64);
+        *session.writer_tx.lock().unwrap() = Some(writer_tx);
+
+        // Interleave the two production enqueue paths: write_raw admits bytes,
+        // queue_terminal_response (vt100 response frames) must not touch the
+        // admission counter at all.
+        session.write_raw(vec![0x62; 2048]).unwrap();
+        session.queue_terminal_response(b"\x1b[0n".to_vec());
+        session.write_raw(vec![0x63; 4096]).unwrap();
+        session.queue_terminal_response(b"\x1b[?1;2c".to_vec());
+        session.write_raw(b"tail".to_vec()).unwrap();
+
+        // Budget reflects only the admitted input bytes, never the responses.
+        assert_eq!(
+            session.pending_writer_bytes.load(Ordering::Acquire),
+            2048 + 4096 + b"tail".len()
+        );
+
+        let items = drain_writer(&writer_rx);
+        assert_eq!(
+            items.iter().map(|item| item.budget).collect::<Vec<_>>(),
+            vec![2048, 0, 4096, 0, b"tail".len()]
+        );
+        // Interleaved response frames still reach the PTY in arrival order.
+        assert_eq!(&items[1].data, b"\x1b[0n");
+        assert_eq!(&items[3].data, b"\x1b[?1;2c");
+        // Budget stays unchanged once the queue is drained.
+        assert_eq!(
+            session.pending_writer_bytes.load(Ordering::Acquire),
+            2048 + 4096 + b"tail".len()
+        );
+    }
+
+    #[test]
+    fn writer_mixed_input_and_terminal_response_drain_settles_budget_to_zero() {
+        let session = Arc::new(test_session(SessionPhase::Idle));
+        let (writer_tx, writer_rx) = sync_channel(64);
+        *session.writer_tx.lock().unwrap() = Some(writer_tx);
+
+        spawn_writer(Arc::clone(&session), Box::new(std::io::sink()), writer_rx);
+        session.write_raw(vec![0x62; 4096]).unwrap();
+        session.queue_terminal_response(b"\x1b[0n".to_vec());
+        session.write_raw(vec![0x63; 8192]).unwrap();
+        session.queue_terminal_response(b"\x1b[?1;2c".to_vec());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while session.pending_writer_bytes.load(Ordering::Acquire) != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer never drained");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Responses contributed zero budget, so the counter can only settle to
+        // exactly zero when releases never exceeded adds: no underflow.
+        assert_eq!(session.pending_writer_bytes.load(Ordering::Acquire), 0);
+        session.close_writer();
+    }
+
+    fn drain_writer(rx: &std::sync::mpsc::Receiver<WriterItem>) -> Vec<WriterItem> {
+        let mut out = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            out.push(item);
+        }
+        out
     }
 
     #[test]
@@ -4994,7 +5208,7 @@ pub(crate) mod tests {
             .apply_hook_event(hook_event(HookEventKind::PreToolUse))
             .unwrap();
         session.send("\u{3}".to_owned()).unwrap();
-        assert_eq!(writer_rx.recv().unwrap(), b"\x03");
+        assert_eq!(writer_rx.recv().unwrap().data, b"\x03");
         let state = session.state().unwrap();
         assert_eq!(state.phase, SessionPhase::Running);
         assert_eq!(state.activity, HookActivity::Working);
@@ -5003,17 +5217,25 @@ pub(crate) mod tests {
         let (idle_tx, idle_rx) = sync_channel(1);
         *idle.writer_tx.lock().unwrap() = Some(idle_tx);
         idle.send("\u{3}".to_owned()).unwrap();
-        assert_eq!(idle_rx.recv().unwrap(), b"\x03");
+        assert_eq!(idle_rx.recv().unwrap().data, b"\x03");
         let state = idle.state().unwrap();
         assert_eq!(state.phase, SessionPhase::Idle);
         assert_eq!(state.activity, HookActivity::Unknown);
 
         session.send("next task".to_owned()).unwrap();
-        assert_eq!(writer_rx.recv().unwrap(), b"\x1b[200~next task\x1b[201~\r");
+        assert_eq!(
+            writer_rx.recv().unwrap().data,
+            b"\x1b[200~next task\x1b[201~\r"
+        );
 
         let full = test_session(SessionPhase::Idle);
         let (full_tx, _full_rx) = sync_channel(1);
-        full_tx.try_send(vec![b'x']).unwrap();
+        full_tx
+            .try_send(WriterItem {
+                data: vec![b'x'],
+                budget: 1,
+            })
+            .unwrap();
         *full.writer_tx.lock().unwrap() = Some(full_tx);
         let before = full.state().unwrap();
         let error = full.send("\u{3}".to_owned()).unwrap_err();
@@ -5041,7 +5263,7 @@ pub(crate) mod tests {
         *session.writer_tx.lock().unwrap() = Some(writer_tx);
 
         session.write_raw(b"\x03".to_vec()).unwrap();
-        assert_eq!(writer_rx.recv().unwrap(), b"\x03");
+        assert_eq!(writer_rx.recv().unwrap().data, b"\x03");
         let state = session.state().unwrap();
         assert_eq!(state.phase, SessionPhase::Idle);
         assert_eq!(state.activity, HookActivity::Unknown);
@@ -5053,7 +5275,12 @@ pub(crate) mod tests {
 
         let full = test_session(SessionPhase::Idle);
         let (full_tx, _full_rx) = sync_channel(1);
-        full_tx.try_send(vec![b'x']).unwrap();
+        full_tx
+            .try_send(WriterItem {
+                data: vec![b'x'],
+                budget: 1,
+            })
+            .unwrap();
         *full.writer_tx.lock().unwrap() = Some(full_tx);
         let before = full.state().unwrap();
         let error = full.write_raw(b"\x03".to_vec()).unwrap_err();

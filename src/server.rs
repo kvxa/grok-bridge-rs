@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     io::{BufRead, BufReader, ErrorKind, Write},
     net::{TcpListener, TcpStream},
@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -35,11 +35,12 @@ const WEB_EVENTS_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Max idle sleep between client-frame polls so interactive keys stay low-latency.
 /// Host Condvar still wakes immediately on session revisions.
 const WEB_EVENTS_CLIENT_POLL: Duration = Duration::from_millis(25);
-/// Refresh every managed Codex lease while a WebUI event socket remains live.
-/// This stays well below the minimum configurable 30-second lease.
-const WEB_EVENTS_LEASE_REFRESH: Duration = Duration::from_secs(10);
 /// Cap inbound request-id length for WebUI command frames.
 const WEB_EVENTS_MAX_REQUEST_ID_BYTES: usize = 128;
+/// Hard per-connection bound on tracked request ids. When full, the next new
+/// command is rejected with an explicit reconnect result and the connection is
+/// closed. Old ids are never evicted or replayable within one connection.
+const WEB_EVENTS_MAX_TRACKED_REQUEST_IDS: usize = 65536;
 
 pub(crate) fn run() -> Result<()> {
     let name = runtime_name()?;
@@ -607,26 +608,19 @@ fn handle_events_websocket(
 }
 
 fn run_events_websocket(websocket: &mut WebSocket<TcpStream>, state: &RuntimeState) {
-    if let Err(error) = state.host.touch_web_clients() {
-        eprintln!("grok-bridge server: WebUI lease refresh failed: {error:#}");
-    }
-    let mut next_lease_refresh = Instant::now() + WEB_EVENTS_LEASE_REFRESH;
     let mut cursors = HashMap::new();
+    // Request ids must be unique within this connection; duplicates are
+    // rejected before any PTY side effect.
+    let mut seen_ids = HashSet::new();
     let mut seen_revision = state.host.revision();
     if !send_web_events(websocket, state, &mut cursors, true) {
         return;
     }
 
     while !state.stopping.load(Ordering::Acquire) {
-        if Instant::now() >= next_lease_refresh {
-            if let Err(error) = state.host.touch_web_clients() {
-                eprintln!("grok-bridge server: WebUI lease refresh failed: {error:#}");
-            }
-            next_lease_refresh = Instant::now() + WEB_EVENTS_LEASE_REFRESH;
-        }
         // Service inbound terminal_input / terminal_resize before sleeping so
         // interactive keystrokes never wait behind a multi-second idle timeout.
-        match poll_websocket_client(websocket, state) {
+        match poll_websocket_client(websocket, state, &mut seen_ids) {
             WsClientAction::Continue => {}
             WsClientAction::Close => return,
         }
@@ -640,7 +634,9 @@ fn run_events_websocket(websocket: &mut WebSocket<TcpStream>, state: &RuntimeSta
         // Sleep until the next host revision *or* the next pure-time lease
         // transition, but never longer than WEB_EVENTS_CLIENT_POLL so client
         // frames stay low-latency. Timeouts without a revision/lease signal
-        // never push frames.
+        // never push frames. The event stream itself never refreshes Codex
+        // leases (only inbound terminal commands do), so real lease
+        // transitions still arrive promptly for display.
         let wait = match lease_deadline {
             Some(deadline) if deadline > now => Duration::from_millis(deadline - now)
                 .min(Duration::from_secs(30))
@@ -650,7 +646,7 @@ fn run_events_websocket(websocket: &mut WebSocket<TcpStream>, state: &RuntimeSta
             None => WEB_EVENTS_CLIENT_POLL,
         };
         let current = state.host.wait_revision(seen_revision, wait);
-        match poll_websocket_client(websocket, state) {
+        match poll_websocket_client(websocket, state, &mut seen_ids) {
             WsClientAction::Continue => {}
             WsClientAction::Close => return,
         }
@@ -735,6 +731,7 @@ enum WsClientAction {
 fn poll_websocket_client(
     websocket: &mut WebSocket<TcpStream>,
     state: &RuntimeState,
+    seen_ids: &mut HashSet<String>,
 ) -> WsClientAction {
     // Drain a bounded number of control/application frames so a noisy client
     // cannot pin this connection thread forever.
@@ -751,7 +748,10 @@ fn poll_websocket_client(
                 return WsClientAction::Close;
             }
             Ok(Message::Text(text)) => {
-                if handle_web_events_client_text(websocket, state, text.as_str()).is_err() {
+                if matches!(
+                    handle_web_events_client_text(websocket, state, seen_ids, text.as_str()),
+                    WsClientAction::Close
+                ) {
                     return WsClientAction::Close;
                 }
             }
@@ -777,59 +777,132 @@ fn poll_websocket_client(
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WebEventsClientCommand {
     TerminalInput {
-        id: Option<String>,
+        id: String,
         session: String,
         data_base64: String,
     },
     TerminalResize {
-        id: Option<String>,
+        id: String,
         session: String,
         cols: u16,
         rows: u16,
     },
 }
 
-/// Parse a single WebUI client command without panicking on junk.
-/// Unknown types yield `Ok(None)` (ignored). Malformed known types yield `Err`.
-fn parse_web_events_client_command(text: &str) -> Result<Option<WebEventsClientCommand>, String> {
-    if text.len() > WEB_EVENTS_MAX_MESSAGE_BYTES {
-        return Err("message exceeds size limit".to_owned());
+/// A parse failure that may still carry enough structure — a legal request id,
+/// a recognized command type, and a cleanly extractable session — to correlate
+/// the error result with the browser's pending command. Only messages where
+/// nothing usable can be identified (invalid JSON, non-object, oversized, or a
+/// malformed id) stay id-less with the generic `input_result` type.
+#[derive(Debug)]
+struct WebEventsParseError {
+    message: String,
+    id: Option<String>,
+    session: Option<String>,
+    result_type: &'static str,
+}
+
+impl WebEventsParseError {
+    fn generic(message: impl Into<String>) -> Self {
+        WebEventsParseError {
+            message: message.into(),
+            id: None,
+            session: None,
+            result_type: "input_result",
+        }
     }
-    let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|error| format!("invalid JSON: {error}"))?;
+
+    fn with_context(
+        message: impl Into<String>,
+        id: Option<String>,
+        session: Option<String>,
+        result_type: &'static str,
+    ) -> Self {
+        WebEventsParseError {
+            message: message.into(),
+            id,
+            session,
+            result_type,
+        }
+    }
+}
+
+/// Parse a single WebUI client command without panicking on junk.
+/// Unknown types yield `Ok(None)` (ignored). Malformed known types yield `Err`
+/// carrying the recognized request id and result type when available.
+fn parse_web_events_client_command(
+    text: &str,
+) -> Result<Option<WebEventsClientCommand>, WebEventsParseError> {
+    if text.len() > WEB_EVENTS_MAX_MESSAGE_BYTES {
+        return Err(WebEventsParseError::generic("message exceeds size limit"));
+    }
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| WebEventsParseError::generic(format!("invalid JSON: {error}")))?;
     let Some(object) = value.as_object() else {
-        return Err("message must be a JSON object".to_owned());
+        return Err(WebEventsParseError::generic(
+            "message must be a JSON object",
+        ));
     };
     let message_type = object
         .get("type")
         .and_then(|value| value.as_str())
         .unwrap_or("");
+    // Best-effort extraction before the field checks below, so a malformed
+    // known-shape command can still be settled by its request id and type.
     let id = match object.get("id") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(value)) => {
             if value.len() > WEB_EVENTS_MAX_REQUEST_ID_BYTES {
-                return Err("request id is too long".to_owned());
+                return Err(WebEventsParseError::generic("request id is too long"));
             }
             Some(value.clone())
         }
-        Some(_) => return Err("request id must be a string".to_owned()),
+        Some(_) => return Err(WebEventsParseError::generic("request id must be a string")),
+    };
+    let session = object
+        .get("session")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let result_type = match message_type {
+        "terminal_input" => "input_result",
+        "terminal_resize" => "resize_result",
+        // Unknown / push-only types (e.g. future clients): ignore safely.
+        _ => return Ok(None),
+    };
+    // Errors past this point keep the recognized id/session/type so the
+    // browser can release its pending entry and see a correlated failure.
+    // The closure owns its own clones so `id` below can still be moved into
+    // the command variants.
+    let context_error = {
+        let id = id.clone();
+        let session = session.clone();
+        move |message: String| {
+            WebEventsParseError::with_context(message, id.clone(), session.clone(), result_type)
+        }
     };
 
     match message_type {
         "terminal_input" => {
+            let Some(id) = id else {
+                return Err(context_error("request id is required".to_owned()));
+            };
+            if id.is_empty() {
+                return Err(context_error("request id is required".to_owned()));
+            }
             let session = object
                 .get("session")
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_owned();
-            validate_session_handle(&session).map_err(|error| format!("{error:#}"))?;
+            validate_session_handle(&session).map_err(|err| context_error(format!("{err:#}")))?;
             let data_base64 = object
                 .get("data_base64")
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_owned();
             if data_base64.is_empty() {
-                return Err("data_base64 is required".to_owned());
+                return Err(context_error("data_base64 is required".to_owned()));
             }
             Ok(Some(WebEventsClientCommand::TerminalInput {
                 id,
@@ -838,22 +911,30 @@ fn parse_web_events_client_command(text: &str) -> Result<Option<WebEventsClientC
             }))
         }
         "terminal_resize" => {
+            let Some(id) = id else {
+                return Err(context_error("request id is required".to_owned()));
+            };
+            if id.is_empty() {
+                return Err(context_error("request id is required".to_owned()));
+            }
             let session = object
                 .get("session")
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_owned();
-            validate_session_handle(&session).map_err(|error| format!("{error:#}"))?;
+            validate_session_handle(&session).map_err(|err| context_error(format!("{err:#}")))?;
             let cols = object
                 .get("cols")
                 .and_then(|value| value.as_u64())
-                .ok_or_else(|| "cols is required".to_owned())?;
+                .ok_or_else(|| context_error("cols is required".to_owned()))?;
             let rows = object
                 .get("rows")
                 .and_then(|value| value.as_u64())
-                .ok_or_else(|| "rows is required".to_owned())?;
-            let cols = u16::try_from(cols).map_err(|_| "cols out of range".to_owned())?;
-            let rows = u16::try_from(rows).map_err(|_| "rows out of range".to_owned())?;
+                .ok_or_else(|| context_error("rows is required".to_owned()))?;
+            let cols =
+                u16::try_from(cols).map_err(|_| context_error("cols out of range".to_owned()))?;
+            let rows =
+                u16::try_from(rows).map_err(|_| context_error("rows out of range".to_owned()))?;
             Ok(Some(WebEventsClientCommand::TerminalResize {
                 id,
                 session,
@@ -861,7 +942,6 @@ fn parse_web_events_client_command(text: &str) -> Result<Option<WebEventsClientC
                 rows,
             }))
         }
-        // Unknown / push-only types (e.g. future clients): ignore safely.
         _ => Ok(None),
     }
 }
@@ -915,10 +995,74 @@ fn web_events_command_session(command: &WebEventsClientCommand) -> &str {
     }
 }
 
-fn web_events_command_id(command: &WebEventsClientCommand) -> Option<&str> {
+fn web_events_command_id(command: &WebEventsClientCommand) -> &str {
     match command {
         WebEventsClientCommand::TerminalInput { id, .. }
-        | WebEventsClientCommand::TerminalResize { id, .. } => id.as_deref(),
+        | WebEventsClientCommand::TerminalResize { id, .. } => id.as_str(),
+    }
+}
+
+/// The single result a client command resolves to: applied, rejected by apply
+/// validation, or rejected as a duplicate request id. Exactly one result is
+/// always sent back so the caller can match it to its pending command.
+struct WebEventsCommandOutcome {
+    result_type: &'static str,
+    id: Option<String>,
+    session: Option<String>,
+    ok: bool,
+    error: Option<String>,
+    reconnect: bool,
+}
+
+fn plan_web_events_command_outcome(
+    host: &SessionHost,
+    command: &WebEventsClientCommand,
+    seen_ids: &mut HashSet<String>,
+) -> WebEventsCommandOutcome {
+    let result_type = web_events_result_type(command);
+    let id = web_events_command_id(command).to_owned();
+    let session = Some(web_events_command_session(command).to_owned());
+    // Strict per-connection uniqueness with a hard memory bound. Eviction
+    // would let a previously-applied non-idempotent input replay, so a full
+    // window rejects one new command and explicitly rotates the connection.
+    if seen_ids.contains(&id) {
+        return WebEventsCommandOutcome {
+            result_type,
+            id: Some(id),
+            session,
+            ok: false,
+            error: Some("duplicate request id".to_owned()),
+            reconnect: false,
+        };
+    }
+    if seen_ids.len() >= WEB_EVENTS_MAX_TRACKED_REQUEST_IDS {
+        return WebEventsCommandOutcome {
+            result_type,
+            id: Some(id),
+            session,
+            ok: false,
+            error: Some("request id window exhausted; reconnect required".to_owned()),
+            reconnect: true,
+        };
+    }
+    seen_ids.insert(id.clone());
+    match apply_web_events_client_command(host, command) {
+        Ok(()) => WebEventsCommandOutcome {
+            result_type,
+            id: Some(id),
+            session,
+            ok: true,
+            error: None,
+            reconnect: false,
+        },
+        Err(error) => WebEventsCommandOutcome {
+            result_type,
+            id: Some(id),
+            session,
+            ok: false,
+            error: Some(error),
+            reconnect: false,
+        },
     }
 }
 
@@ -929,6 +1073,7 @@ fn build_web_events_command_result(
     session: Option<&str>,
     ok: bool,
     error: Option<&str>,
+    reconnect: bool,
 ) -> String {
     let mut map = serde_json::Map::new();
     map.insert(
@@ -951,6 +1096,9 @@ fn build_web_events_command_result(
             serde_json::Value::String(error.to_owned()),
         );
     }
+    if reconnect {
+        map.insert("reconnect".to_owned(), serde_json::Value::Bool(true));
+    }
     serde_json::Value::Object(map).to_string()
 }
 
@@ -961,8 +1109,9 @@ fn send_web_events_command_result(
     session: Option<&str>,
     ok: bool,
     error: Option<&str>,
+    reconnect: bool,
 ) -> Result<(), ()> {
-    let payload = build_web_events_command_result(result_type, id, session, ok, error);
+    let payload = build_web_events_command_result(result_type, id, session, ok, error, reconnect);
     if payload.len() > WEB_EVENTS_MAX_MESSAGE_BYTES {
         return Err(());
     }
@@ -975,46 +1124,55 @@ fn send_web_events_command_result(
 fn handle_web_events_client_text(
     websocket: &mut WebSocket<TcpStream>,
     state: &RuntimeState,
+    seen_ids: &mut HashSet<String>,
     text: &str,
-) -> Result<(), ()> {
+) -> WsClientAction {
     match parse_web_events_client_command(text) {
-        Ok(None) => Ok(()),
-        Ok(Some(command)) => match apply_web_events_client_command(&state.host, &command) {
-            Ok(()) => {
-                // Success is silent for terminal_input (high frequency). Resize
-                // still gets a positive ack so the UI can confirm PTY apply.
-                if matches!(command, WebEventsClientCommand::TerminalResize { .. }) {
-                    send_web_events_command_result(
-                        websocket,
-                        web_events_result_type(&command),
-                        web_events_command_id(&command),
-                        Some(web_events_command_session(&command)),
-                        true,
-                        None,
-                    )?;
-                }
-                Ok(())
-            }
-            Err(error) => send_web_events_command_result(
+        Ok(None) => WsClientAction::Continue,
+        Ok(Some(command)) => {
+            // terminal_input and terminal_resize always resolve to exactly one
+            // result frame (input acks included) keyed by the connection-unique
+            // request id, so the browser can settle its pending command.
+            let outcome = plan_web_events_command_outcome(&state.host, &command, seen_ids);
+            let sent = send_web_events_command_result(
                 websocket,
-                web_events_result_type(&command),
-                web_events_command_id(&command),
-                Some(web_events_command_session(&command)),
-                false,
-                Some(&error),
-            ),
-        },
+                outcome.result_type,
+                outcome.id.as_deref(),
+                outcome.session.as_deref(),
+                outcome.ok,
+                outcome.error.as_deref(),
+                outcome.reconnect,
+            );
+            if sent.is_err() {
+                return WsClientAction::Close;
+            }
+            if outcome.reconnect {
+                let _ = websocket.close(None);
+                WsClientAction::Close
+            } else {
+                WsClientAction::Continue
+            }
+        }
         Err(error) => {
             // Malformed known-shape or generic junk that failed parse: never
-            // touch PTY; return a generic input_result when possible.
-            send_web_events_command_result(
+            // touch PTY. If the parse preserved a recognized id/type/session,
+            // send a correlated failure so the browser can settle (and release
+            // the admission bytes of) its pending command; fully-unidentifiable
+            // junk falls back to a generic input_result the browser ignores.
+            let sent = send_web_events_command_result(
                 websocket,
-                "input_result",
-                None,
-                None,
+                error.result_type,
+                error.id.as_deref(),
+                error.session.as_deref(),
                 false,
-                Some(&error),
-            )
+                Some(&error.message),
+                false,
+            );
+            if sent.is_err() {
+                WsClientAction::Close
+            } else {
+                WsClientAction::Continue
+            }
         }
     }
 }
@@ -1616,7 +1774,7 @@ mod tests {
         assert_eq!(
             input,
             WebEventsClientCommand::TerminalInput {
-                id: Some("r1".to_owned()),
+                id: "r1".to_owned(),
                 session: "gbt-1".to_owned(),
                 data_base64: "YQ==".to_owned(),
             }
@@ -1630,7 +1788,7 @@ mod tests {
         assert_eq!(
             resize,
             WebEventsClientCommand::TerminalResize {
-                id: Some("r2".to_owned()),
+                id: "r2".to_owned(),
                 session: "gbt-1".to_owned(),
                 cols: 120,
                 rows: 40,
@@ -1645,27 +1803,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_missing_empty_or_oversized_request_ids() {
+        let missing = r#"{"type":"terminal_input","session":"gbt-1","data_base64":"YQ=="}"#;
+        assert!(parse_web_events_client_command(missing).is_err());
+        let empty = r#"{"type":"terminal_resize","id":"","session":"gbt-1","cols":80,"rows":24}"#;
+        assert!(parse_web_events_client_command(empty).is_err());
+        let numeric = r#"{"type":"terminal_input","id":7,"session":"gbt-1","data_base64":"YQ=="}"#;
+        assert!(parse_web_events_client_command(numeric).is_err());
+        let long_id = format!(
+            r#"{{"type":"terminal_input","id":{id},"session":"gbt-1","data_base64":"YQ=="}}"#,
+            id = serde_json::to_string(&"x".repeat(WEB_EVENTS_MAX_REQUEST_ID_BYTES + 1)).unwrap()
+        );
+        assert!(parse_web_events_client_command(&long_id).is_err());
+    }
+
+    #[test]
     fn parse_rejects_malformed_and_oversized_input_without_command() {
         assert!(parse_web_events_client_command("not-json").is_err());
         assert!(
             parse_web_events_client_command(
-                r#"{"type":"terminal_input","session":"","data_base64":"YQ=="}"#
+                r#"{"type":"terminal_input","id":"r1","session":"","data_base64":"YQ=="}"#
             )
             .is_err()
         );
         assert!(
-            parse_web_events_client_command(r#"{"type":"terminal_input","session":"gbt-1"}"#)
-                .is_err()
+            parse_web_events_client_command(
+                r#"{"type":"terminal_input","id":"r1","session":"gbt-1"}"#
+            )
+            .is_err()
         );
         assert!(
             parse_web_events_client_command(
-                r#"{"type":"terminal_resize","session":"gbt-1","cols":1,"rows":40}"#
+                r#"{"type":"terminal_resize","id":"r1","session":"gbt-1","cols":1,"rows":40}"#
             )
             .is_ok()
         );
         // cols=1 is parsed; apply-time validate_terminal_size rejects it.
         let cmd = parse_web_events_client_command(
-            r#"{"type":"terminal_resize","session":"gbt-1","cols":1,"rows":40}"#,
+            r#"{"type":"terminal_resize","id":"r1","session":"gbt-1","cols":1,"rows":40}"#,
         )
         .unwrap()
         .unwrap();
@@ -1684,7 +1859,7 @@ mod tests {
         });
         // Exact raw bytes for "A" (0x41) via standard base64.
         let cmd = WebEventsClientCommand::TerminalInput {
-            id: Some("n1".to_owned()),
+            id: "n1".to_owned(),
             session: "missing-session".to_owned(),
             data_base64: "QQ==".to_owned(),
         };
@@ -1696,14 +1871,14 @@ mod tests {
 
         // Empty / oversized rejected by decode_write_data before host write.
         let empty = WebEventsClientCommand::TerminalInput {
-            id: None,
+            id: "e1".to_owned(),
             session: "missing-session".to_owned(),
             data_base64: "".to_owned(),
         };
         // Empty base64 fails at parse (required).
         assert!(
             parse_web_events_client_command(
-                r#"{"type":"terminal_input","session":"s","data_base64":""}"#
+                r#"{"type":"terminal_input","id":"r1","session":"s","data_base64":""}"#
             )
             .is_err()
         );
@@ -1712,7 +1887,7 @@ mod tests {
         use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
         let oversize = BASE64.encode(vec![0x5a; crate::protocol::MAX_WRITE_BYTES + 1]);
         let over = WebEventsClientCommand::TerminalInput {
-            id: None,
+            id: "o1".to_owned(),
             session: "missing-session".to_owned(),
             data_base64: oversize,
         };
@@ -1727,6 +1902,7 @@ mod tests {
             Some("gbt-1"),
             false,
             Some("nope"),
+            false,
         );
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["type"], "input_result");
@@ -1734,8 +1910,20 @@ mod tests {
         assert_eq!(value["id"], "r1");
         assert_eq!(value["session"], "gbt-1");
         assert_eq!(value["error"], "nope");
+        assert!(value.get("reconnect").is_none());
         assert!(value.get("sessions").is_none());
         assert!(value.get("terminals").is_none());
+
+        let rotate = build_web_events_command_result(
+            "input_result",
+            Some("r2"),
+            Some("gbt-1"),
+            false,
+            Some("request id window exhausted; reconnect required"),
+            true,
+        );
+        let rotate: serde_json::Value = serde_json::from_str(&rotate).unwrap();
+        assert_eq!(rotate["reconnect"], true);
     }
 
     #[test]
@@ -1744,8 +1932,120 @@ mod tests {
         // reading client frames.
         assert!(WEB_EVENTS_CLIENT_POLL <= Duration::from_millis(100));
         assert!(WEB_EVENTS_CLIENT_POLL >= Duration::from_millis(1));
-        assert!(WEB_EVENTS_LEASE_REFRESH < Duration::from_secs(30));
-        assert!(WEB_EVENTS_LEASE_REFRESH >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn web_events_command_plan_rejects_duplicate_ids_and_acks_input_success() {
+        use std::collections::HashSet as StdSet;
+
+        let host = SessionHost::new(OrphanPolicy {
+            lease_ms: 120_000,
+            grace_ms: 600_000,
+        });
+        let command = WebEventsClientCommand::TerminalInput {
+            id: "k1".to_owned(),
+            session: "missing-session".to_owned(),
+            data_base64: "YQ==".to_owned(),
+        };
+        let mut seen = StdSet::new();
+        // Unknown session fails apply, but still resolves to exactly one result.
+        let outcome = plan_web_events_command_outcome(&host, &command, &mut seen);
+        assert_eq!(outcome.result_type, "input_result");
+        assert_eq!(outcome.id.as_deref(), Some("k1"));
+        assert!(!outcome.ok);
+        assert!(outcome.error.is_some());
+
+        // Same id again on the same connection is a strict duplicate rejection,
+        // even though the first attempt never touched a PTY.
+        let duplicate = plan_web_events_command_outcome(&host, &command, &mut seen);
+        assert_eq!(duplicate.id.as_deref(), Some("k1"));
+        assert!(!duplicate.ok);
+        assert!(
+            duplicate
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("duplicate request id"))
+        );
+
+        // A fresh id resolves independently.
+        let other = WebEventsClientCommand::TerminalInput {
+            id: "k2".to_owned(),
+            session: "missing-session".to_owned(),
+            data_base64: "YQ==".to_owned(),
+        };
+        let second = plan_web_events_command_outcome(&host, &other, &mut seen);
+        assert_eq!(second.id.as_deref(), Some("k2"));
+        assert!(!second.ok);
+
+        // A missing session fails apply for resize too, but still resolves to
+        // exactly one resize_result carrying the id.
+        let resize = WebEventsClientCommand::TerminalResize {
+            id: "k3".to_owned(),
+            session: "missing-session".to_owned(),
+            cols: 80,
+            rows: 24,
+        };
+        let resize_outcome = plan_web_events_command_outcome(&host, &resize, &mut seen);
+        assert_eq!(resize_outcome.result_type, "resize_result");
+        assert_eq!(resize_outcome.id.as_deref(), Some("k3"));
+        assert!(!resize_outcome.ok);
+    }
+
+    #[test]
+    fn request_id_window_rotates_connection_when_full_without_evicting_old_ids() {
+        use std::collections::HashSet as StdSet;
+
+        let host = SessionHost::new(OrphanPolicy {
+            lease_ms: 120_000,
+            grace_ms: 600_000,
+        });
+        let mut seen = StdSet::new();
+        let first_id = "bulk-0".to_owned();
+        for index in 0..WEB_EVENTS_MAX_TRACKED_REQUEST_IDS {
+            let command = WebEventsClientCommand::TerminalInput {
+                id: format!("bulk-{index}"),
+                session: "missing-session".to_owned(),
+                data_base64: "YQ==".to_owned(),
+            };
+            let outcome = plan_web_events_command_outcome(&host, &command, &mut seen);
+            assert!(
+                !outcome
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("duplicate request id"))
+            );
+        }
+        assert_eq!(seen.len(), WEB_EVENTS_MAX_TRACKED_REQUEST_IDS);
+
+        // Window is full: the new command is rejected before apply and the
+        // result instructs the browser to rotate this exhausted connection.
+        let extra = WebEventsClientCommand::TerminalInput {
+            id: "bulk-overflow".to_owned(),
+            session: "missing-session".to_owned(),
+            data_base64: "YQ==".to_owned(),
+        };
+        let overflow = plan_web_events_command_outcome(&host, &extra, &mut seen);
+        assert!(!overflow.ok);
+        assert_eq!(
+            overflow.error.as_deref(),
+            Some("request id window exhausted; reconnect required")
+        );
+        assert!(overflow.reconnect);
+        assert_eq!(seen.len(), WEB_EVENTS_MAX_TRACKED_REQUEST_IDS);
+
+        // An OLD applied-or-rejected id is never re-admitted for replay: it is
+        // explicitly rejected as a duplicate, never re-applied.
+        let replay = WebEventsClientCommand::TerminalInput {
+            id: first_id,
+            session: "missing-session".to_owned(),
+            data_base64: "YQ==".to_owned(),
+        };
+        let replay_outcome = plan_web_events_command_outcome(&host, &replay, &mut seen);
+        assert!(!replay_outcome.ok);
+        assert_eq!(
+            replay_outcome.error.as_deref(),
+            Some("duplicate request id")
+        );
     }
 
     #[test]
@@ -1761,16 +2061,17 @@ mod tests {
         ];
         for bad in bad_cases {
             let payload = format!(
-                r#"{{"type":"terminal_input","session":{session},"data_base64":"YQ=="}}"#,
+                r#"{{"type":"terminal_input","id":"r1","session":{session},"data_base64":"YQ=="}}"#,
                 session = serde_json::to_string(bad).unwrap()
             );
             let err = parse_web_events_client_command(&payload).unwrap_err();
             assert!(
-                err.contains("session handle") || err.contains("session"),
-                "bad={bad:?} err={err}"
+                err.message.contains("session handle") || err.message.contains("session"),
+                "bad={bad:?} err={:?}",
+                err.message
             );
             let resize = format!(
-                r#"{{"type":"terminal_resize","session":{session},"cols":80,"rows":24}}"#,
+                r#"{{"type":"terminal_resize","id":"r1","session":{session},"cols":80,"rows":24}}"#,
                 session = serde_json::to_string(bad).unwrap()
             );
             assert!(parse_web_events_client_command(&resize).is_err());
@@ -1778,11 +2079,75 @@ mod tests {
         // Valid handle shape is accepted by the parser (host still enforces existence).
         assert!(
             parse_web_events_client_command(
-                r#"{"type":"terminal_input","session":"gbt-1","data_base64":"YQ=="}"#
+                r#"{"type":"terminal_input","id":"r1","session":"gbt-1","data_base64":"YQ=="}"#
             )
             .unwrap()
             .is_some()
         );
+    }
+
+    #[test]
+    fn parse_errors_keep_recognized_id_session_and_result_type() {
+        // Malformed known-shape command: the error still carries the request
+        // id, session, and result type so the browser can settle its pending
+        // entry and release the admission bytes it holds.
+        let err = parse_web_events_client_command(
+            r#"{"type":"terminal_input","id":"r1","session":"gbt-1"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.id.as_deref(), Some("r1"));
+        assert_eq!(err.session.as_deref(), Some("gbt-1"));
+        assert_eq!(err.result_type, "input_result");
+        assert!(err.message.contains("data_base64"));
+
+        // Invalid session handle: id and result type survive.
+        let err = parse_web_events_client_command(
+            r#"{"type":"terminal_input","id":"r2","session":"bad id","data_base64":"YQ=="}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.id.as_deref(), Some("r2"));
+        assert_eq!(err.result_type, "input_result");
+        assert_eq!(err.session.as_deref(), Some("bad id"));
+
+        // resize errors keep resize_result.
+        let err = parse_web_events_client_command(
+            r#"{"type":"terminal_resize","id":"r3","session":"gbt-1"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.id.as_deref(), Some("r3"));
+        assert_eq!(err.result_type, "resize_result");
+        assert!(err.message.contains("cols"));
+
+        // Missing id: nothing to correlate, generic fallback type.
+        let err = parse_web_events_client_command(
+            r#"{"type":"terminal_input","session":"gbt-1","data_base64":"YQ=="}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.id, None);
+        assert_eq!(err.session.as_deref(), Some("gbt-1"));
+        assert_eq!(err.result_type, "input_result");
+    }
+
+    #[test]
+    fn generic_parse_errors_stay_id_less_with_input_result_type() {
+        // Junk that carries no recognizable id keeps the generic fallback.
+        for payload in ["not-json", r#"[]"#, r#""plain string""#] {
+            let err = parse_web_events_client_command(payload).unwrap_err();
+            assert_eq!(err.id, None);
+            assert_eq!(err.result_type, "input_result");
+        }
+        // A non-object with an unknown type is ignored, not an error.
+        assert_eq!(
+            parse_web_events_client_command(r#"{"type":7}"#).unwrap(),
+            None
+        );
+        // Oversized / non-string id is also not correlatable.
+        let err = parse_web_events_client_command(
+            r#"{"type":"terminal_input","id":7,"session":"gbt-1","data_base64":"YQ=="}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.id, None);
+        assert_eq!(err.result_type, "input_result");
     }
 
     #[test]
