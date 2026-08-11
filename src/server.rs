@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -33,8 +33,8 @@ use crate::{
     },
     session::{CloseError, OrphanPolicy, SessionHost},
     transport::{
-        IPC_FRAME_READ_DEADLINE, IPC_REJECT_DEADLINE, call_anonymous, read_frame, runtime_name,
-        write_response, write_response_with_deadline,
+        IPC_FRAME_READ_DEADLINE, IPC_REJECT_DEADLINE, read_frame, runtime_name, write_response,
+        write_response_with_deadline,
     },
     version_check::{CHECK_INTERVAL, VersionChecker},
 };
